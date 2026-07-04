@@ -28,6 +28,7 @@ for s in ~/agent-core/skills/*/; do ln -sfn "$s" ~/.claude/skills/$(basename "$s
 ```
 AGENTS.md                    ← Layer 1（保持精簡，每 session 載入）
 BOOTSTRAP.md                 ← 新 instance 初始化指令書
+CONTRIBUTING.md              ← 變更規則（instance 提案 lesson 走 PR）
 framework/
 ├── WORK-LOOP.md             ← 9 步 ticket 流程（泛化版）
 ├── RETRIEVAL.md             ← memory 分層 + 檢索深度協議
@@ -43,4 +44,4 @@ skills/                      ← 通用 skills（symlink 進 ~/.claude/skills）
 
 - `AGENTS.md` 控制在 ~80 行內；細節放 framework 按需載入
 - Instance 累積的通用教訓 → 蒸餾進 `framework/ENGINEERING-LESSONS.md`；job-specific 留在 instance
-- 改 framework 就 commit push（本 repo 允許直接進 main）
+- 變更規則見 `CONTRIBUTING.md`：Leo 確認過的改動直接進 main；instance 提案的 lesson 一律 `lesson/{instance}/{slug}` branch + PR，Leo merge
