@@ -8,6 +8,7 @@
 | 代號 | Instance |
 |---|---|
 | `lis` | Vibrant America LIS 工作（lis-code-agent） |
+| `iic` | industry-intel 開發維護（industry-intel-code-agent，個人機 `~/personal_project/`） |
 
 新 instance 在 BOOTSTRAP 時指定短代號，寫進該 instance 的 CLAUDE.md，並回填此表。
 
