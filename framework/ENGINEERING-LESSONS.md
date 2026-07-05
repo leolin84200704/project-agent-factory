@@ -21,6 +21,7 @@
 - **Sync sibling encodings of an invariant** — 改一個值/邊界的語意時，同 function 內所有衍生點（顯示、驗證、查詢窗、search 邊界）要用 single source 一起改；測試別 mock 掉共用路徑（假綠燈）。
 - **Migrate all readers, no mirror** — 替換 source-of-truth 時，遷移所有 reader（含 generic DTO mapper）然後停寫舊 store；「先雙寫留 mirror」只會 diverge。
 - **Capability flag enables a pipeline** — backfill 或開 flag 前，確認下游 pipeline 的相依 config 都在，否則 flag 開了功能還是斷的。
+- **Go-live 只對未來生效；event consumer 不可靜默丟棄** — 開 flag/integration 只影響之後到達的 events；上線前已到達的 events 若 consumer 查無 match 就 return + commit offset，資料永久消失且無痕跡。go-live 設計必須含上線前 events 的 backfill 路徑；consumer 丟棄任何 event 至少留 DB 痕跡或 warn-level log（debug log prod 看不到）；catch-all 吞錯後不可照常 commit offset，否則 transient error 也會永久丟資料。
 
 ## 設計判斷
 
