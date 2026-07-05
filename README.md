@@ -1,4 +1,4 @@
-# agent-core
+# project-agent-factory
 
 Leo 的可攜 agent 框架：個人工作習慣（Layer 1）+ 可重用的工作方法框架（work loop、memory 分層、retrieval 協議）。任何新工作/新專案都從這裡長出一個熟悉該 domain 的 code agent。
 
@@ -13,10 +13,10 @@ Leo 的可攜 agent 框架：個人工作習慣（Layer 1）+ 可重用的工作
 ## 安裝（新機器）
 
 ```bash
-git clone git@github.com:leolin84200704/agent-core.git ~/agent-core
-ln -sf ~/agent-core/AGENTS.md ~/.claude/CLAUDE.md
+git clone git@github.com:leolin84200704/project-agent-factory.git ~/project-agent-factory
+ln -sf ~/project-agent-factory/AGENTS.md ~/.claude/CLAUDE.md
 # 通用 skills 接到 user-level：
-for s in ~/agent-core/skills/*/; do ln -sfn "$s" ~/.claude/skills/$(basename "$s"); done
+for s in ~/project-agent-factory/skills/*/; do ln -sfn "$s" ~/.claude/skills/$(basename "$s"); done
 ```
 
 ## 初始化新的工作 agent

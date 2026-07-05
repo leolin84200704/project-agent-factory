@@ -68,8 +68,8 @@ Memory pipelines die silently (real case: 2026-06-08 → 2026-07-01, three weeks
 | Ticket state change during work | STM file directly | Agent owns; no permission needed |
 | New rule / pattern derived from work | **Journal (L3a) only** — dream distills to LTM | Do NOT write LTM directly mid-session; the double-write path (agent + dream both writing LTM) caused duplication |
 | L4 check found STM out-of-sync | Fix STM in same turn | Note discrepancy in journal entry |
-| Leo gives behavioral correction | Personal `~/agent-core/AGENTS.md` if universal; instance CLAUDE.md if job-specific; + journal | Never require the same correction twice |
-| Universal engineering lesson (not job-specific) | `~/agent-core/framework/ENGINEERING-LESSONS.md` — Leo-confirmed edits commit direct; instance proposals go through a lesson PR (see `CONTRIBUTING.md`) | Keeps portable lessons out of the job instance |
+| Leo gives behavioral correction | Personal `~/project-agent-factory/AGENTS.md` if universal; instance CLAUDE.md if job-specific; + journal | Never require the same correction twice |
+| Universal engineering lesson (not job-specific) | `~/project-agent-factory/framework/ENGINEERING-LESSONS.md` — Leo-confirmed edits commit direct; instance proposals go through a lesson PR (see `CONTRIBUTING.md`) | Keeps portable lessons out of the job instance |
 | End of non-trivial session | Journal entry (below) | |
 
 ## Session journaling (L3a)

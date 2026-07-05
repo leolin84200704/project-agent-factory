@@ -45,8 +45,8 @@
 - 必須先問：不確定該改哪個 repo、ticket 描述模糊或矛盾、DB schema 變更、跨 repo 相依改動、現有 code 看起來有問題但不確定要不要動
 
 ## 框架（按需載入，不要預載）
-可攜的工作方法在 `~/agent-core/framework/`：
+可攜的工作方法在 `~/project-agent-factory/framework/`：
 - 處理正式 ticket 工作 → 先讀 `framework/WORK-LOOP.md`（9 步流程）
 - Memory 分層與檢索深度 → `framework/RETRIEVAL.md`
 - 動 DB / 部署 / prod 相關工作 → 先讀 `framework/ENGINEERING-LESSONS.md`（歷史事故蒸餾的通用紀律）
-- 初始化新工作/專案的 agent → `~/agent-core/BOOTSTRAP.md`
+- 初始化新工作/專案的 agent → `~/project-agent-factory/BOOTSTRAP.md`

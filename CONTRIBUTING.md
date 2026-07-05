@@ -1,6 +1,6 @@
-# CONTRIBUTING — agent-core 變更規則
+# CONTRIBUTING — project-agent-factory 變更規則
 
-> agent-core 是 global 層：這裡的每一條會影響所有 instance。
+> project-agent-factory 是 global 層：這裡的每一條會影響所有 instance。
 > 原則：**repo 檔案內容去識別化（可攜、可長存）；commit/PR 訊息不用去識別化（只有 Leo 看，是審核佐證區，寫越具體越好）。**
 
 ## Instance 代號
@@ -50,4 +50,4 @@ Instance 機器開不了 PR 時：把同格式內容寫到 `framework/proposals/
 
 ## 同步提醒
 
-Lesson PR merge 發生在 GitHub；本機 `~/agent-core` 要 `git pull` 才會生效（session 讀的是本機檔案）。Instance 的 dream pipeline 在提案前會先 pull。
+Lesson PR merge 發生在 GitHub；本機 `~/project-agent-factory` 要 `git pull` 才會生效（session 讀的是本機檔案）。Instance 的 dream pipeline 在提案前會先 pull。

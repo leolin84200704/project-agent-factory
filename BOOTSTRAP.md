@@ -1,7 +1,7 @@
 # BOOTSTRAP — 初始化一個新的工作/專案 Agent
 
-> 對 Claude 說「依 `~/agent-core/BOOTSTRAP.md` 初始化 {名稱}，workspace 在 {路徑}，repos 是 {...}」即可執行。
-> 前提：`~/agent-core` 已 clone、`~/.claude/CLAUDE.md → ~/agent-core/AGENTS.md` symlink 已建立（見 README）。
+> 對 Claude 說「依 `~/project-agent-factory/BOOTSTRAP.md` 初始化 {名稱}，workspace 在 {路徑}，repos 是 {...}」即可執行。
+> 前提：`~/project-agent-factory` 已 clone、`~/.claude/CLAUDE.md → ~/project-agent-factory/AGENTS.md` symlink 已建立（見 README）。
 
 ## 產出
 
@@ -62,5 +62,5 @@
 - 確認 hooks 生效：試一個 `git push --force`（對 throwaway repo）應被擋
 
 ## 原則
-- Instance 只放這份工作專屬的內容；任何「其實是通用習慣」的東西上移到 `~/agent-core`（AGENTS.md 或 framework/）
+- Instance 只放這份工作專屬的內容；任何「其實是通用習慣」的東西上移到 `~/project-agent-factory`（AGENTS.md 或 framework/）
 - 反向也成立：instance 累積出的通用教訓，由 dream 或 Leo 確認後蒸餾進 `framework/ENGINEERING-LESSONS.md`

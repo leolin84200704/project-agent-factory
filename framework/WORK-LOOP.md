@@ -64,7 +64,7 @@
 5. **信心度**: 1-5 自評（1=完全依賴指導，5=獨立完成）
 記錄到 STM: Retrospective + Lessons Learned
 
-詳細框架見 `~/agent-core/skills/work-loop/RETROSPECTIVE.md`
+詳細框架見 `~/project-agent-factory/skills/work-loop/RETROSPECTIVE.md`
 
 ## Step 9: Journal（寫 episodic 紀錄 — 不直寫 LTM）
 1. 依 `RETRIEVAL.md` § Session journaling 寫 `{memory_root}/journal/YYYY-MM-DD-{slug}.md`：探索過什麼、排除過什麼、為何這樣決定、使用者的原話
