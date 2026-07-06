@@ -12,6 +12,7 @@
 - **Batch DB verify 100%** — 批次 INSERT/UPDATE 後驗證全部 rows，絕不抽查。
 - **JOIN scope reverse audit** — prod UPDATE-WHERE-JOIN 跑完後，用更廣的 criterion 反向 SELECT 找漏網 row；SQL 的 `NULL = NULL` 是 false，會靜默漏掉。
 - **End-to-end equivalence before swap** — 替換 RPC/service 實作前，diff 前後 output 完全相同；proto 相同 ≠ marshalling 相同。
+- **Client-failure ≠ server-failure：非冪等操作 replay 前先查對端狀態** — 對非冪等的寫入（下單、建資料、扣款），client 看到「失敗」時 server 端可能已成功落地。replay/resend/請上游重送前，必須先查對端系統該筆資料是否已存在，否則 replay 直接造成重複；手動 backfill 主表時，相依的關聯表（matching/對帳用）也要同步補，否則後續自動流程斷鏈。
 
 ## 變更範圍紀律
 
