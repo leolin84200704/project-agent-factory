@@ -28,6 +28,7 @@
 - **Owner-scoped, not actor** — 解析 per-owner 屬性（timezone、settings）要用資源擁有者的 id，不是 JWT actor 的；admin 代操作會打破 actor lookup。
 - **Cleanup filter scope** — prod DELETE 的 WHERE 必須綁定當次操作範圍（時間 + 明確 ID），絕不為「保險」放寬 filter。
 - **No overgeneralize from single case** — 寫通則前 grep 多個 case 確認真正原因，別從單一 case 反推普遍規則。
+- **Invalid response 要 reject，不要 coerce 成合法預設** — 對外部回應寫 `parseInt(x || '0')`、讀錯欄位名後 `?? default` 這類 coercion，會把「從未成功」偽裝成「正常運作」，可以隱藏數週到數月；per-item catch 只印 `error.message`（可能是空字串）同樣讓根因隱形。收到 invalid/empty 的外部回應要明確 reject + loud log；預設值只保留給真正合法的缺省語意。
 
 ## 流程紀律
 
