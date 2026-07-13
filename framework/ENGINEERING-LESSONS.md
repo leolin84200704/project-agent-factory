@@ -28,6 +28,7 @@
 - **Owner-scoped, not actor** — 解析 per-owner 屬性（timezone、settings）要用資源擁有者的 id，不是 JWT actor 的；admin 代操作會打破 actor lookup。
 - **Cleanup filter scope** — prod DELETE 的 WHERE 必須綁定當次操作範圍（時間 + 明確 ID），絕不為「保險」放寬 filter。
 - **No overgeneralize from single case** — 寫通則前 grep 多個 case 確認真正原因，別從單一 case 反推普遍規則。
+- **Shared-quota bottleneck ≠ the segment you optimized** — 當一個 pipeline 撞共用資源限制（rate limit、訂閱 token 額度、連線池），把某段的單位成本砍 N× 後若整體吞吐只增 ~1.5×，瓶頸就不在那段——是另一個共用同資源的消耗者（常是同時在跑的互動 session 或別的 job）。先量「單位成本 vs 吞吐」的比例再下結論，別繼續優化錯的地方；要清 backlog 就讓該工作獨佔資源（無人值守／錯開時段）跑。
 
 ## 流程紀律
 
