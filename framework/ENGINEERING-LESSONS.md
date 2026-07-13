@@ -28,6 +28,7 @@
 - **Owner-scoped, not actor** — 解析 per-owner 屬性（timezone、settings）要用資源擁有者的 id，不是 JWT actor 的；admin 代操作會打破 actor lookup。
 - **Cleanup filter scope** — prod DELETE 的 WHERE 必須綁定當次操作範圍（時間 + 明確 ID），絕不為「保險」放寬 filter。
 - **No overgeneralize from single case** — 寫通則前 grep 多個 case 確認真正原因，別從單一 case 反推普遍規則。
+- **Headless LLM CLI 預設載入整個 harness context** — 用 agent CLI 的 headless/print 模式（如 `claude -p`）當純文字 worker 時，它預設會把整個工具 schema、所有 MCP server、專案 memory 檔、動態 system prompt 都塞進 context——實測連一個字的 prompt 也可能 ~170K token/call，其中工具 schema 是最大宗（非 MCP）。純文字進、JSON 出、不呼叫任何 tool 的任務要明確關掉：`--tools none` + 空 MCP config + 極簡 system prompt + 關動態 section，可降 ~30×。別假設 headless 模式就是精簡的；用 `--output-format json` 看 `usage` 逐項驗證哪個開關真正省 token。
 
 ## 流程紀律
 
