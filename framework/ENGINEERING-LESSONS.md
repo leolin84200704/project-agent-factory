@@ -35,6 +35,7 @@
 
 ## 流程紀律
 
+- **Probe capability, not just errors** — 只對「有流量的錯誤」告警的監控，永遠抓不到零流量通道的損壞（域名失效、對端主機下線的低頻/休眠 integration）。對所有 enabled 的外送通道要週期性探測「能力」本身（DNS 解析、TCP 可達），否則通道壞掉的發現時間 = 下一筆真實流量失敗的時間，而那筆流量往往就是損失本身。
 - **Preserve evidence before restart** — hang 的 pod/process 在 restart/delete 前先 dump logs + describe，否則 root cause 隨 GC 永久消失。
 - **Check live state before migration work** — 遷移/cutover 類工作開工前先讀 live config + 環境實況；ticket 系統的狀態 ≠ 環境實際狀態。
 - **Worktree for parallel branches** — 多 branch 平行/stacked 工作用 git worktree，不要 in-place checkout（per-worktree 重建 deps）。
