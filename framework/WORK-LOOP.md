@@ -62,6 +62,7 @@
 3. **模式識別**: 是否匹配已知 pattern、新發現
 4. **教訓**: 技術面、流程面、工具面
 5. **信心度**: 1-5 自評（1=完全依賴指導，5=獨立完成）
+6. **Factory 蒸餾檢查（必做，不是選項）**: 問「這次學到的東西有沒有跨 instance 可攜的？」有 → 立刻開 lesson PR 到 project-agent-factory（規格見該 repo CONTRIBUTING.md：一條 lesson 一個 PR、檔案內容去識別化、細節寫在 PR body）。判斷標準：拿掉公司名/系統名之後規則仍然成立、且換一個工作環境仍會踩到 → 可攜。沒有就明說「本次無可蒸餾」。這一步做不做，決定 factory 會不會退化成死文件。
 記錄到 STM: Retrospective + Lessons Learned
 
 詳細框架見 `~/project-agent-factory/skills/work-loop/RETROSPECTIVE.md`
