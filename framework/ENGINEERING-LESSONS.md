@@ -13,6 +13,7 @@
 - **JOIN scope reverse audit** — prod UPDATE-WHERE-JOIN 跑完後，用更廣的 criterion 反向 SELECT 找漏網 row；SQL 的 `NULL = NULL` 是 false，會靜默漏掉。
 - **End-to-end equivalence before swap** — 替換 RPC/service 實作前，diff 前後 output 完全相同；proto 相同 ≠ marshalling 相同。
 - **Channel liveness is third-party state — round-trip test it** — user-facing 通道（chat bot、webhook 推播、訂閱）的關鍵狀態存在第三方且可被外部行為者改寫；「己方註冊/發送動作執行成功」≠ 通道活著。deploy/驗收收尾必做一次真實 round-trip（實際收發各一則並確認）；長期監控要查第三方的實際狀態（如 getWebhookInfo）而非自己的 log，drift 要自癒並通知用戶。同一通道故障被用戶發現兩次 = 缺的是測試不是修復。
+- **Read the helper before you build on it — stubs log success** — 依賴既有 helper/service method 前先讀它的實作，不能只看名字和回傳型別。真實案例：SFTP `moveFile()` 是空 stub — `ensureConnected()` 後直接 log "File moved successfully" 回 `{success:true}`，從未呼叫 client，任何 caller 都拿到假成功且無錯誤可觀察。判斷法：宣稱有副作用的 method 內若沒有對應的 client/IO 呼叫即是 stub；接手時先補真實作（含 timeout）+ 行為級 unit test，再開始建上層功能。
 
 ## 變更範圍紀律
 
