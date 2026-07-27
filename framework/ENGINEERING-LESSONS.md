@@ -37,6 +37,7 @@
 
 ## 流程紀律
 
+- **測試中發現的缺陷必須當場變 ticket，筆記不是追蹤** — E2E/測試/triage 過程中發現「不屬於當前工作範圍」的真實缺陷時，必須在同一個 session 內開正式 ticket（有 owner、有狀態、連結 parent），然後筆記引用 ticket id——絕不能反過來只在 memory/STM 寫一句 "proposed follow-up" 就結案。筆記沒有 owner、沒有 queue、對排程不可見；只存在筆記裡的已知缺陷功能上等同未知缺陷，而重新發現的成本往往由外部使用者/夥伴付。收尾檢查：關 ticket 前掃自己的工作紀錄，任何 "follow-up"/"wrinkle"/"proposed" 字樣而沒有對應 ticket id 的，都是還沒歸檔的缺陷。
 - **Probe capability, not just errors** — 只對「有流量的錯誤」告警的監控，永遠抓不到零流量通道的損壞（域名失效、對端主機下線的低頻/休眠 integration）。對所有 enabled 的外送通道要週期性探測「能力」本身（DNS 解析、TCP 可達），否則通道壞掉的發現時間 = 下一筆真實流量失敗的時間，而那筆流量往往就是損失本身。
 - **Preserve evidence before restart** — hang 的 pod/process 在 restart/delete 前先 dump logs + describe，否則 root cause 隨 GC 永久消失。
 - **Check live state before migration work** — 遷移/cutover 類工作開工前先讀 live config + 環境實況；ticket 系統的狀態 ≠ 環境實際狀態。
