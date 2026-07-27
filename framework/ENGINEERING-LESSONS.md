@@ -32,6 +32,7 @@
 - **Cleanup filter scope** — prod DELETE 的 WHERE 必須綁定當次操作範圍（時間 + 明確 ID），絕不為「保險」放寬 filter。
 - **No overgeneralize from single case** — 寫通則前 grep 多個 case 確認真正原因，別從單一 case 反推普遍規則。
 - **Headless LLM CLI 預設載入整個 harness context** — 用 agent CLI 的 headless/print 模式（如 `claude -p`）當純文字 worker 時，它預設會把整個工具 schema、所有 MCP server、專案 memory 檔、動態 system prompt 都塞進 context——實測連一個字的 prompt 也可能 ~170K token/call，其中工具 schema 是最大宗（非 MCP）。純文字進、JSON 出、不呼叫任何 tool 的任務要明確關掉：`--tools none` + 空 MCP config + 極簡 system prompt + 關動態 section，可降 ~30×。別假設 headless 模式就是精簡的；用 `--output-format json` 看 `usage` 逐項驗證哪個開關真正省 token。
+- **Idempotency key 不可被 terminal failure 消耗** — 「先插 unique row 再處理」是正確的併發防護，但 resend 分支必須看既有 row 的**狀態**再決定：處理中/已成功 → 短路回 duplicate；terminal failure（驗證失敗、拒絕、下游錯誤）→ 用 status-gated 原子 UPDATE reclaim 該 row 重跑（N 個併發 resend 恰一個搶到）。否則「修正問題後重送同 key」這個 idempotency 的核心使用情境永遠走不通，且呼叫端拿到的 5xx「可重試」承諾是假的。配套：若 pipeline 是 charge-first / 先產生副作用再完成，副作用完成的**當下**就要把憑證（payment id 等）持久化到該 row，retry 時 replay 而非重做——不然 failed 狀態永遠不敢放開重試。Doc 寫了 retry 語意不代表 code 有實作，兩邊都要驗。
 - **Shared-quota bottleneck ≠ the segment you optimized** — 當一個 pipeline 撞共用資源限制（rate limit、訂閱 token 額度、連線池），把某段的單位成本砍 N× 後若整體吞吐只增 ~1.5×，瓶頸就不在那段——是另一個共用同資源的消耗者（常是同時在跑的互動 session 或別的 job）。先量「單位成本 vs 吞吐」的比例再下結論，別繼續優化錯的地方；要清 backlog 就讓該工作獨佔資源（無人值守／錯開時段）跑。
 
 
