@@ -14,6 +14,7 @@
 - **JOIN scope reverse audit** — prod UPDATE-WHERE-JOIN 跑完後，用更廣的 criterion 反向 SELECT 找漏網 row；SQL 的 `NULL = NULL` 是 false，會靜默漏掉。
 - **End-to-end equivalence before swap** — 替換 RPC/service 實作前，diff 前後 output 完全相同；proto 相同 ≠ marshalling 相同。
 - **Channel liveness is third-party state — round-trip test it** — user-facing 通道（chat bot、webhook 推播、訂閱）的關鍵狀態存在第三方且可被外部行為者改寫；「己方註冊/發送動作執行成功」≠ 通道活著。deploy/驗收收尾必做一次真實 round-trip（實際收發各一則並確認）；長期監控要查第三方的實際狀態（如 getWebhookInfo）而非自己的 log，drift 要自癒並通知用戶。同一通道故障被用戶發現兩次 = 缺的是測試不是修復。
+- **資料違反現行設定 ≠ engine bug — 先為設定變更定年** — 當存量資料看起來違反現行設定（預約落在可用時段之外、記錄超出現行 quota、舊值過不了現行 validation），第一個要排除的假設是「設定在資料寫入之後被改過」：先確認寫入當時生效的設定，再開始懷疑驗證引擎。設定 store 常沒有歷史（無 updated_at、無 audit log），但 delete-and-recreate 的儲存模式讓 surrogate key 順序成為可用的定年工具——某物件的整組 row id 若是全表最高，即證明它是最近被整批重寫的，可與資料寫入時間交叉比對出先後。反向教訓：任何 user 可自行編輯、又被引擎當驗證依據的設定表，要有 updated_at 或 audit，否則 triage 只能靠 id 推理，且縮小設定時應偵測並提示落在新設定之外的既有資料。
 - **Read the helper before you build on it — stubs log success** — 依賴既有 helper/service method 前先讀它的實作，不能只看名字和回傳型別。真實案例：SFTP `moveFile()` 是空 stub — `ensureConnected()` 後直接 log "File moved successfully" 回 `{success:true}`，從未呼叫 client，任何 caller 都拿到假成功且無錯誤可觀察。判斷法：宣稱有副作用的 method 內若沒有對應的 client/IO 呼叫即是 stub；接手時先補真實作（含 timeout）+ 行為級 unit test，再開始建上層功能。
 
 ## 變更範圍紀律
