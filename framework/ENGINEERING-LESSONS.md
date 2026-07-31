@@ -14,6 +14,7 @@
 - **JOIN scope reverse audit** — prod UPDATE-WHERE-JOIN 跑完後，用更廣的 criterion 反向 SELECT 找漏網 row；SQL 的 `NULL = NULL` 是 false，會靜默漏掉。
 - **End-to-end equivalence before swap** — 替換 RPC/service 實作前，diff 前後 output 完全相同；proto 相同 ≠ marshalling 相同。
 - **Channel liveness is third-party state — round-trip test it** — user-facing 通道（chat bot、webhook 推播、訂閱）的關鍵狀態存在第三方且可被外部行為者改寫；「己方註冊/發送動作執行成功」≠ 通道活著。deploy/驗收收尾必做一次真實 round-trip（實際收發各一則並確認）；長期監控要查第三方的實際狀態（如 getWebhookInfo）而非自己的 log，drift 要自癒並通知用戶。同一通道故障被用戶發現兩次 = 缺的是測試不是修復。
+- **安靜的觀測窗不是故障證據 — 要量輸入端** — 「改完後 N 分鐘沒有預期產出」不能推論成壞了；必須先確認那段時間**輸入是否真的到達**。event-driven 系統的正確量法：topic/queue 的 offsets-by-timestamp（該窗內生產了幾筆）+ consumer group lag；**lag ≈ 0 代表系統把能拿的都吃了 = 健康且輸入為空**，跟「卡住」是完全相反的結論。真實事故（2026-07-31）：cutover 後 61 分鐘零產出，我判定失敗並回滾，實際上上游那小時就是沒有事件，事件在第 65 分鐘到達且新路徑處理正確——回滾反而造成 ~17 筆重複交付與 5 筆中斷的 in-flight 工作。配套兩條：(a) **看證據的時間戳，不只看數量**——「切換後有 64 筆事件」在確認每筆的到達時間之前毫無意義，那 64 筆全部在我量完零之後才到；(b) **檢查這個「故障」有沒有自己已經寫下來的替代解釋**——我先前才記錄過「這個系統有整小時零產出的自然空窗」，卻在自己的改動受嫌疑時忽略該 baseline。嚴謹的統計論證架在錯誤前提上，只會讓錯誤結論看起來更可信。
 - **Read the helper before you build on it — stubs log success** — 依賴既有 helper/service method 前先讀它的實作，不能只看名字和回傳型別。真實案例：SFTP `moveFile()` 是空 stub — `ensureConnected()` 後直接 log "File moved successfully" 回 `{success:true}`，從未呼叫 client，任何 caller 都拿到假成功且無錯誤可觀察。判斷法：宣稱有副作用的 method 內若沒有對應的 client/IO 呼叫即是 stub；接手時先補真實作（含 timeout）+ 行為級 unit test，再開始建上層功能。
 
 ## 變更範圍紀律
@@ -23,6 +24,8 @@
 - **Audit callers when adding fallback** — 加 fallback 機制時，同一個 PR audit 並遷移所有同類 caller；revert 一個 service 時 audit 同 server 其他同類風險。
 - **Sync sibling encodings of an invariant** — 改一個值/邊界的語意時，同 function 內所有衍生點（顯示、驗證、查詢窗、search 邊界）要用 single source 一起改；測試別 mock 掉共用路徑（假綠燈）。
 - **Migrate all readers, no mirror** — 替換 source-of-truth 時，遷移所有 reader（含 generic DTO mapper）然後停寫舊 store；「先雙寫留 mirror」只會 diverge。
+- **Rollback 是有 blast radius 的變更，不是免費的還原鍵** — 「照 runbook 回滾」聽起來安全，但回滾本身會產生副作用，決策時要跟「維持現狀」一起評估。最常見的形態：**consumer group 切換**。A→B 切換期間 group A 停止消費、offset 停在切換點；切回 A 就從那個 offset 重放，下游若沒有 idempotency gate 就是**重複交付**（重複寫入若是覆寫同一列，row count 還會看起來乾乾淨淨，指標騙人）。硬規則：任一方向切換前，先把**目標 group 的 committed offset 推到 high watermark**（`admin.setOffsets`），或明確接受重放。真實案例：回滾重放 1,940 筆造成 ~17 筆重複；切回去前若不先推 offset，另有 8,501 筆待重放。另一個副作用：**重啟會殺掉 in-flight 的 job**（BullMQ 等），留下 `next_retry_at=null` 的孤兒列，不會自癒，必須事後逐筆補跑並驗證。
+- **大改動拆成至少 3 個 commit，切在 revert 邊界上** — 一個把新元件、接線、infra/config 全塞在一起的肥 commit，無法只 revert 有風險的那一片（k8s manifest / prod config），要退就得連安全的部分（新 service + 測試）一起退。寫 code **之前**就規劃邊界：(1) 新能力 + 其單元測試（未接線、inert）→ (2) 接進呼叫端（真正的行為改變）→ (3) infra/config/依賴（最難 revert 的放最後且獨立）。附帶約束：branch 一旦 push，回頭拆需要改寫歷史，而 force-push 在工作 repo 是禁止的——所以要嘛一次切對，要嘛用新 branch 重建。
 - **Capability flag enables a pipeline** — backfill 或開 flag 前，確認下游 pipeline 的相依 config 都在，否則 flag 開了功能還是斷的。
 
 ## 設計判斷
@@ -44,5 +47,8 @@
 - **Preserve evidence before restart** — hang 的 pod/process 在 restart/delete 前先 dump logs + describe，否則 root cause 隨 GC 永久消失。
 - **Check live state before migration work** — 遷移/cutover 類工作開工前先讀 live config + 環境實況；ticket 系統的狀態 ≠ 環境實際狀態。
 - **Worktree for parallel branches** — 多 branch 平行/stacked 工作用 git worktree，不要 in-place checkout（per-worktree 重建 deps）。
+- **輸出看起來錯但你的文字沒錯 → 去找顯示層，並用自己的 transcript 舉證** — 用戶反覆指出同一個「你寫錯了」而你的原始文字其實正確時，錯誤在**下游的顯示/轉換層**，那才是要修的地方；用「應該是渲染問題」結案等於把問題留給用戶重複踩。舉證方法：grep 自己的 session transcript（`~/.claude/projects/<slug>/*.jsonl`，解析 JSONL 並把 assistant 的 `text` block 與 `tool_use`/`tool_result` 分開統計），先證明自己到底有沒有輸出過那個字串，再往顯示層追。真實事故：用戶三次（相隔 11 天）指出 Jira 連結域名錯，前兩次我 grep repo/config 都沒找到就寫下「大概是 render-time 替換」；第三次去 grep transcript 才證明 assistant text 從未出現該字串，接著在**舊 session** 裡找到根因——一條 agent 自己寫的終端機 hyperlink 規則（`~/.wezterm-local.lua`，且當初刻意不進 git，所以任何 repo 搜尋必然是空的），把畫面上每個 ticket id 都連到錯誤網域。
+- **grep 找不到只界定了搜尋範圍，不證明不存在** — 「我 grep 過，沒有」是無效結論，除非同時說出搜尋範圍。上面那個 case 前兩次搜的是 repo 檔案 + `~/.config` + `~/.zshrc` + `~/.wezterm.lua`，而目標檔案是 `~/.wezterm-local.lua`（刻意未追蹤）。報告時一律寫成「在 X、Y、Z 範圍內沒有」，並主動問「還有哪些地方可能承載這個行為」。
+- **絕不從使用者的 email 域名推導組織的 URL/識別碼** — 登入信箱網域 ≠ 組織的服務網域（`hung.l@zymebalanz.com` vs Jira 站 `vibrantamerica.atlassian.net`）。不知道正確值就去查真實來源（既有連結、API、config）或直接問；一次憑空猜測換來三次打擾、一個錯誤的補救方案，以及 22 天畫面上每個 ticket id 都指向不存在的站。
 - **Debug 從 header/證據本身下手** — 例：debug CORS 永遠 grep `access-control-allow-origin` 本身；framework 可能回 204 + 其他 header 造成假象。
 - **宣稱「更乾淨」前先驗隱藏相依** — 追求更好的設計沒問題，但改之前確認沒有隱藏耦合（env、cache、singleton）。
