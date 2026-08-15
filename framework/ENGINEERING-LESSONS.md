@@ -3,6 +3,7 @@
 > 從真實事故蒸餾的跨專案通則。每條都對應至少一次實際踩雷。
 > 動 DB / 部署 / prod / migration 前先掃過對應章節。
 > 新教訓寫入規則見 `RETRIEVAL.md` § Write-back：確定可泛化才進這裡，job-specific 留在該 instance 的 LTM。
+> 條目格式、字數上限（≤50 字）與 Add/Modify/Deprecate 生命週期見 `../CONTRIBUTING.md` § Lesson PR 規格。
 
 ## 驗證紀律
 

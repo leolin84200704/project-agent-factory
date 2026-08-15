@@ -36,6 +36,16 @@ Case-specific "always check X" rules do not scale. This protocol replaces them w
 | Designing next iteration | L3a + L3b + L4 | "Redesign the retry logic — what failed before?" |
 | One-off chat | None | "ok", "got it" |
 
+### Recall questions: grep before you answer（2026-08-15）
+
+事實型 recall（模型名、id、label、排程時間、設定值、閾值）**不可憑印象回答，也不可只靠
+index 路由直覺**：先 `grep -ri {問題的關鍵名詞} long-term-memory/`（連同 instance
+CLAUDE.md），讀命中的段落並引用來源；沒命中才走 index 路由。LTM 檔的 frontmatter
+`summary:` 與 `tags:` 就是為 grep 設計的 retrieval trigger（寫法見 dream.md Rules）。
+
+動機：regression baseline（2026-08-15）抓到檢索非確定性 — 兩題 LTM 有明確答案的題目
+k=1 時 fail、重跑即過。「有時會去查」對紀律類知識不夠，此規則把它變成「必查」。
+
 ### The L3→L4 rule
 
 **Memory references the world; it does not contain the world.** When an STM file references an external artifact, the artifact is authoritative — never the STM text. Concretely, before answering any "current state" question:

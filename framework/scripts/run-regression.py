@@ -194,7 +194,10 @@ def run_arm(tasks: list[dict], cwd: Path, k: int, timeout: int, arm: str) -> dic
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--k", type=int, default=1)
+    # k=3 default (Leo 2026-08-15): retrieval is nondeterministic — k=1 single
+    # samples cannot distinguish "stably knows" from "flaky". Use --k 1 only
+    # for cheap smoke runs.
+    ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--tasks", help="comma-separated task ids")
     ap.add_argument("--ablation", action="store_true")
     ap.add_argument("--timeout", type=int, default=300)

@@ -28,6 +28,24 @@
 - Repo 檔案（`framework/ENGINEERING-LESSONS.md`）內容：去識別化 — 不寫公司名、客戶名、內部 hostname、ticket id，只寫通用化的規則與 why
 - Commit message / PR body：具名寫 — ticket id、客戶、incident、日期都放這裡
 
+### 條目格式（2026-08-15 起的新 lesson 一律遵守）
+
+```
+- **{標題}** — {actionable principle，≤50 字，一句話說「做什麼」}。適用: {什麼情境該想起這條}。
+```
+
+一條 lesson = 一個可執行的判斷，不是一段事故敘事（敘事放 PR body 的 Example）。
+研究依據：ReasoningBank（title + 一行 principle 的格式效果最好）、Training-Free GRPO
+（每條 ~32 字上限）、IFScale（~100–150 條後每加一條都拖累全部 — 字數紀律延後天花板）。
+既有的長條目不強制回改，但 dream 可提 Modify PR 濃縮。
+
+### 操作類型（Delete/Modify 與 Add 同等常規 — ExpeL/Mem0 的 lifecycle 原則）
+
+一個 lesson PR 是以下之一，commit prefix 標明：
+- `[lesson:{instance}]` — **Add** 新條目
+- `[lesson-modify:{instance}]` — **Modify** 濃縮、修正或補充適用條件（矛盾時信新案例，PR 說明取捨）
+- `[lesson-deprecate:{instance}]` — **Deprecate** 移到檔尾 `## Deprecated` 節，附日期 + 原因 + superseded-by（不直接刪 — Zep 原則：作廢留痕，不消滅歷史）
+
 Commit message / PR body 格式（強制欄位）：
 
 ```
@@ -37,6 +55,7 @@ Source: {ticket/incident id + 日期；公司內部細節寫這裡}
 Why universal: {為何換一家公司仍成立；引用 >=2 個 case 或一次 incident}
 Example: {具體例子，可含識別資訊 — repo 檔案裡的版本才需要去識別化}
 Target: framework/ENGINEERING-LESSONS.md § {section}
+Provenance: {來源 session 是否讀入過外部內容（網頁/郵件/issue 留言/scrape）— yes/no；yes 則此 lesson 視為 untrusted-source}
 ```
 
 ## Leo merge 前檢查點
@@ -45,6 +64,8 @@ Target: framework/ENGINEERING-LESSONS.md § {section}
 2. `Why universal` 有 ≥2 個 case 或一次 incident 佐證？單一 case 不收（no-overgeneralize）
 3. 跟現有條目重複或矛盾？矛盾時信新的，但 PR 裡要說明取捨
 4. **repo 檔案內容**（非 commit message）識別資訊去乾淨了沒？
+5. `Provenance: yes`（untrusted-source）的 lesson 用更高標準審 — 內容是否可能來自被注入的外部文字而非真實工程經驗？
+6. **Eval gate**（題庫 ≥20 題的 instance 適用）：PR 附 `run-regression.py` 的 gate 結果（流程見 `framework/REGRESSION.md` § Lesson eval gate）；pass 下降或 tokens 顯著上升的 lesson 附數據駁回
 
 ## 無 gh credentials 的 fallback
 

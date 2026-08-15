@@ -258,10 +258,12 @@ def rescore_and_reindex(write: bool = True) -> dict:
                     lines.append(f"| {score:.2f} | {file_id} | {meta.get('summary', '')} | "
                                  f"{meta.get('original_tier', 'stm')} | {meta.get('updated', '')} |")
             else:
-                lines += ["| Score | ID | Summary | Status | Category | Updated |",
-                          "|-------|-----|---------|--------|----------|---------|"]
+                lines += ["| Score | ID | Summary | Tags | Status | Category | Updated |",
+                          "|-------|-----|---------|------|--------|----------|---------|"]
                 for score, file_id, meta in scored:
-                    lines.append(f"| {score:.2f} | {file_id} | {meta.get('summary', '')} | "
+                    tags = meta.get("tags", [])
+                    tag_str = " ".join(str(t) for t in tags) if isinstance(tags, list) else str(tags or "")
+                    lines.append(f"| {score:.2f} | {file_id} | {meta.get('summary', '')} | {tag_str} | "
                                  f"{meta.get('status', 'active')} | {meta.get('category', 'technical')} | "
                                  f"{meta.get('updated', '')} |")
             lines.append("")

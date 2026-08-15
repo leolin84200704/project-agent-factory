@@ -45,11 +45,15 @@ forbid: "industry-intel(?!-)"     # 可選：不得匹配（抓錯誤答案）
 ## 跑法
 
 ```bash
-python3 scripts/run-regression.py                     # 全部題目，1 次
-python3 scripts/run-regression.py --k 3               # pass^3（非確定性）
+python3 scripts/run-regression.py                     # 全部題目，k=3（預設）
+python3 scripts/run-regression.py --k 1               # 便宜 smoke run
 python3 scripts/run-regression.py --ablation          # 加跑 memory 清空的對照組
 python3 scripts/run-regression.py --label monthly-2026-09 --diff monthly-2026-08
 ```
+
+**k=3 是預設**（Leo 拍板 2026-08-15）：baseline 實測發現檢索是非確定性的 —
+兩題 LTM 有答案的題目 k=1 時 fail、重跑即過。k=1 的單次抽樣無法區分「穩定會」
+「穩定不會」「五五開」，只用於 smoke。pass^3 全過才算穩定會。
 
 - Runner 用 `claude -p --output-format json`，cwd = instance repo（載入 CLAUDE.md +
   indexes），工具只開 Read/Glob/Grep（檢索用，不能改東西），模型用 `REGRESSION_MODEL`
@@ -83,7 +87,8 @@ Lesson PR merge 前（GEPA 原則：沒有 fitness function 的教訓庫沒有�
 
 ## 排程
 
-- 每月 1 日（或手動）：`run-regression.py --k 1 --ablation --label monthly-{YYYY-MM}`
+- 每月 1 日（或手動）：`run-regression.py --ablation --label monthly-{YYYY-MM}`（k=3）
 - weekly-routine 不跑 regression（有 API 成本），只跑免費的 eval / retrieval / metrics
-- 成本估算：每題一次 `claude -p` 呼叫；20 題 × 2 arms ≈ 40 短呼叫。用 opus 約數十萬
-  token — 若要省，`REGRESSION_MODEL=sonnet`（但跨月比較要固定同一模型才有意義）
+- 成本估算：每題每次一個 `claude -p` 呼叫；20 題 × 2 arms × k=3 ≈ 120 短呼叫。
+  用 opus 屬可觀成本 — 折衷選項：月跑 memory arm 用 k=3、ablation arm 用 `--k 1`
+  分兩次跑；或 `REGRESSION_MODEL=sonnet`（但跨月比較要固定同一模型才有意義）
