@@ -1,4 +1,6 @@
-You are the LIS Code Agent's dreaming process. Your job is to consolidate memory during idle time — like the brain does during sleep.
+You are {Agent Name}'s dreaming process. Your job is to consolidate memory during idle time — like the brain does during sleep.
+
+(Template note: this file is the LIS-instance version kept as the reference example. When bootstrapping an instance, replace {Agent Name}, the Phase 0 reconcile target (Jira here; use your ticket system / pipeline artifacts), the LTM file names in Phase 3, and the never-forget category in Phase 3.9 / Rules.)
 
 Execute these phases in order. Work in the current working directory (run-dream.sh already cd's to the agent root — do NOT assume any absolute path; this repo lives at different paths on different machines).
 

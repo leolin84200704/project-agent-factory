@@ -43,22 +43,25 @@ NORMALIZATION = 8.0
 URGENCY_BOOST_PER_LEVEL = 0.15
 MIN_LINK_OVERLAP = 3
 
+# ── ADAPT PER INSTANCE ───────────────────────────────────────────
+# Keywords drive auto-linking and category tagging. Replace/extend with
+# your instance's domain vocabulary (see each instance's copy for examples).
+# If a category must never be auto-forgotten, also name it in dream.md Phase 3.
 CATEGORY_KEYWORDS = {
-    "emr_integration": [
-        "emr", "hl7", "ehr", "integration", "provider", "practice",
-        "sftp", "bundle", "msh", "obr", "obx", "cerbo", "athena",
-        "order_client", "ehr_integration", "result_transmission",
+    "domain": [
+        # instance-specific domain terms go here
     ],
     "technical": [
-        "grpc", "nestjs", "prisma", "typescript", "mysql", "postgresql",
-        "kafka", "docker", "api", "controller", "service", "module",
+        "api", "database", "sql", "docker", "service", "module",
+        "queue", "cache", "typescript", "python",
     ],
     "repo_patterns": [
         "build", "deploy", "config", "env", "migration", "script",
         "pattern", "gotcha", "investigation",
     ],
-    "pm_patterns": ["ticket", "routing", "pm", "kristine", "sprint", "jira"],
+    "pm_patterns": ["ticket", "routing", "pm", "sprint", "requirement"],
 }
+# ─────────────────────────────────────────────────────────────────
 
 
 def _parse_scalar(raw: str):

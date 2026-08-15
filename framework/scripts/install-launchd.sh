@@ -1,19 +1,27 @@
 #!/bin/bash
-# Generate + install the launchd jobs (dream nightly 18:30, weekly Sunday 11:00)
-# for THIS machine's checkout path. The old committed plists hardcoded
-# /Users/hung.l/src/lis-code-agent, so on any other machine the jobs silently
-# never existed — that is how the dream pipeline died without anyone noticing.
+# Generate + install the launchd jobs (dream nightly, weekly Sunday 11:00)
+# for THIS machine's checkout path. Labels are derived from the instance
+# directory name, so the same script works for every instance unmodified.
+#
+# History: the old committed plists hardcoded one machine's absolute path, so
+# on any other machine the jobs silently never existed — that is how the dream
+# pipeline died without anyone noticing. Deriving everything from $AGENT_ROOT
+# at install time prevents that class of failure.
 #
 # Usage: bash scripts/install-launchd.sh          # install/refresh both jobs
 #        bash scripts/install-launchd.sh --status # show current state
+#        DREAM_HOUR=19 DREAM_MINUTE=0 bash scripts/install-launchd.sh
+#          (instances sharing a machine should stagger dream times so they
+#           don't compete for the same API quota window)
 set -euo pipefail
 
 AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+INSTANCE="$(basename "$AGENT_ROOT")"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
 mkdir -p "$LAUNCH_DIR" "$AGENT_ROOT/logs"
 
 if [[ "${1:-}" == "--status" ]]; then
-    for label in com.lis-code-agent.dream com.lis-code-agent.weekly; do
+    for label in "com.$INSTANCE.dream" "com.$INSTANCE.weekly"; do
         echo "== $label =="
         launchctl list "$label" 2>/dev/null || echo "  not loaded"
     done
@@ -57,13 +65,16 @@ EOF
     echo "installed + loaded: $out -> $AGENT_ROOT/scripts/$script"
 }
 
-make_plist com.lis-code-agent.dream run-dream.sh \
-"        <key>Hour</key>
-        <integer>18</integer>
-        <key>Minute</key>
-        <integer>30</integer>"
+DREAM_HOUR="${DREAM_HOUR:-18}"
+DREAM_MINUTE="${DREAM_MINUTE:-30}"
 
-make_plist com.lis-code-agent.weekly weekly-routine.sh \
+make_plist "com.$INSTANCE.dream" run-dream.sh \
+"        <key>Hour</key>
+        <integer>$DREAM_HOUR</integer>
+        <key>Minute</key>
+        <integer>$DREAM_MINUTE</integer>"
+
+make_plist "com.$INSTANCE.weekly" weekly-routine.sh \
 "        <key>Weekday</key>
         <integer>0</integer>
         <key>Hour</key>
@@ -72,4 +83,4 @@ make_plist com.lis-code-agent.weekly weekly-routine.sh \
         <integer>0</integer>"
 
 echo
-echo "Verify: launchctl list | grep lis-code-agent"
+echo "Verify: launchctl list | grep $INSTANCE"
