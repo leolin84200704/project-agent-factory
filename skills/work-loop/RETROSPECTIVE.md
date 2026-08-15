@@ -7,7 +7,8 @@ trigger: 由 SKILL.md Step 8 自動觸發，不獨立使用
 # Retrospective Protocol
 
 > Step 8 的 analyze sub-agent 使用此協議進行回顧反思。
-> 讀取 `stm_read(ticket_id)` 取得完整工作紀錄後，按以下框架逐項分析。
+> 讀取 STM 檔（`{memory_root}/storage/short_term_memory/{ticket_id}.md`）取得
+> 完整工作紀錄後，按以下框架逐項分析。
 
 ---
 
@@ -33,7 +34,7 @@ Scope 變化: {擴大/縮小/一致}
 ```
 
 ### 2. 失敗分析
-- 從 Failures 區段提取所有失敗紀錄（用 `stm_get_failures(ticket_id)`）
+- 從 STM 檔的 `## Failures` 區段提取所有失敗紀錄
 - 每個失敗逐一分析：
 
 | 項目 | 內容 |
@@ -57,8 +58,8 @@ Scope 變化: {擴大/縮小/一致}
 
 ### 3. 模式識別
 - 這次的問題模式是否在過去出現過？
-  - 搜尋 `stm_search` 結果中的類似 pattern
-  - 對比 knowledge 檔案中已知的 pattern
+  - Grep 過去的 STM 檔找類似 pattern
+  - 對比 LTM（`long-term-memory/`）中已知的 pattern
 - 是否發現了新的 pattern 值得記住？
   - 新的 code pattern（例如某個 service 的正確使用方式）
   - 新的 gotcha（例如某個欄位的 type 不是預期的）
@@ -161,10 +162,10 @@ PM 描述特點: ...
 改進方向: ...
 ```
 
-主 agent 收到後，將結果記錄到：
-- `stm_append(ticket_id, section="Retrospective", content="{完整回顧}")`
-- `stm_append(ticket_id, section="Lessons Learned", content="{教訓摘要}")`
+主 agent 收到後，將結果寫回 STM 檔：
+- `## Retrospective` 區段 ← 完整回顧
+- `## Lessons Learned` 區段 ← 教訓摘要
 
 ---
 
-*Last Updated: 2026-04-16*
+*Last Updated: 2026-08-15*
