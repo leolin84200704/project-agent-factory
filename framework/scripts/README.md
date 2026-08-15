@@ -13,7 +13,9 @@
 | `extract-failures.py` | STM Failures → LTM failure index | `THEMES` |
 | `extract-rules.py` | STM feedback → LTM rules constitution | `CATEGORIES` |
 | `sweep-urgency.py` | STM urgency 補標 | prefix/tag tuples |
-| `weekly-routine.sh` | 每週量測（eval + retrieval diff 報告） | 不用改 |
+| `agent-metrics.py` | 縱向行為指標（interventions / interrupts / streak / auto-approve / line survival） | `WATCH_PATHS`、`DEFAULT_REPOS` |
+| `run-regression.py` | 私有 regression suite + memory-ablation（見 `../REGRESSION.md`） | `eval-tasks/` 題庫 per instance |
+| `weekly-routine.sh` | 每週量測（eval + retrieval + metrics diff 報告） | 不用改 |
 | `install-launchd.sh` | 排程安裝（label 自動取目錄名） | 同機多 instance 用 `DREAM_HOUR`/`DREAM_MINUTE` 錯開 |
 
 工作機的活體（Vibrant America instance）在 `~/src/lis-code-agent/scripts/` — 那份先演化；框架大改時回填這裡。個人機 instance（iic/jac）2026-08-15 起與此版本同步。

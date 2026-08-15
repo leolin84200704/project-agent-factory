@@ -34,7 +34,8 @@ DRY RUN: would run weekly self-improvement
     4. python3 scripts/memory_scoring.py
     5. python3 scripts/eval.py --label weekly-$DATE
     6. python3 scripts/test-retrieval.py --label weekly-$DATE
-    7. write $REPORT (diff with previous weekly snapshot)
+    7. python3 scripts/agent-metrics.py --days 30 --label weekly-$DATE
+    8. write $REPORT (diff with previous weekly snapshot)
 EOF
     exit 0
 fi
@@ -55,6 +56,7 @@ step "sweep-urgency"     python3 scripts/sweep-urgency.py
 step "rebuild-scores"    python3 scripts/memory_scoring.py
 step "eval-snapshot"     python3 scripts/eval.py --label "weekly-$DATE"
 step "retrieval-test"    python3 scripts/test-retrieval.py --label "weekly-$DATE"
+step "agent-metrics"     python3 scripts/agent-metrics.py --days 30 --label "weekly-$DATE"
 
 # Build the human-readable report: diff against the previous weekly eval
 # snapshot. Exclude *retrieval* files (they have their own diff below) and
@@ -82,6 +84,11 @@ fi
         echo "## Retrieval diff"
         echo '```'
         python3 scripts/test-retrieval.py --diff "weekly-$prev_label" 2>&1 | sed -n '/## Diff/,$p'
+        echo '```'
+        echo
+        echo "## Agent metrics diff (30d window)"
+        echo '```'
+        python3 scripts/agent-metrics.py --days 30 --diff "weekly-$prev_label" 2>&1 | sed -n '/## Diff/,$p'
         echo '```'
     else
         echo "_No previous weekly snapshot found — this is the first weekly run._"

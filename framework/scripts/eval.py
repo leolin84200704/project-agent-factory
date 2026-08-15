@@ -46,6 +46,9 @@ EVAL_OUT.mkdir(exist_ok=True)
 ARCHIVE_STALE_DAYS = 30
 ARCHIVE_SCORE_CEILING = 0.1
 
+# Self-assessed confidence written by the work loop's Step 8 retrospective.
+CONFIDENCE_RE = re.compile(r"信心度[:：]?\s*([1-5])\s*/\s*5")
+
 
 def _section_filled(text: str, header: str) -> bool:
     """Return True if the named markdown section has non-trivial body content."""
@@ -134,10 +137,14 @@ def collect() -> dict:
     with_retro = 0
     with_failures = 0
     completed_without_retro = []
-    for f in stm_files:
+    confidences: list[int] = []
+    for f in stm_files + list_tier_files("archive"):
         try:
             text = f.read_text(encoding="utf-8")
         except Exception:
+            continue
+        confidences.extend(int(m) for m in CONFIDENCE_RE.findall(text))
+        if f not in stm_files:
             continue
         meta = metas.get(f, {})
         retro_ok = _section_filled(text, "Retrospective")
@@ -152,6 +159,13 @@ def collect() -> dict:
         "retrospective_pct": round(100 * with_retro / n, 1),
         "failures_pct": round(100 * with_failures / n, 1),
         "completed_without_retro": completed_without_retro,
+    }
+    # Confidence trend (STM + archive, so scores survive archiving); weekly
+    # snapshot diffs turn this into the longitudinal curve.
+    result["confidence"] = {
+        "n": len(confidences),
+        "mean": round(statistics.mean(confidences), 2) if confidences else None,
+        "min": min(confidences) if confidences else None,
     }
 
     result["last_dream"] = _parse_last_dream_log()
@@ -221,6 +235,10 @@ def print_report(r: dict) -> None:
         print(f"- Completed but missing Retrospective: {len(c['completed_without_retro'])}")
         for tid in c["completed_without_retro"]:
             print(f"    - {tid}")
+    conf = r.get("confidence", {})
+    if conf.get("n"):
+        print(f"- Self-assessed confidence: mean {conf['mean']}/5 "
+              f"(n={conf['n']}, min={conf['min']})")
 
     print()
     print("## Last Dream Ops")
