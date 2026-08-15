@@ -7,6 +7,7 @@
 當收到 ticket 處理請求時，遵循以下流程。
 
 ## Step 1: Retrieve（檢索經驗）
+0. **Sync first（最高指導原則，AGENTS.md 核心原則 0）**：`git fetch` 本 instance repo 與所有會碰到的工作 repos，確認 ahead/behind；落後先 pull / rebase 再開始
 1. 讀取 STM / LTM `_index.md`（含 staleness check，見 `RETRIEVAL.md`）
 2. Grep `{memory_root}/storage/short_term_memory/` 找類似的過去 ticket；有相似 ticket 就讀其 STM，特別關注 Failures 區段
 3. Grep `{memory_root}/long-term-memory/` 找相關技術知識

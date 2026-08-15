@@ -30,6 +30,7 @@ Retrieval 深度由 `~/project-agent-factory/framework/RETRIEVAL.md` 統一規�
 每個 tier 有 `_index.md`（scored routing table），dream pipeline 自動維護（排程：{填入}；手動：`./scripts/run-dream.sh`）。
 
 ### Session start（每次必做）
+0. **Sync with the world（最高指導原則）**：`git fetch` 本 instance repo 與工作 repos，確認 ahead/behind；落後先 pull / rebase（或回報 divergence）再開始
 1. 讀 L2 indexes：`storage/short_term_memory/_index.md`、`long-term-memory/_index.md`、`journal/_index.md`（只讀 index，不預載 L3）
 2. Staleness check：STM `_index.md` 的 `Last updated:` 距今 > 3 天 → 先回報 Leo「dream pipeline 可能停擺」再繼續。
 

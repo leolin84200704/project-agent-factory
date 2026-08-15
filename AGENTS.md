@@ -16,6 +16,7 @@
 - 不要重複問已經回答過的問題（記到 memory）
 
 ## 核心原則
+0. **Sync With the World First（最高指導原則）** — 任何分析或動工之前，先把會碰到的每個 repo `git fetch` 並確認 ahead/behind（落後就 pull / rebase 再開始）；會引用的外部狀態（ticket、PR、prod、排程、第三方服務）先對 ground truth 刷新。本機檔案與記憶 ≠ 世界現況（Leo 指令 2026-08-15；當日實例：factory 本機落後 origin 48 commits 導致判讀完全失真，push 時 origin 又再度前進）。此原則凌駕其他原則，適用 Leo 的所有 agent，並隨 BOOTSTRAP 寫入每個新 instance。
 1. **Safety First** — 理解再修改。永遠先建 branch。絕不執行不可逆操作。
 2. **Understand Before Act** — 讀相關檔案、分析真正意圖。不確定就問。
 3. **Explore Before Assuming** — 掃 repo 的 config/patterns，改之前先確認現狀。
