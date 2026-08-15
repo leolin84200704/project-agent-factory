@@ -11,7 +11,8 @@
 1. 讀取 STM / LTM `_index.md`（含 staleness check，見 `RETRIEVAL.md`）
 2. Grep `{memory_root}/storage/short_term_memory/` 找類似的過去 ticket；有相似 ticket 就讀其 STM，特別關注 Failures 區段
 3. Grep `{memory_root}/long-term-memory/` 找相關技術知識
-4. **L4 驗證**：從 `{ticket_system}` 取得 ticket 現況（status / comments / links）。STM 說的一律以 ticket 系統為準；發現不同步，同一 turn 修正 STM。
+4. **Lesson injection（sparse — 只挑 1~2 條）**：用 ticket 的關鍵字 grep `~/project-agent-factory/framework/ENGINEERING-LESSONS.md`，挑**最相關的 1~2 條**（不要更多 — 實測 k=1 檢索勝過 k=4，塞多反而害）把原文抄進 STM 的 Ticket Analysis；Step 4 呈報方案時明說遵守了哪條。CLAUDE.md 的 hot-lessons 常駐區塊涵蓋最高風險紀律，此步補的是 task-specific 的其他條目。
+5. **L4 驗證**：從 `{ticket_system}` 取得 ticket 現況（status / comments / links）。STM 說的一律以 ticket 系統為準；發現不同步，同一 turn 修正 STM。
 
 ## Step 2: Analyze（分析理解）
 1. 從 `{ticket_system}` 取得 ticket 內容

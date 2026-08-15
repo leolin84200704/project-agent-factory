@@ -22,6 +22,11 @@
             "if": "Bash(git clean*)",
             "command": ".claude/hooks/validate-git-destructive.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/remind-engineering-lessons.sh",
+            "timeout": 5
           }
         ]
       }

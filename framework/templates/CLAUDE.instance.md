@@ -53,3 +53,13 @@ Retrieval 深度由 `~/project-agent-factory/framework/RETRIEVAL.md` 統一規�
 
 ## 本工作 Know-how
 {填入或連結：repo 清單、環境存取方式、部署 pipeline、domain 知識入口}
+
+## Hot lessons（factory 核心紀律常駐層 — dream 每晚與 ENGINEERING-LESSONS 同步，勿手改）
+<!-- hot-lessons:begin -->
+- **Batch DB verify 100%** — 批次 INSERT/UPDATE 後驗證全部 rows（count 對帳 + 反向查漏網），絕不抽查。
+- **Cleanup filter scope** — DELETE 的 WHERE 必須綁定當次操作範圍（時間 + 明確 ID），絕不為「保險」放寬。
+- **Verified means live, not mock** — 行為結論要用真實 DB / 跑著的服務重現；mock 綠燈 ≠ 驗證過。
+- **Test before push** — 影響 prod 的 push 前必跑測試，覆蓋新 logic 每個分支；compile pass ≠ 行為正確。
+- **Preserve evidence before restart** — hang 的 process/pod 先 dump logs 再重啟，否則 root cause 永久消失。
+- **Channel liveness is third-party state** — 己方動作成功 ≠ 通道活著；deploy 收尾做真實 round-trip。
+<!-- hot-lessons:end -->
