@@ -44,6 +44,43 @@ ALLOWED_TOOLS = "Read,Glob,Grep"
 RUN_WARN_THRESHOLD = 60
 
 
+def _unquote(v: str) -> str:
+    """Minimal YAML scalar semantics for the no-PyYAML fallback. Double-quoted
+    strings process escapes (a silent gap here once made two graders
+    unsatisfiable — 2026-08-15); single-quoted and plain scalars are literal."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        return v[1:-1].replace('\\\\', '\x00').replace('\\"', '"').replace('\x00', '\\')
+    if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+        return v[1:-1].replace("''", "'")
+    return v
+
+
+def _parse_fallback_yaml(block: str) -> dict:
+    """Flat key/value + block lists. Flow lists are NOT supported — commas
+    inside regex patterns make naive splitting wrong; use block lists."""
+    meta: dict = {}
+    list_key: str | None = None
+    for line in block.splitlines():
+        if line.startswith("- ") and list_key:
+            meta.setdefault(list_key, []).append(_unquote(line[2:]))
+            continue
+        if ":" in line and not line.startswith(" "):
+            list_key = None
+            k, _, v = line.partition(":")
+            k = k.strip()
+            if not v.strip():
+                list_key = k
+                meta.setdefault(k, [])
+            elif v.strip().startswith("["):
+                raise SystemExit(
+                    f"task frontmatter uses a flow list ({k}: [...]) — not "
+                    f"supported without PyYAML; use a block list (- item)")
+            else:
+                meta[k] = _unquote(v)
+    return meta
+
+
 def load_tasks(subset: set[str] | None) -> list[dict]:
     tasks = []
     if not TASKS_DIR.is_dir():
@@ -58,15 +95,7 @@ def load_tasks(subset: set[str] | None) -> list[dict]:
             import yaml  # type: ignore
             meta = yaml.safe_load(text[4:end]) or {}
         except ModuleNotFoundError:
-            for line in text[4:end].splitlines():
-                if ":" in line:
-                    k, _, v = line.partition(":")
-                    v = v.strip().strip("'\"")
-                    if v.startswith("[") and v.endswith("]"):
-                        meta[k.strip()] = [x.strip().strip("'\"")
-                                           for x in v[1:-1].split(",") if x.strip()]
-                    else:
-                        meta[k.strip()] = v
+            meta = _parse_fallback_yaml(text[4:end])
         if meta.get("retired"):
             continue
         tid = meta.get("id", f.stem)
@@ -161,12 +190,19 @@ def cleanup_ablated(dest: Path, tmp: str) -> None:
 
 
 def run_arm(tasks: list[dict], cwd: Path, k: int, timeout: int, arm: str) -> dict:
+    fail_dir = EVAL_OUT / "failed-outputs"
     rows = []
     for t in tasks:
         attempts = []
-        for _ in range(k):
+        for i in range(k):
             r = run_claude(t["prompt"], cwd, timeout)
             ok, why = (False, r["error"]) if r.get("error") else grade(t, r["output"])
+            if not ok:
+                # Keep the raw answer — an ungradeable-vs-wrong-vs-flaky
+                # diagnosis is impossible without it (learned 2026-08-15).
+                fail_dir.mkdir(exist_ok=True)
+                (fail_dir / f"{date.today().isoformat()}-{arm}-{t['id']}-a{i+1}.txt"
+                 ).write_text(f"WHY: {why}\n---\n{r.get('output', '')}", encoding="utf-8")
             attempts.append({"pass": ok, "why": why,
                              "tokens": r.get("tokens"), "turns": r.get("turns"),
                              "seconds": r.get("seconds")})
@@ -203,7 +239,19 @@ def main() -> None:
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--label")
     ap.add_argument("--diff")
+    ap.add_argument("--check", metavar="TASK_ID",
+                    help="grade a hand-written answer against one task's "
+                         "grader — validates the grader itself, no API call")
+    ap.add_argument("--answer", help="known-correct answer text for --check")
     args = ap.parse_args()
+
+    if args.check:
+        checked = load_tasks({args.check})
+        if not checked:
+            sys.exit(f"no task '{args.check}'")
+        ok, why = grade(checked[0], args.answer or "")
+        print(f"{checked[0]['id']}: {'GRADER OK (PASS)' if ok else 'GRADER FAIL — ' + str(why)}")
+        sys.exit(0 if ok else 1)
 
     subset = set(args.tasks.split(",")) if args.tasks else None
     tasks = load_tasks(subset)

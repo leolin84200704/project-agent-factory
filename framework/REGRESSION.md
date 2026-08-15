@@ -38,9 +38,16 @@ forbid: "industry-intel(?!-)"     # 可選：不得匹配（抓錯誤答案）
 3. **題目要考「記憶才知道的事」** — 模型自身推不出來的 non-inferable 事實/規則
    （ETH Zurich 2026：context 只有這類內容有用）。好題：「gcloud project id 是什麼」
    （typo 只有記憶知道）。壞題：「什麼是 docker」。
-4. 目標 20–50 題；達標後新失敗進題、連續 6 個月全過且來源已失效的題退役（記錄在
+4. **Grader 先驗證再入庫（血訓 2026-08-15）** — 每題入庫前必跑
+   `run-regression.py --check {id} --answer "{手寫的正確答案}"`（零 API 成本）確認
+   grader 判得對。第一版題庫有兩題因 YAML escaping 讓 regex 永遠匹配不到，「不可能
+   被判對的題」被誤讀成「agent 檢索失敗」，浪費了一輪修復。fail 時 runner 會把
+   agent 原始回答存到 `eval-output/failed-outputs/` — 診斷先看它。
+5. 題目 regex 避免 backslash escape（`.` 不轉義照樣匹配字面句點）；`expect_all` 一律
+   用 block list（`- "pattern"`），不用 flow list（無 PyYAML 的機器上逗號會切壞 pattern）。
+6. 目標 20–50 題；達標後新失敗進題、連續 6 個月全過且來源已失效的題退役（記錄在
    task frontmatter `retired: {date}` 而非刪除）。
-5. 題庫是私有資料，**不要**放進任何公開 repo 或 prompt 分享。
+7. 題庫是私有資料，**不要**放進任何公開 repo 或 prompt 分享。
 
 ## 跑法
 
