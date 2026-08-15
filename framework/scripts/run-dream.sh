@@ -2,7 +2,19 @@
 set -uo pipefail
 
 AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+INSTANCE="$(basename "$AGENT_ROOT")"
 cd "$AGENT_ROOT"
+
+# Pin the dream model explicitly. Headless `claude -p` inherits the user's
+# default model from ~/.claude/settings.json — if that default is Fable, every
+# nightly dream silently burns Fable usage credits on a consolidation job that
+# does not need it. Override per-run with DREAM_MODEL=... if needed.
+DREAM_MODEL="${DREAM_MODEL:-opus}"
+
+# The dream must never read/write Claude Code's native auto memory: the
+# instance repo (STM/LTM/journal) is the single system of record, and headless
+# runs writing to ~/.claude/projects/*/memory/ create a diverging shadow store.
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
 
 DATE=$(date +%Y-%m-%d)
 LOG_DIR="$AGENT_ROOT/logs"
@@ -12,7 +24,8 @@ if [[ "${1:-}" == "--dry" ]]; then
     echo "DRY RUN: would execute dream pipeline"
     echo "  Agent root: $AGENT_ROOT"
     echo "  Date: $DATE"
-    echo "  Command: claude -p \"\$(cat scripts/dream.md)\" --allowedTools Read,Write,Edit,Glob,Grep,Bash"
+    echo "  Model: $DREAM_MODEL"
+    echo "  Command: claude -p \"\$(cat scripts/dream.md)\" --model $DREAM_MODEL --allowedTools Read,Write,Edit,Glob,Grep,Bash"
     exit 0
 fi
 
@@ -25,7 +38,7 @@ echo "  Agent root: $AGENT_ROOT" | tee -a "$LOG_FILE"
 # log and no notification (output had no "API Error" so it looked like success).
 if ! command -v claude >/dev/null 2>&1; then
     echo "[$(date)] FATAL: claude CLI not found on PATH ($PATH)" | tee -a "$LOG_FILE"
-    osascript -e 'display notification "claude CLI not found — dream pipeline cannot run" with title "LIS Code Agent" sound name "Basso"' >/dev/null 2>&1 || true
+    osascript -e 'display notification "claude CLI not found — dream pipeline cannot run" with title "'"$INSTANCE"'" sound name "Basso"' >/dev/null 2>&1 || true
     exit 1
 fi
 
@@ -47,6 +60,7 @@ while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
     echo "[$(date)] === Dream attempt $ATTEMPT/$MAX_ATTEMPTS ===" | tee -a "$LOG_FILE"
     TMP=$(mktemp)
     claude -p "$PROMPT" \
+        --model "$DREAM_MODEL" \
         --allowedTools "Read,Write,Edit,Glob,Grep,Bash" \
         > "$TMP" 2>&1
     CLAUDE_EXIT=$?
@@ -70,7 +84,7 @@ done
 
 if [[ $SUCCESS -eq 0 ]]; then
     echo "[$(date)] FAILED after $MAX_ATTEMPTS attempts" | tee -a "$LOG_FILE"
-    osascript -e 'display notification "Dream pipeline failed after retries" with title "LIS Code Agent" sound name "Basso"' >/dev/null 2>&1 || true
+    osascript -e 'display notification "Dream pipeline failed after retries" with title "'"$INSTANCE"'" sound name "Basso"' >/dev/null 2>&1 || true
     exit 1
 fi
 

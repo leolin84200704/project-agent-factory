@@ -48,13 +48,15 @@
 - `long-term-memory/ticket-routing.md` — 「哪類需求改哪個 repo」的初版路由表（之後由 dream 持續修正）
 
 ### 4. 接 memory pipeline
-- `scripts/` 內路徑與 ticket 系統參數改成本 instance 的
-- 排程（launchd/cron）依 `scripts/install-launchd.sh` 樣式安裝；沒有排程也可，但 CLAUDE.md 要註明「手動跑 run-dream.sh」
+- `scripts/` 內路徑與 ticket 系統參數改成本 instance 的（`ADAPT PER INSTANCE` 標記的 config 區塊）
+- 排程：`bash scripts/install-launchd.sh` 直接裝（label 自動取 instance 目錄名；同機多 instance 用 `DREAM_HOUR`/`DREAM_MINUTE` 錯開）。沒有排程也可，但 CLAUDE.md 要註明「手動跑 run-dream.sh」
 - Staleness check 從第一天就生效
+- Native auto memory 關閉（template settings.json 已含 `autoMemoryEnabled: false`；理由見 `framework/RETRIEVAL.md` § Native harness auto memory）
 
 ### 5. Workspace 接線
 - 若 Leo 從 workspace 根目錄（非 instance repo 內）啟動 session：workspace 根放一份 `CLAUDE.md`，內容一行 `@{instance}/CLAUDE.md`
 - 這份工作專屬的 skills 放 `{instance}/.claude/skills/`，並 symlink 到 `{workspace}/.claude/skills/`（讓從 workspace 啟動的 session 也能發現）
+- Workspace 及各工作 repo 放 `.claude/settings.local.json` 內容 `{"autoMemoryEnabled": false}`（auto memory 以 session cwd 為單位，只關 instance repo 關不到工作 repo 的 session）
 
 ### 6. 驗收（新開一個 session 測）
 - 問「branch 規則是什麼」→ 應同時反映個人層 + instance 層

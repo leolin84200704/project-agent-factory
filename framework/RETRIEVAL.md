@@ -106,6 +106,26 @@ distilled: false        # dream sets true after distillation
 
 Cap ~200 lines. Journal is the compressed reasoning trace, not a play-by-play — the ticket report already exists in STM.
 
+## Native harness auto memory（決策 2026-08-15）
+
+Claude Code v2.1.33+ 內建 per-cwd auto memory（`~/.claude/projects/{slug}/memory/`，
+每 session 自動載入 MEMORY.md 前 200 行，模型自行寫入）。**在有 instance memory
+系統的 repo 與其 workspace，一律 `autoMemoryEnabled: false` 關閉**（instance
+`.claude/settings.json` + workspace `.claude/settings.local.json`；template 已內建）。
+
+理由（自家 dream ≥ 原生，實測比較 2026-08-15）：
+1. 原生無 consolidation 保證（所謂 Auto Dream 官方文件不存在）、無 L4 ground-truth
+   reconcile、無 scoring/decay、無跨 instance lesson 傳播 — 這些自家 pipeline 都有。
+2. Store 在 `~/.claude` 之下：不進 instance git、不可攜、受 harness 行為與政策變動影響。
+3. 兩套並存的實害已發生：同一教訓三份 copy（原生 + instance CLAUDE.md + factory
+   lessons）；另有 Leo 行為規則只被原生抓到、instance memory 全然不知（divergence）。
+4. 每 session 200 行 context tax，疊在 instance CLAUDE.md + indexes 之上。
+
+原生的唯一優勢是 mid-session 隨手捕捉（不靠 session-end 紀律）— 弱點由 journal
+紀律 + AGENTS.md 的 auto-learner 協議補償。沒有 instance memory 系統的一般專案
+不在此限，原生 auto memory 可留用。headless dream run 一律
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`（run-dream.sh 已內建），避免 shadow store。
+
 ## Anti-patterns this protocol replaces
 
 1. Trusting STM `status:` without checking the ticket system → L3→L4 rule
