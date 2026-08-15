@@ -10,6 +10,7 @@
 - **Verified means live, not mock** — 別把 mock unit test 說成「線上驗證」。prod 行為的結論要用真實 DB / 部署中的 service 重現。
 - **Verify peer-observed state** — 修 network/lifecycle 問題時，驗證對端可觀察的狀態（對方的 session count、connection 數），不只看自己這邊的 log。
 - **Rolling deploy 完成的判準是新 pod 本身，不是 deployment 聚合欄位** — k8s rolling update 期間 `deployment.status.readyReplicas` 計入**舊** pod，所以「spec image 已更新 + ready≥1」會在新 pod 還沒起來時就成立，是假完成訊號；照它開跑驗證會打到舊版 code，測試結果全部作廢。正確判準：存在一個 **image == 目標版本** 且 `containerStatuses[].ready==true` 的 pod（必要時再確認舊 pod 已終止）。同理適用任何滾動替換系統：完成訊號要綁「新實例的身份+就緒」，不能用會混入舊實例的聚合計數。旁註：切換過程中單次 API 讀值可能出現 transient 異常值，關鍵判斷要重讀確認、不要憑單次讀值行動。
+- **並發 merge 會讓舊 build 蓋掉新 artifact — 收尾要驗 serving 版本身分** — per-commit 觸發的 CI/CD 有個 race：兩個 PR 相隔很近 merge，會觸發重疊的 build，較早 commit 的 build 可能**最後**完成，把新 commit 的 image/artifact 蓋回舊 code。「build 綠燈」≠「新 code 正在服務」。根因是 build 之間無 commit-ordering 保證、deploy 又是「最後完成者勝」。連續 merge（尤其打同一條 pipeline 的兩個 PR）後，必須驗證實際 serving 的 revision/image digest 對得上目標 commit，而不是只看最後一次 build 回綠。這是上一條 rolling-deploy 教訓的姊妹：兩者都要求收尾時綁定「正在服務的 artifact 身分」，而非任何聚合或「已觸發」訊號。
 - **Batch DB verify 100%** — 批次 INSERT/UPDATE 後驗證全部 rows，絕不抽查。
 - **JOIN scope reverse audit** — prod UPDATE-WHERE-JOIN 跑完後，用更廣的 criterion 反向 SELECT 找漏網 row；SQL 的 `NULL = NULL` 是 false，會靜默漏掉。
 - **End-to-end equivalence before swap** — 替換 RPC/service 實作前，diff 前後 output 完全相同；proto 相同 ≠ marshalling 相同。
