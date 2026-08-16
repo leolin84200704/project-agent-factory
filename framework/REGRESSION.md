@@ -85,7 +85,7 @@ worktree 一律清除。
 
 Lesson PR merge 前（GEPA 原則：沒有 fitness function 的教訓庫沒有選擇壓力）：
 
-1. 在 factory checkout lesson branch（`git -C ~/project-agent-factory switch lesson/...`）
+1. 在 factory checkout lesson branch（`git -C ~/src/project-agent-factory switch lesson/...`）
 2. 對受影響的 instance 跑 `run-regression.py --label gate-{slug}`
 3. `git switch main` 再跑 `--label gate-baseline --diff gate-{slug}`
 4. pass 下降或 tokens 顯著上升 → lesson 有害，PR 附數據駁回；否則照常人工審

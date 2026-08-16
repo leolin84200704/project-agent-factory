@@ -79,4 +79,4 @@ Instance 機器開不了 PR 時：把同格式內容寫到 `framework/proposals/
 
 ## 同步提醒
 
-Lesson PR merge 發生在 GitHub；本機 `~/project-agent-factory` 要 `git pull` 才會生效（session 讀的是本機檔案）。Instance 的 dream pipeline 在提案前會先 pull。
+Lesson PR merge 發生在 GitHub；本機 `~/src/project-agent-factory` 要 `git pull` 才會生效（session 讀的是本機檔案）。Instance 的 dream pipeline 在提案前會先 pull。
