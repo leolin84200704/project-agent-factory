@@ -11,7 +11,7 @@
 1. 讀取 STM / LTM `_index.md`（含 staleness check，見 `RETRIEVAL.md`）
 2. Grep `{memory_root}/storage/short_term_memory/` 找類似的過去 ticket；有相似 ticket 就讀其 STM，特別關注 Failures 區段
 3. Grep `{memory_root}/long-term-memory/` 找相關技術知識
-4. **Lesson injection（sparse — 只挑 1~2 條）**：用 ticket 的關鍵字 grep `~/src/project-agent-factory/framework/ENGINEERING-LESSONS.md`，挑**最相關的 1~2 條**（不要更多 — 實測 k=1 檢索勝過 k=4，塞多反而害）把原文抄進 STM 的 Ticket Analysis；Step 4 呈報方案時明說遵守了哪條。CLAUDE.md 的 hot-lessons 常駐區塊涵蓋最高風險紀律，此步補的是 task-specific 的其他條目。
+4. **Lesson injection（sparse — 只挑 1~2 條）**：用 ticket 的關鍵字 grep `framework/ENGINEERING-LESSONS.md`（本檔所在 factory repo），挑**最相關的 1~2 條**（不要更多 — 實測 k=1 檢索勝過 k=4，塞多反而害）把原文抄進 STM 的 Ticket Analysis；Step 4 呈報方案時明說遵守了哪條。CLAUDE.md 的 hot-lessons 常駐區塊涵蓋最高風險紀律，此步補的是 task-specific 的其他條目。
 5. **L4 驗證**：從 `{ticket_system}` 取得 ticket 現況（status / comments / links）。STM 說的一律以 ticket 系統為準；發現不同步，同一 turn 修正 STM。
 
 ## Step 2: Analyze（分析理解）
@@ -82,7 +82,7 @@
 6. **Factory 蒸餾檢查（必做，不是選項）**: 問「這次學到的東西有沒有跨 instance 可攜的？」有 → 立刻開 lesson PR 到 project-agent-factory（規格見該 repo CONTRIBUTING.md：一條 lesson 一個 PR、檔案內容去識別化、細節寫在 PR body）。判斷標準：拿掉公司名/系統名之後規則仍然成立、且換一個工作環境仍會踩到 → 可攜。沒有就明說「本次無可蒸餾」。這一步做不做，決定 factory 會不會退化成死文件。
 記錄到 STM: Retrospective + Lessons Learned
 
-詳細框架見 `~/src/project-agent-factory/skills/work-loop/RETROSPECTIVE.md`
+詳細框架見 `skills/work-loop/RETROSPECTIVE.md`（本檔所在 factory repo）
 
 ## Step 9: Journal（寫 episodic 紀錄 — 不直寫 LTM）
 1. 依 `RETRIEVAL.md` § Session journaling 寫 `{memory_root}/journal/YYYY-MM-DD-{slug}.md`：探索過什麼、排除過什麼、為何這樣決定、使用者的原話

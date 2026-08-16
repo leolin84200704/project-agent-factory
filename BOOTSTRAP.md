@@ -1,7 +1,9 @@
 # BOOTSTRAP — 初始化一個新的工作/專案 Agent
 
-> 對 Claude 說「依 `~/src/project-agent-factory/BOOTSTRAP.md` 初始化 {名稱}，workspace 在 {路徑}，repos 是 {...}」即可執行。
-> 前提：`~/src/project-agent-factory` 已 clone、`~/.claude/CLAUDE.md → ~/src/project-agent-factory/AGENTS.md` symlink 已建立（見 README）。
+> 對 Claude 說「依 `$FACTORY/BOOTSTRAP.md` 初始化 {名稱}，workspace 在 {路徑}，repos 是 {...}」即可執行。
+> `$FACTORY` = factory clone 位置，依機器而異：依序探測 `~/src/project-agent-factory`、
+> `~/personal_project/project-agent-factory`，取第一個存在者（絕不用 cwd 推測；定義同 AGENTS.md「框架」節）。
+> 前提：factory 已 clone、`~/.claude/CLAUDE.md → $FACTORY/AGENTS.md` symlink 已建立（見 README）。
 
 ## 產出
 
@@ -42,7 +44,7 @@
 
 ### 2. 建骨架
 - 依上方結構 mkdir + 複製 templates/scripts/hooks
-- `CLAUDE.md`：填 `framework/templates/CLAUDE.instance.md` 的所有 `{佔位符}`；沒有答案的欄位保留 TODO 並列給 Leo
+- `CLAUDE.md`：填 `framework/templates/CLAUDE.instance.md` 的所有 `{佔位符}`；沒有答案的欄位保留 TODO 並列給 Leo。其中 `{factory_path}` 一律填**本機解析後的絕對路徑**（上方 `$FACTORY` 探測結果）——instance 檔案內不留探測邏輯，烘死路徑
 - 各 `_index.md` 初始化為空表 + `Last updated: {today}`
 
 ### 3. 餵 repos（長出第一版 LTM）
@@ -78,5 +80,5 @@
 - 確認 hooks 生效：試一個 `git push --force`（對 throwaway repo）應被擋
 
 ## 原則
-- Instance 只放這份工作專屬的內容；任何「其實是通用習慣」的東西上移到 `~/src/project-agent-factory`（AGENTS.md 或 framework/）
+- Instance 只放這份工作專屬的內容；任何「其實是通用習慣」的東西上移到 `$FACTORY`（AGENTS.md 或 framework/）
 - 反向也成立：instance 累積出的通用教訓，由 dream 或 Leo 確認後蒸餾進 `framework/ENGINEERING-LESSONS.md`
