@@ -42,10 +42,17 @@
 對每個 repo 派一個 Explore 子 agent（可平行）：
 - 掃 README、package.json/build 設定、目錄結構、CI/deploy 設定、env var 用法
 - 產出：這個 repo 是什麼、tech stack、怎麼 build/test/run、部署方式、明顯的 gotchas
+- **欄杆盤點（enforcement ladder 第 5–6 階）**：這個 repo 現有哪些確定性欄杆
+  （strict type config、lint 規則、import boundary、coverage gate、CI 上的
+  test/migration 檢查），缺哪些。缺口寫成 `long-term-memory/guardrail-gaps.md`
+  ——**只盤點與提案，不擅自加**：工作 repo 是團隊資產，加 lint/CI 規則影響所有人，
+  由 Leo 決定何時以正式 ticket/PR 提給團隊。此檔的意義：agent 寫 code 時知道
+  「哪些紀律這個 repo 不會自動幫你把關」，對應的驗證要自己補（見 WORK-LOOP Step 5–6）
 彙整寫入：
 - `long-term-memory/repos.md` — 每 repo 一節
 - `long-term-memory/patterns.md` — build/deploy/config 慣例
 - `long-term-memory/ticket-routing.md` — 「哪類需求改哪個 repo」的初版路由表（之後由 dream 持續修正）
+- `long-term-memory/guardrail-gaps.md` — 欄杆盤點與提案（上）
 
 ### 4. 接 memory pipeline
 - `scripts/` 內路徑與 ticket 系統參數改成本 instance 的（`ADAPT PER INSTANCE` 標記的 config 區塊）
@@ -56,7 +63,7 @@
 ### 5. Workspace 接線
 - 若 Leo 從 workspace 根目錄（非 instance repo 內）啟動 session：workspace 根放一份 `CLAUDE.md`，內容一行 `@{instance}/CLAUDE.md`
 - 這份工作專屬的 skills 放 `{instance}/.claude/skills/`，並 symlink 到 `{workspace}/.claude/skills/`（讓從 workspace 啟動的 session 也能發現）
-- Workspace 及各工作 repo 放 `.claude/settings.local.json`：`autoMemoryEnabled: false` + **hooks 用絕對路徑指回 factory `framework/hooks/`**（git 安全 ×2 + engineering-lessons 提醒；單一源頭、不複製檔案進產品 repo）。工作 repo 是 git 的話把 `.claude/` 加進 `.git/info/exclude`（本地 ignore，不產生 commit — 對 push-to-deploy 的 repo 尤其重要）
+- Workspace 及各工作 repo 放 `.claude/settings.local.json`：`autoMemoryEnabled: false` + **hooks 用絕對路徑指回 factory `framework/hooks/`**（git 安全 ×2 + engineering-lessons 提醒 + verification-asset 保護；單一源頭、不複製檔案進產品 repo）。工作 repo 是 git 的話把 `.claude/` 加進 `.git/info/exclude`（本地 ignore，不產生 commit — 對 push-to-deploy 的 repo 尤其重要）
 
 ### 6. 驗收（新開一個 session 測）
 - 問「branch 規則是什麼」→ 應同時反映個人層 + instance 層

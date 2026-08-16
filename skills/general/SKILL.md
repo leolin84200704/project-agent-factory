@@ -62,6 +62,35 @@ Handle various types of tickets that don't fit into specialized skills:
 
 ---
 
+## Design for Testability
+
+LLM-generated code drifts toward the most common shape in training data — and
+that shape mixes I/O into logic (network calls inside transactions, `Date.now()`
+inside domain functions, clients constructed inline). Untestable code is the
+default outcome, not the exception. Counter it with these named patterns
+(mainstream idioms — prefer them because the model already writes them well):
+
+- **Functional core / imperative shell** — pure functions for decisions and
+  transformations (no I/O, no clock, no randomness); a thin shell owns all I/O.
+  The core is what gets exhaustive cheap tests; the shell stays thin enough to
+  review by eye.
+- **Parse, don't validate** — at every boundary, parse input into a type that
+  cannot represent illegal states, instead of checking and passing the raw
+  value along.
+- **Inject the seams** — clock, ids, external clients, env come in as
+  parameters/constructor args, never reached for globally from inside logic.
+  If the test skeleton can't be written without a real DB or network, a seam
+  is missing — fix the design, not the test.
+- **Behavior-level assertions** — test what the caller observes, not internal
+  call sequences; a test that mocks the shared path it is supposed to exercise
+  is a false green (see ENGINEERING-LESSONS "Sync sibling encodings").
+
+Sequencing rule (mirrors WORK-LOOP Step 5): write the test skeleton before the
+implementation. The skeleton failing to materialize is the earliest, cheapest
+signal that the design is untestable.
+
+---
+
 ## ⚠️ CRITICAL EXECUTION RULES
 
 ### 1. READ CODE FIRST, WRITE SECOND

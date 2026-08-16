@@ -26,7 +26,8 @@
 - **Routine**（完全照既有 pattern 的 config/設定類 ticket）→ **跳過 debate**，直接進 Step 4，但要在方案裡註明「依循 {過去 ticket} 的既有 pattern」。
 - **Code change / 新 pattern / incident / 影響 prod 資料** → 派兩個子 agent 同時辯論：
   - 正方：為推薦方案辯護（優點、可行性）
-  - 反方：質疑方案（風險、邊界案例、更簡單的替代方案）
+  - 反方：質疑方案（風險、邊界案例、更簡單的替代方案），且**必問可測試性**：
+    這個方案的測試會不會全是 mock？seam（注入點）在哪？寫不出行為級測試的部分是哪一塊？
   - 綜合雙方論點調整方案，記錄到 STM: Approaches Considered
 
 ## Step 4: Discuss with User（暫停等使用者確認）
@@ -35,19 +36,27 @@
 ## Ticket: {ticket_id} - {summary}
 ### 分析摘要
 ### 建議方案（含正反論點）
+### Test plan（這個改動怎麼被驗證、seam 在哪、哪些部分只能 mock 及原因）
 ### 需要確認
 ```
-**必須等使用者確認才能進入 Step 5**
+**必須等使用者確認才能進入 Step 5**；**寫不出 Test plan 的方案不能進 Step 5**——
+測不動是設計問題，回頭改方案，不是進實作後再發現。
 
 ## Step 5: Execute（執行實作）
 1. 建立 Git branch: `git checkout -b {branch_pattern}`
-2. 逐步執行修改，每步驗證
-3. 失敗時立即記錄到 STM Failures，分析 root cause
-4. 記錄到 STM: Code Changes
+2. **先寫行為級測試骨架，再寫實作**（照 Step 4 的 Test plan；骨架 = arrange/assert
+   的空殼即可）。骨架寫不出來 = 設計缺 seam，回 Step 4 修方案，不要硬寫——
+   順序本身強迫注入點存在
+3. 逐步執行修改，每步驗證
+4. 失敗時立即記錄到 STM Failures，分析 root cause
+5. 記錄到 STM: Code Changes
 
 ## Step 6: Review with User（暫停等使用者 Review）
 1. 執行 `git diff --stat` 整理變更摘要
-2. 執行測試（如適用）
+2. 執行測試——新 logic 必附**行為級**測試（mock 掉共用路徑的假綠燈不算，見
+   ENGINEERING-LESSONS「Sync sibling encodings」條）；無法附測試時必須在 Review
+   報告明寫原因——「寫不出測試」本身就是難測 code 的警報，要浮上來給人裁決，
+   不得靜默跳過
 3. 呈現 Review 報告
 4. **必須等使用者確認才能進入 Step 7**
 5. 使用者要求修改 → 回到 Step 5
@@ -66,7 +75,9 @@
 1. **結果比較**: 初始分析假設 vs 最終結果
 2. **失敗分析**: 每個失敗的 root cause、是否可預防
 3. **模式識別**: 是否匹配已知 pattern、新發現
-4. **教訓**: 技術面、流程面、工具面
+4. **教訓**: 技術面、流程面、工具面；每條做**下推檢查**——能否變成確定性機制
+   （hook / grader / constraint / regression 題）而非 prose？參
+   `framework/ENFORCEMENT-LADDER.md`，不變量日誌格式見 RETROSPECTIVE.md § 失敗分析
 5. **信心度**: 1-5 自評（1=完全依賴指導，5=獨立完成）
 6. **Factory 蒸餾檢查（必做，不是選項）**: 問「這次學到的東西有沒有跨 instance 可攜的？」有 → 立刻開 lesson PR 到 project-agent-factory（規格見該 repo CONTRIBUTING.md：一條 lesson 一個 PR、檔案內容去識別化、細節寫在 PR body）。判斷標準：拿掉公司名/系統名之後規則仍然成立、且換一個工作環境仍會踩到 → 可攜。沒有就明說「本次無可蒸餾」。這一步做不做，決定 factory 會不會退化成死文件。
 記錄到 STM: Retrospective + Lessons Learned

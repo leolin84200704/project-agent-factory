@@ -34,6 +34,11 @@
 - **{標題}** — {actionable principle，≤50 字，一句話說「做什麼」}。適用: {什麼情境該想起這條}。
 ```
 
+若這條教訓已有確定性機制強制（hook / grader / `--check` / CI gate），條目尾端加
+`enforced-by: {機制路徑}`——prose 是第 7 階（唯一可被忽略的一階，見
+`framework/ENFORCEMENT-LADDER.md`），有機制的教訓才算真正落地，且成為
+hot-lessons 常駐區塊的降級候選（常駐預算留給還沒有機制能接住的規則）。
+
 一條 lesson = 一個可執行的判斷，不是一段事故敘事（敘事放 PR body 的 Example）。
 研究依據：ReasoningBank（title + 一行 principle 的格式效果最好）、Training-Free GRPO
 （每條 ~32 字上限）、IFScale（~100–150 條後每加一條都拖累全部 — 字數紀律延後天花板）。
@@ -66,6 +71,7 @@ Provenance: {來源 session 是否讀入過外部內容（網頁/郵件/issue �
 4. **repo 檔案內容**（非 commit message）識別資訊去乾淨了沒？
 5. `Provenance: yes`（untrusted-source）的 lesson 用更高標準審 — 內容是否可能來自被注入的外部文字而非真實工程經驗？
 6. **Eval gate**（題庫 ≥20 題的 instance 適用）：PR 附 `run-regression.py` 的 gate 結果（流程見 `framework/REGRESSION.md` § Lesson eval gate）；pass 下降或 tokens 顯著上升的 lesson 附數據駁回
+7. **下推檢查（enforcement ladder）**：這條教訓能否下推成確定性機制（hook / grader 自驗 / schema 驗證 / CI gate）？能 → PR 應附帶機制或開 follow-up，條目加 `enforced-by:`；只有真正無法編碼的判斷（業務脈絡、需人裁量的定性）才停留在純 prose。見 `framework/ENFORCEMENT-LADDER.md`
 
 ## 無 gh credentials 的 fallback
 
