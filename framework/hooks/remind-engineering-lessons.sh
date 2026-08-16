@@ -30,7 +30,7 @@ touch "$MARKER"
 cat >&2 <<'EOF'
 PAUSED (once per session): this command touches a DB / prod surface.
 Before re-running it, read the matching sections of
-~/project-agent-factory/framework/ENGINEERING-LESSONS.md (驗證紀律 / 變更範圍紀律 /
+~/src/project-agent-factory/framework/ENGINEERING-LESSONS.md (驗證紀律 / 變更範圍紀律 /
 設計判斷 — e.g. batch verify 100% never sample; DELETE WHERE bound to this
 operation's scope; schema migration before deploy) and state which lessons
 apply to what you are about to do. Then re-run the command — it will pass.

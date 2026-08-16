@@ -56,9 +56,9 @@ Execute applicable operations:
 
 1. **Distill journal** — For `undistilled_journal` entries: extract generalizable insights (Decisions + why, ruled-out approaches, user feedback) into the appropriate LTM file (emr-integration.md, patterns.md, repos.md, ticket-routing.md). Set `distilled: true` in the entry's frontmatter. This is the ONLY path by which LTM gets written — the work loop never writes LTM directly.
 
-   **Universal-lesson routing** — if an insight is a job-agnostic engineering discipline (would hold at any employer/project), propose it to project-agent-factory via a lesson PR per `~/project-agent-factory/CONTRIBUTING.md`:
-   1. If `~/project-agent-factory` does not exist on this machine, skip and note it in the dream log.
-   2. `git -C ~/project-agent-factory pull`, then grep `framework/ENGINEERING-LESSONS.md` — skip if already covered.
+   **Universal-lesson routing** — if an insight is a job-agnostic engineering discipline (would hold at any employer/project), propose it to project-agent-factory via a lesson PR per `~/src/project-agent-factory/CONTRIBUTING.md`:
+   1. If `~/src/project-agent-factory` does not exist on this machine, skip and note it in the dream log.
+   2. `git -C ~/src/project-agent-factory pull`, then grep `framework/ENGINEERING-LESSONS.md` — skip if already covered.
    3. Create branch `lesson/{instance}/{slug}`, append the **de-identified** lesson (no company/customer names, internal hostnames, ticket ids) to the matching section, commit + push, open a PR with `gh pr create` using the CONTRIBUTING format (Source / Why universal with >=2 cases or an incident / Example / Target — identifying details belong HERE, in the PR body, not the file). Do NOT merge.
    4. If `gh` or push is unavailable: write the same content to `framework/proposals/{date}-{slug}.md` and commit to main as an unreviewed inbox item.
    5. List proposed lesson PRs in the dream log.

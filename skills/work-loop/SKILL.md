@@ -6,7 +6,7 @@ trigger: "work loop {ticket_id}" or "處理 ticket {ticket_id}" or "執行 {tick
 
 # Work Loop
 
-> Source of truth 是 `~/project-agent-factory/framework/WORK-LOOP.md` — 收到觸發時**先讀它**，
+> Source of truth 是 `~/src/project-agent-factory/framework/WORK-LOOP.md` — 收到觸發時**先讀它**，
 > 依其 9 步執行。本檔只補充 harness 層的執行細節，不重複流程內容。
 >
 > 歷史註記：本 skill 舊版描述的 `stm_*` / `jira_*` / `task_*` / `stm_distill` 等 MCP 工具

@@ -1,8 +1,8 @@
 # {Agent Name} — {工作/專案名稱} Code Agent
 
 > Workspace-level context，只放這份工作/專案專屬的內容。
-> 個人習慣與通用紀律來自 `~/project-agent-factory/AGENTS.md`（user-level 自動載入），不要在此重複。
-> 處理 ticket 時先讀 `~/project-agent-factory/framework/WORK-LOOP.md`；memory 檢索深度見 `~/project-agent-factory/framework/RETRIEVAL.md`。
+> 個人習慣與通用紀律來自 `~/src/project-agent-factory/AGENTS.md`（user-level 自動載入），不要在此重複。
+> 處理 ticket 時先讀 `~/src/project-agent-factory/framework/WORK-LOOP.md`；memory 檢索深度見 `~/src/project-agent-factory/framework/RETRIEVAL.md`。
 
 ## 角色
 你是 {Agent Name}，Leo 的 AI coding assistant，負責 {domain} 相關專案的維護和開發。
@@ -19,7 +19,7 @@
 - Work Loop 的 L4 驗證即對此系統查證
 
 ## Memory 架構（本 instance 的路徑）
-Retrieval 深度由 `~/project-agent-factory/framework/RETRIEVAL.md` 統一規範 — 先讀它。
+Retrieval 深度由 `~/src/project-agent-factory/framework/RETRIEVAL.md` 統一規範 — 先讀它。
 
 | Layer | 位置 | 用途 |
 |------|------|------|
@@ -44,7 +44,7 @@ Retrieval 深度由 `~/project-agent-factory/framework/RETRIEVAL.md` 統一規�
 - **不確定** → 先讀 `ticket-routing.md` 分類
 
 ## STM
-每個 ticket 一份：`storage/short_term_memory/{ticket_id}.md`，模板見 `~/project-agent-factory/framework/templates/stm.md`。
+每個 ticket 一份：`storage/short_term_memory/{ticket_id}.md`，模板見 `~/src/project-agent-factory/framework/templates/stm.md`。
 - category 集合（本 instance）：{填入 category 與 base_weight 對照}
 - 追加：Edit 在對應 section 下插 `### [YYYY-MM-DD HH:MM]`，並更新 frontmatter `updated:`
 - 只為實際動工的 ticket 建 STM，不要批次預建空殼（污染 index）

@@ -7,7 +7,7 @@
 
 | 代號 | Instance |
 |---|---|
-| `lis` | Vibrant America LIS 工作（lis-code-agent） |
+| `lis` | Vibrant America LIS 工作（vibrant-america-working-agent，工作機 `~/src/`；2026-07-06 由 `lis-code-agent` 更名） |
 | `iic` | industry-intel 開發維護（industry-intel-code-agent，個人機 `~/personal_project/`） |
 | `jac` | job-applier pipeline 開發維護（job-applier-code-agent，個人機 `~/personal_project/`） |
 
@@ -79,4 +79,4 @@ Instance 機器開不了 PR 時：把同格式內容寫到 `framework/proposals/
 
 ## 同步提醒
 
-Lesson PR merge 發生在 GitHub；本機 `~/project-agent-factory` 要 `git pull` 才會生效（session 讀的是本機檔案）。Instance 的 dream pipeline 在提案前會先 pull。
+Lesson PR merge 發生在 GitHub；本機 `~/src/project-agent-factory` 要 `git pull` 才會生效（session 讀的是本機檔案）。Instance 的 dream pipeline 在提案前會先 pull。

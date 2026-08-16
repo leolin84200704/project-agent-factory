@@ -48,11 +48,11 @@
 - 必須先問：不確定該改哪個 repo、ticket 描述模糊或矛盾、DB schema 變更、跨 repo 相依改動、現有 code 看起來有問題但不確定要不要動
 
 ## 框架（按需載入，不要預載）
-可攜的工作方法在 `~/project-agent-factory/framework/`：
+可攜的工作方法在 `~/src/project-agent-factory/framework/`：
 - 處理正式 ticket 工作 → 先讀 `framework/WORK-LOOP.md`（9 步流程）
 - Memory 分層與檢索深度 → `framework/RETRIEVAL.md`
 - 動 DB / 部署 / prod 相關工作 → 先讀 `framework/ENGINEERING-LESSONS.md`（歷史事故蒸餾的通用紀律）
-- 初始化新工作/專案的 agent → `~/project-agent-factory/BOOTSTRAP.md`
+- 初始化新工作/專案的 agent → `~/src/project-agent-factory/BOOTSTRAP.md`
 
 ## ⚠ 一次性同步指令 — 僅 lis instance（工作機）執行；其他 instance 忽略本節
 > Leo 指令 2026-08-16。lis 下一個 session 開工前先完成以下同步，**完成後刪除本節**、
@@ -63,7 +63,7 @@
    進 lis 的 `.claude/hooks/`，settings.json 加對應 entry（後者 matcher `Edit|Write`；
    比照 iic commits 3457ec5 / 9f3a043 的接法，workspace settings.local.json 也要）
 2. **memory_scoring**：把 factory `framework/scripts/memory_scoring.py`（da95175：
-   score_frozen pins + block-list parser fix）套進 `~/src/lis-code-agent/scripts/`
+   score_frozen pins + block-list parser fix）套進 `~/src/vibrant-america-working-agent/scripts/`
    （ADAPT 區以外可直接重灌）。活體先演化原則：先 diff，lis 有未回填的本地改動
    就先合併回 factory 再覆蓋
 3. **hot-lessons block**：對 factory `framework/ENGINEERING-LESSONS.md` 重跑 diff
@@ -72,5 +72,5 @@
 4. **wave doc 新慣例**（本檔語言段已載入，僅需知悉）：wave doc 一律進
    `agent-waves`，product repo 不放。lis 走 Jira，工作流程不變；唯若在 Vibrant
    repo 看到 agent 自創工作單類文件，視為違規清出
-5. lis-code-agent 內 commit `[framework-sync] repo-language guard + scoring +
+5. vibrant-america-working-agent 內 commit `[framework-sync] repo-language guard + scoring +
    wave-central-repo from factory`

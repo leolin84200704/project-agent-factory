@@ -8,15 +8,15 @@ Leo 的可攜 agent 框架：個人工作習慣（Layer 1）+ 可重用的工作
 |---|---|---|
 | Layer 1 個人層 | 語言/溝通/git 紀律/暫停規則 — 跨工作通用 | `AGENTS.md`（symlink 到 `~/.claude/CLAUDE.md` 全域生效） |
 | Framework | work loop、retrieval 協議、通用工程教訓、templates、dream pipeline 樣板、hooks、通用 skills | `framework/`、`skills/` |
-| Layer 2 工作層 | 各工作/專案的 instance（know-how、memory 資料） | 各自的 repo（例：`lis-code-agent` = Vibrant America instance） |
+| Layer 2 工作層 | 各工作/專案的 instance（know-how、memory 資料） | 各自的 repo（例：`vibrant-america-working-agent` = Vibrant America instance） |
 
 ## 安裝（新機器）
 
 ```bash
-git clone git@github.com:leolin84200704/project-agent-factory.git ~/project-agent-factory
-ln -sf ~/project-agent-factory/AGENTS.md ~/.claude/CLAUDE.md
+git clone git@github.com:leolin84200704/project-agent-factory.git ~/src/project-agent-factory
+ln -sf ~/src/project-agent-factory/AGENTS.md ~/.claude/CLAUDE.md
 # 通用 skills 接到 user-level：
-for s in ~/project-agent-factory/skills/*/; do ln -sfn "$s" ~/.claude/skills/$(basename "$s"); done
+for s in ~/src/project-agent-factory/skills/*/; do ln -sfn "$s" ~/.claude/skills/$(basename "$s"); done
 ```
 
 ## 初始化新的工作 agent
