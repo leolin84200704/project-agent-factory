@@ -18,4 +18,4 @@
 | `weekly-routine.sh` | 每週量測（eval + retrieval + metrics diff 報告） | 不用改 |
 | `install-launchd.sh` | 排程安裝（label 自動取目錄名） | 同機多 instance 用 `DREAM_HOUR`/`DREAM_MINUTE` 錯開 |
 
-工作機的活體（Vibrant America instance）在 `~/src/lis-code-agent/scripts/` — 那份先演化；框架大改時回填這裡。個人機 instance（iic/jac）2026-08-15 起與此版本同步。
+工作機的活體（Vibrant America instance）在 `~/src/vibrant-america-working-agent/scripts/` — 那份先演化；框架大改時回填這裡。個人機 instance（iic/jac）2026-08-15 起與此版本同步。

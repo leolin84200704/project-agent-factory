@@ -7,7 +7,7 @@
 
 | 代號 | Instance |
 |---|---|
-| `lis` | Vibrant America LIS 工作（lis-code-agent） |
+| `lis` | Vibrant America LIS 工作（vibrant-america-working-agent，工作機 `~/src/`；2026-07-06 由 `lis-code-agent` 更名） |
 | `iic` | industry-intel 開發維護（industry-intel-code-agent，個人機 `~/personal_project/`） |
 | `jac` | job-applier pipeline 開發維護（job-applier-code-agent，個人機 `~/personal_project/`） |
 

@@ -63,7 +63,7 @@
    進 lis 的 `.claude/hooks/`，settings.json 加對應 entry（後者 matcher `Edit|Write`；
    比照 iic commits 3457ec5 / 9f3a043 的接法，workspace settings.local.json 也要）
 2. **memory_scoring**：把 factory `framework/scripts/memory_scoring.py`（da95175：
-   score_frozen pins + block-list parser fix）套進 `~/src/lis-code-agent/scripts/`
+   score_frozen pins + block-list parser fix）套進 `~/src/vibrant-america-working-agent/scripts/`
    （ADAPT 區以外可直接重灌）。活體先演化原則：先 diff，lis 有未回填的本地改動
    就先合併回 factory 再覆蓋
 3. **hot-lessons block**：對 factory `framework/ENGINEERING-LESSONS.md` 重跑 diff
@@ -72,5 +72,5 @@
 4. **wave doc 新慣例**（本檔語言段已載入，僅需知悉）：wave doc 一律進
    `agent-waves`，product repo 不放。lis 走 Jira，工作流程不變；唯若在 Vibrant
    repo 看到 agent 自創工作單類文件，視為違規清出
-5. lis-code-agent 內 commit `[framework-sync] repo-language guard + scoring +
+5. vibrant-america-working-agent 內 commit `[framework-sync] repo-language guard + scoring +
    wave-central-repo from factory`
