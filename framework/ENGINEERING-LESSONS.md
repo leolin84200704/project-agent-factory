@@ -37,6 +37,7 @@
 
 - **Diagnosis in the agent layer, facts in the app** — 系統有 LLM agent 常駐監看時，失敗「診斷」（根因推理、跨表反查、修法建議）放 agent 層：偵測到失敗後由 agent 查證並把英文結論寫回 DB 的 detail 欄位；app code 只記錄裸事實（錯誤碼、上游回應）並提供可寫欄位。診斷邏輯寫進 app 會讓每個新失敗型態都變成一次 code deploy，而 agent 層改 prompt 就能涵蓋。配套硬規則：短 TTL 的證據（container log 會被下一次 redeploy 洗掉）必須由 agent 在**偵測當下**快照到耐久儲存（repo/檔案），不能等事後查——事後永遠查不到。
 - **Prefer stable id over name matching** — 有 unique id 可用時不要用 display name 做 matching key，主動建議改用 id。
+- **關鍵依賴別綁移動標籤，且要對輸出形狀下量化斷言** — `-latest`/`:latest`/`-preview`/浮動版號會原地換版、無版本紀錄，行為在腳下改變且不報錯；pin 只擋掉一種漂移（preview/exp 通道自己也會換版），真正的防線是對產出下量化 guard + 告警。適用: 接第三方模型、image tag、外部 API 版本時。
 - **Owner-scoped, not actor** — 解析 per-owner 屬性（timezone、settings）要用資源擁有者的 id，不是 JWT actor 的；admin 代操作會打破 actor lookup。
 - **Cleanup filter scope** — prod DELETE 的 WHERE 必須綁定當次操作範圍（時間 + 明確 ID），絕不為「保險」放寬 filter。
 - **No overgeneralize from single case** — 寫通則前 grep 多個 case 確認真正原因，別從單一 case 反推普遍規則。
