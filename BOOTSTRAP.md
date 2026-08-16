@@ -30,6 +30,10 @@
 ### 1. 收集參數（缺任何一項先問 Leo）
 - Agent 名稱、workspace 路徑
 - Repo 清單（路徑或 GitHub URL）
+- **每個 repo 的所有權層級：personal 還是 company/team-owned？**（寫進 instance
+  CLAUDE.md）personal → 工作慣例由 Leo 裁定；team-owned → agent 自創慣例（wave
+  doc、工作紀錄、檔案語言）**不得**進該 repo，除非整個團隊明確接受——預設放
+  instance repo 或既有 ticket 系統（ENGINEERING-LESSONS 流程紀律第一條）
 - Ticket 系統與取用方式（Jira MCP？GitHub Issues？無？）
 - Branch/commit 慣例、保護分支、deploy 觸發方式
 
@@ -63,7 +67,7 @@
 ### 5. Workspace 接線
 - 若 Leo 從 workspace 根目錄（非 instance repo 內）啟動 session：workspace 根放一份 `CLAUDE.md`，內容一行 `@{instance}/CLAUDE.md`
 - 這份工作專屬的 skills 放 `{instance}/.claude/skills/`，並 symlink 到 `{workspace}/.claude/skills/`（讓從 workspace 啟動的 session 也能發現）
-- Workspace 及各工作 repo 放 `.claude/settings.local.json`：`autoMemoryEnabled: false` + **hooks 用絕對路徑指回 factory `framework/hooks/`**（git 安全 ×2 + engineering-lessons 提醒 + verification-asset 保護；單一源頭、不複製檔案進產品 repo）。工作 repo 是 git 的話把 `.claude/` 加進 `.git/info/exclude`（本地 ignore，不產生 commit — 對 push-to-deploy 的 repo 尤其重要）
+- Workspace 及各工作 repo 放 `.claude/settings.local.json`：`autoMemoryEnabled: false` + **hooks 用絕對路徑指回 factory `framework/hooks/`**（git 安全 ×2 + engineering-lessons 提醒 + verification-asset 保護 + repo-language 攔截（`git commit` 時 staged 的非 .md 檔含 CJK 即攔）；單一源頭、不複製檔案進產品 repo）。工作 repo 是 git 的話把 `.claude/` 加進 `.git/info/exclude`（本地 ignore，不產生 commit — 對 push-to-deploy 的 repo 尤其重要）
 
 ### 6. 驗收（新開一個 session 測）
 - 問「branch 規則是什麼」→ 應同時反映個人層 + instance 層
