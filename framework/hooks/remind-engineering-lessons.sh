@@ -27,10 +27,14 @@ MARKER="${TMPDIR:-/tmp}/lessons-reminded-${SESSION}"
 [ -f "$MARKER" ] && exit 0
 touch "$MARKER"
 
-cat >&2 <<'EOF'
+# Self-locate: this hook lives at <factory>/framework/hooks/, so the factory
+# root is two levels up — machine-agnostic (clone location differs per machine).
+FACTORY_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+cat >&2 <<EOF
 PAUSED (once per session): this command touches a DB / prod surface.
 Before re-running it, read the matching sections of
-~/src/project-agent-factory/framework/ENGINEERING-LESSONS.md (驗證紀律 / 變更範圍紀律 /
+${FACTORY_ROOT}/framework/ENGINEERING-LESSONS.md (驗證紀律 / 變更範圍紀律 /
 設計判斷 — e.g. batch verify 100% never sample; DELETE WHERE bound to this
 operation's scope; schema migration before deploy) and state which lessons
 apply to what you are about to do. Then re-run the command — it will pass.

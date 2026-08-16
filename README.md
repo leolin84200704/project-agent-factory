@@ -13,10 +13,14 @@ Leo 的可攜 agent 框架：個人工作習慣（Layer 1）+ 可重用的工作
 ## 安裝（新機器）
 
 ```bash
-git clone git@github.com:leolin84200704/project-agent-factory.git ~/src/project-agent-factory
-ln -sf ~/src/project-agent-factory/AGENTS.md ~/.claude/CLAUDE.md
+# 新機器建議放 ~/src/；既有機器維持原位即可（個人機在 ~/personal_project/）。
+# 所有文件以「依序探測 ~/src/project-agent-factory → ~/personal_project/project-agent-factory」
+# 定位 clone（寫作 $FACTORY），目錄名必須恰為 project-agent-factory。
+FACTORY=~/src/project-agent-factory
+git clone git@github.com:leolin84200704/project-agent-factory.git "$FACTORY"
+ln -sf "$FACTORY/AGENTS.md" ~/.claude/CLAUDE.md
 # 通用 skills 接到 user-level：
-for s in ~/src/project-agent-factory/skills/*/; do ln -sfn "$s" ~/.claude/skills/$(basename "$s"); done
+for s in "$FACTORY"/skills/*/; do ln -sfn "$s" ~/.claude/skills/$(basename "$s"); done
 ```
 
 ## 初始化新的工作 agent
