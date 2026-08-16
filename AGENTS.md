@@ -57,12 +57,15 @@
 ## ⚠ 一次性同步指令 — 僅 lis instance（工作機）執行；其他 instance 忽略本節
 > Leo 指令 2026-08-16。lis 下一個 session 開工前先完成以下同步，**完成後刪除本節**、
 > commit factory（`[sync] lis framework-sync done`）並 push。iic/jac 已同步，無需動作。
-1. **repo-language hook**：把 `framework/hooks/validate-repo-language.sh` 接進
-   lis-code-agent 的 hooks 設定（比照 iic commit 3457ec5 的接法：staged 非 markdown
-   檔含 CJK 即攔 `git commit`，每 repo+session 提醒一次）
+1. **兩個 hook**：複製 `framework/hooks/validate-repo-language.sh`（staged 非 markdown
+   檔含 CJK 即攔 `git commit`，每 repo+session 提醒一次）與
+   `framework/hooks/protect-verification-assets.sh`（改既有 eval/hook/grader 需人批准）
+   進 lis 的 `.claude/hooks/`，settings.json 加對應 entry（後者 matcher `Edit|Write`；
+   比照 iic commits 3457ec5 / 9f3a043 的接法，workspace settings.local.json 也要）
 2. **memory_scoring**：把 factory `framework/scripts/memory_scoring.py`（da95175：
-   score_frozen pins + block-list parser fix）同步到 `~/src/lis-code-agent/scripts/`。
-   活體先演化原則：先 diff，lis 有未回填的本地改動就先合併回 factory 再覆蓋
+   score_frozen pins + block-list parser fix）套進 `~/src/lis-code-agent/scripts/`
+   （ADAPT 區以外可直接重灌）。活體先演化原則：先 diff，lis 有未回填的本地改動
+   就先合併回 factory 再覆蓋
 3. **hot-lessons block**：對 factory `framework/ENGINEERING-LESSONS.md` 重跑 diff
    （dream.md 的 hot-lessons sync 步驟），特別是流程紀律第一條新增的所有權層級
    + wave-doc 子規則
