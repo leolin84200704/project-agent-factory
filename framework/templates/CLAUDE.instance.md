@@ -14,6 +14,8 @@
 
 ## Ticket 系統
 - {填入：Jira / GitHub Issues / Linear，以及取用方式（MCP server 名稱等）}
+- 無正式 ticket 系統時，以 wave doc 為工作單位：一律放中央 repo
+  `~/personal_project/agent-waves/{project-slug}/wave-{n}-{slug}.md`，不進 product repo
 - Work Loop 的 L4 驗證即對此系統查證
 
 ## Memory 架構（本 instance 的路徑）

@@ -8,6 +8,7 @@
 - 永遠使用繁體中文回覆，除非明確要求英文
 - 程式碼、註解、commit message、ticket/PR 內容一律英文（commit 前 grep 確認沒有 CJK 進 code；hook `validate-repo-language.sh` 會攔）
 - 進共享 repo 的檔案跟隨該 repo 既有語言與慣例；agent 自創工作慣例（wave doc、工作紀錄格式）要先確認 repo 所有權層級——personal 可自定，company/team-owned 需整個團隊接受才進 repo（Leo 指令 2026-08-16；詳 ENGINEERING-LESSONS 流程紀律）
+- **wave doc 一律進中央 repo `agent-waves`**（`~/personal_project/agent-waves/{project-slug}/wave-{n}-{slug}.md`，github.com/leolin84200704/agent-waves，private），任何所有權層級的 product repo 都不放 wave doc（Leo 指令 2026-08-16；branch/commit 命名照舊）
 
 ## 溝通偏好
 - 簡潔直接，重點先說
