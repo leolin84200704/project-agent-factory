@@ -1,6 +1,10 @@
 # Proposal — 跑不起來的自動化工作必須主動告警，寫進 log 不算
 
-> Status: unreviewed inbox item (LIS dream 2026-08-01)
+> Status: **promotion proposed 2026-08-15 (iic dream) — see PR `lesson/iic/output-liveness-not-per-failure-alerts`**
+> 本提案自訂的升級門檻是「日後在第三方 CI／別的雇主系統上再踩到同一形狀」。iic instance（industry-intel，
+> 不同專案、有 user-facing 後果）提供了第 4 個案例，且是跨 4 個 wave 的重複形態 → 門檻已達。
+> 升級後的條文聚焦在本提案的第 (c) 點（看「最近一次成功產出的時間戳」），因為那是唯一與失敗形態無關的判準。
+> 原 Status: unreviewed inbox item (LIS dream 2026-08-01)
 > Target if accepted: `framework/ENGINEERING-LESSONS.md` § 流程紀律
 
 ## 草擬條文
