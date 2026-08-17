@@ -36,9 +36,13 @@
   CLAUDE.md）personal → 工作慣例由 Leo 裁定；team-owned → agent 自創慣例（工作
   紀錄、檔案語言）**不得**進該 repo，除非整個團隊明確接受——預設放
   instance repo 或既有 ticket 系統（ENGINEERING-LESSONS 流程紀律第一條）
-- **wave doc 不問層級、一律進中央 repo**：`~/personal_project/agent-waves/
-  {project-slug}/wave-{n}-{slug}.md`（instance CLAUDE.md 的 ticket 段與 L4
-  驗證都指向此路徑；product repo 永遠不放 wave doc）
+- **wave doc 不問層級、一律進中央 repo**：`$WAVES/{project-slug}/wave-{n}-{slug}.md`
+  （instance CLAUDE.md 的 ticket 段與 L4 驗證都指向此路徑；product repo 永遠不放
+  wave doc）。`$WAVES` 依機器而異，**依序探測** `~/src/agent-waves` →
+  `~/personal_project/agent-waves` 取第一個存在者；兩個都沒有就 clone
+  `github.com/leolin84200704/agent-waves`（private）到該機器 `$FACTORY` 的同一層。
+  **找不到路徑時絕不退回 product repo，也不要略過**——「路徑不存在就跳過」正是
+  dream.md 的 lesson routing 靜默停擺過好幾晚的原因
 - Ticket 系統與取用方式（Jira MCP？GitHub Issues？無？）
 - Branch/commit 慣例、保護分支、deploy 觸發方式
 
