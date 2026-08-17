@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Shared git pre-push guard — see pre-commit in this directory for why these
+# live in the factory and are wired via core.hooksPath.
+#
+# Override, only when intentional: git push --no-verify
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "$repo_root" ] || exit 0
+
+# ---------- chain to the repo's own hook ----------
+# git-lfs installs its own pre-push here; skipping it corrupts LFS pointers.
+git_dir="$(git rev-parse --git-dir)"
+local_hook="$git_dir/hooks/pre-push"
+if [ -x "$local_hook" ] && [ "$(cd "$(dirname "$local_hook")" && pwd)" != "$(cd "$(dirname "$0")" && pwd)" ]; then
+  "$local_hook" "$@" || exit $?
+fi
+
+# ── ADAPT PER INSTANCE ───────────────────────────────────────────
+# Repos where a build must pass before pushing, matched on the origin repo name.
+# Deliberately opt-in rather than "any repo with a build script": forcing a build
+# on every push in every JS repo is a workflow change nobody agreed to, and a
+# guard that fires where it was not wanted is a guard that gets turned off.
+BUILD_GATE_REPOS='lis-backend-emr-v2'
+# ─────────────────────────────────────────────────────────────────
+
+origin="$(git -C "$repo_root" remote get-url origin 2>/dev/null)"
+repo_name="$(basename "${origin%.git}")"
+echo "$repo_name" | grep -qE "^($BUILD_GATE_REPOS)$" || exit 0
+
+cd "$repo_root" || exit 0
+log_prefix="/tmp/${repo_name}-prepush"
+
+# prisma is regenerated first only if this repo actually uses it: switching
+# branches leaves the generated client matching the OTHER branch's schema, and
+# the resulting type errors look exactly like someone else's pre-existing
+# breakage. That misattribution is the whole reason this gate exists.
+if [ -f "$repo_root/prisma/schema.prisma" ] || grep -q '"prisma"' "$repo_root/package.json" 2>/dev/null; then
+  echo "[pre-push] prisma generate ..."
+  if ! npx prisma generate > "$log_prefix-prisma.log" 2>&1; then
+    echo ""
+    echo "x [pre-push] prisma generate failed — not pushing"
+    tail -n 20 "$log_prefix-prisma.log"
+    echo "log: $log_prefix-prisma.log     skip: git push --no-verify"
+    exit 1
+  fi
+fi
+
+if [ -f "$repo_root/package.json" ] && grep -q '"build"' "$repo_root/package.json" 2>/dev/null; then
+  echo "[pre-push] build ..."
+  if ! npm run build > "$log_prefix-build.log" 2>&1; then
+    echo ""
+    echo "x [pre-push] build failed — not pushing."
+    echo "  Assume you caused it. Check branch switches, untracked files carried"
+    echo "  over, generated code (prisma client, proto), and node_modules state"
+    echo "  before concluding it is pre-existing."
+    tail -n 30 "$log_prefix-build.log"
+    echo "log: $log_prefix-build.log     skip: git push --no-verify"
+    exit 1
+  fi
+  echo "[pre-push] build OK"
+fi
+
+exit 0
