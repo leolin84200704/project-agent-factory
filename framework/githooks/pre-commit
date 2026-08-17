@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Shared git pre-commit guards, version-controlled in the factory and wired via
+# `core.hooksPath` so they survive a fresh clone.
+#
+# Why this file exists: these guards used to live in one repo's `.git/hooks/`.
+# That directory cannot be committed, is invisible when browsing the repo, and
+# disappears on every fresh clone — so a rule that had already been broken three
+# times was protected by a file nobody could see and nobody would get.
+#
+# Two constraints shape the design:
+#
+# 1. It must CHAIN to the repo's own hook. Setting `core.hooksPath` makes git
+#    ignore `.git/hooks/` entirely, which would silently disable third-party
+#    hooks — git-lfs installs pre-push/post-commit/post-merge/post-checkout that
+#    way, and killing them corrupts LFS pointers. The repo's own hook runs first
+#    and its failure is honoured.
+# 2. It must be REPO-AWARE. One file is wired from many repos, so every guard
+#    decides for itself whether this repo is in scope, and does nothing when it
+#    is not. A guard that fires where it was never agreed is a guard that gets
+#    disabled.
+#
+# Override, only when intentional: git commit --no-verify
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "$repo_root" ] || exit 0
+
+# ---------- chain to the repo's own hook ----------
+# `git rev-parse --git-path hooks` resolves to core.hooksPath once it is set —
+# i.e. to THIS directory — so the real hooks dir must be built from --git-dir.
+git_dir="$(git rev-parse --git-dir)"
+local_hook="$git_dir/hooks/pre-commit"
+if [ -x "$local_hook" ] && [ "$(cd "$(dirname "$local_hook")" && pwd)" != "$(cd "$(dirname "$0")" && pwd)" ]; then
+  "$local_hook" "$@" || exit $?
+fi
+
+fail=0
+
+# ---------- guard 1: config coupled with code ----------
+# Scope: repos that ship a ConfigMap pair at the root. Discovered by shape, not
+# hardcoded by name, so a repo opts in simply by having the files.
+dev_yaml="$(ls "$repo_root"/*-config.yaml 2>/dev/null | head -1)"
+prod_yaml="$(ls "$repo_root"/*-config-prod.yaml 2>/dev/null | head -1)"
+# *-config.yaml also matches *-config-prod.yaml on some globs; make sure they differ.
+[ "$dev_yaml" = "$prod_yaml" ] && dev_yaml="$(ls "$repo_root"/*-config.yaml 2>/dev/null | grep -v -- '-config-prod\.yaml$' | head -1)"
+
+if [ -n "$dev_yaml" ] && [ -n "$prod_yaml" ]; then
+  added_vars="$(git diff --cached --unified=0 -- '*.ts' '*.js' 2>/dev/null \
+    | grep '^+' | grep -v '^+++' \
+    | grep -oE 'process\.env\.[A-Za-z_][A-Za-z0-9_]*' \
+    | sed 's/process\.env\.//' | sort -u || true)"
+
+  if [ -n "$added_vars" ]; then
+    yaml_has_key() { grep -qE "^[[:space:]]+$1:" "$2" 2>/dev/null; }
+    missing=""
+    for v in $added_vars; do
+      miss=""
+      yaml_has_key "$v" "$dev_yaml"  || miss="$miss dev"
+      yaml_has_key "$v" "$prod_yaml" || miss="$miss prod"
+      [ -n "$miss" ] && missing="$missing
+  - $v   (missing in:$miss)"
+    done
+    if [ -n "$missing" ]; then
+      echo ""
+      echo "x [guard 1] config coupled with code"
+      echo "These process.env vars are referenced by staged code but absent from the ConfigMap:"
+      echo "$missing"
+      echo "Add them to the data: block of BOTH:"
+      echo "  $dev_yaml"
+      echo "  $prod_yaml"
+      fail=1
+    fi
+  fi
+fi
+
+# ---------- guard 2: no CJK in code ----------
+# Applies everywhere: source, comments and migrations stay English. Markdown and
+# docs are exempt — a doc's language follows the repo owner's convention, which
+# is a human judgment; code files carry no such discretion.
+cjk_hits="$(git diff --cached --unified=0 -- '*.ts' '*.js' '*.sql' 2>/dev/null \
+  | grep '^+' | grep -v '^+++' \
+  | perl -CSD -ne 'print if /[\x{2e80}-\x{9fff}\x{f900}-\x{faff}\x{ff00}-\x{ffef}]/' || true)"
+
+if [ -n "$cjk_hits" ]; then
+  echo ""
+  echo "x [guard 2] no CJK in code"
+  echo "These staged additions contain CJK characters (source/comments/migrations must be English):"
+  echo "$cjk_hits" | sed 's/^/    /'
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo ""
+  echo "If the content is genuinely intentional:  git commit --no-verify"
+  echo ""
+  exit 1
+fi
+exit 0
