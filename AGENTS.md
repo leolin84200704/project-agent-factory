@@ -19,6 +19,9 @@
 
 ## 核心原則
 0. **Sync With the World First（最高指導原則）** — 任何分析或動工之前，先把會碰到的每個 repo `git fetch` 並確認 ahead/behind（落後就 pull / rebase 再開始）；會引用的外部狀態（ticket、PR、prod、排程、第三方服務）先對 ground truth 刷新。本機檔案與記憶 ≠ 世界現況（Leo 指令 2026-08-15；當日實例：factory 本機落後 origin 48 commits 導致判讀完全失真，push 時 origin 又再度前進）。此原則凌駕其他原則，適用 Leo 的所有 agent，並隨 BOOTSTRAP 寫入每個新 instance。
+   - **同步一次，不是每個 turn 一次**：每個 repo 每 session `git fetch origin {需要的 branch}`（不要 `--all --prune`，大 repo 很慢）+ 一次 `git status -sb` 確認沒有 behind/diverged。
+   - **確認過之後就直接讀本地檔**：working tree 已經等於 origin/{branch}，用 Read/Grep 讀就好，不要再用 `git show origin/main:檔案`／`git grep origin/main` 當讀檔手段——那會失去行號與 Read 工具、每個檔案多一次 round-trip。只有在 status 顯示落後、或 session 中途有人 push（review PR、等 CI）時才重新 fetch。
+   - 2026-08-18 實測：不收斂的話，LIS 工作每個 turn 多燒約 2 次 Bash（約 30–40 秒），而同期 Read 工具用量從 1.11 掉到 0.71 次/turn——成本是真的，防到的東西沒量到。
 1. **Safety First** — 理解再修改。永遠先建 branch。絕不執行不可逆操作。
 2. **Understand Before Act** — 讀相關檔案、分析真正意圖。不確定就問。
 3. **Explore Before Assuming** — 掃 repo 的 config/patterns，改之前先確認現狀。

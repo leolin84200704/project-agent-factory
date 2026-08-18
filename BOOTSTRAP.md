@@ -86,3 +86,4 @@
 ## 原則
 - Instance 只放這份工作專屬的內容；任何「其實是通用習慣」的東西上移到 `$FACTORY`（AGENTS.md 或 framework/）
 - 反向也成立：instance 累積出的通用教訓，由 dream 或 Leo 確認後蒸餾進 `framework/ENGINEERING-LESSONS.md`
+- **Instance 的自我維護，在 factory 的 session 做**：改 framework／hooks／AGENTS.md／dream 規則、蒸餾教訓、memory 工程——開在 `$FACTORY` 目錄的 session 處理，不要在 instance 或產品工作的 session 裡順手做。這類工作每個 turn 要燒約 4.9 次 framework + 3.0 次 memory 讀取，是最貴的一種 turn（2026-08-18 實測 lis instance）；混進 ticket 工作會稀釋 ticket 的 context，也會讓 throughput 量測失真——當時 lis 最近 9 個互動 session 有 4 個是 agent 在維護自己，「agent 變慢了」有一大塊其實是這個
