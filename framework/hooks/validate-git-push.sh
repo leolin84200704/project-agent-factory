@@ -40,18 +40,34 @@ PERSONAL_REPOS='project-agent-factory|agent-waves|vibrant-america-working-agent|
 EXTRA_PROTECTED='stage_test'
 # ─────────────────────────────────────────────────────────────────
 
-# Keep every match inside the push command segment: `[^;&|]*` stops a match from
-# leaking across `&&`, `;` or a pipe, so `rm -f x && git push` is not a force
-# push. Scoping to the push segment is also what fixes the old bug where a bare
-# `-f ` anywhere blocked ordinary `rm -f tmp.js`, `tail -f log`, `grep -f pats`.
-PUSH_SEG=$(echo "$COMMAND" | grep -oE 'push[^;&|]*' | head -1)
+# Every check runs against the command segments that actually invoke `git push`,
+# never against the whole command string. Splitting on shell separators is what
+# keeps `rm -f x && git push` from reading as a force push, and what stops a bare
+# `-f ` anywhere blocking ordinary `rm -f tmp.js`, `tail -f log`, `grep -f pats`.
+#
+# Two bugs the earlier scoping still had, both measured 2026-08-18:
+#   - the protected-branch check matched `$COMMAND`, so ANY push was blocked as
+#     soon as the word `main` appeared later in the command — a `gh pr create
+#     --body` mentioning `git checkout main` was enough. And because a blocked
+#     call is discarded whole, the `git commit` chained ahead of that push was
+#     lost with it.
+#   - `grep -o 'push[^;&|]*' | head -1` took the FIRST `push` in the command, so
+#     `echo "about to push" && git push --force origin main` was checked against
+#     the echo and sailed through. Collecting every git-push segment closes that.
+#   - heredoc bodies were inspected as if they were commands, so a commit
+#     message or PR body that quoted `git push --force` as an example blocked
+#     the commit that carried it. Bodies are data; lib/command-text.sh drops them.
+. "$(dirname "$0")/lib/command-text.sh"
+PUSH_SEGS=$(command_shell_text "$COMMAND" | tr ';&|\n' '\n\n\n\n' \
+  | grep -E '(^|[[:space:]])git([[:space:]]|$)' \
+  | grep -E '(^|[[:space:]])push([[:space:]]|$)')
 
-if [ -n "$PUSH_SEG" ]; then
+if [ -n "$PUSH_SEGS" ]; then
   # (a) explicit flags, (b) the `+refspec` form — `git push origin +main` and
   # `git push origin +refs/heads/main:refs/heads/main` are force pushes with no
   # flag anywhere in the command.
-  if echo "$PUSH_SEG" | grep -qE '(--force-with-lease|--force|[[:space:]]-f([[:space:]]|$))' \
-     || echo "$PUSH_SEG" | grep -qE '[[:space:]]\+[A-Za-z0-9_./*-]+(:[A-Za-z0-9_./*-]+)?([[:space:]]|$)'; then
+  if echo "$PUSH_SEGS" | grep -qE '(--force-with-lease|--force|[[:space:]]-f([[:space:]]|$))' \
+     || echo "$PUSH_SEGS" | grep -qE '[[:space:]]\+[A-Za-z0-9_./*-]+(:[A-Za-z0-9_./*-]+)?([[:space:]]|$)'; then
     echo "BLOCKED: force push 不允許（含 --force / --force-with-lease / -f / +refspec）。" >&2
     exit 2
   fi
@@ -82,13 +98,13 @@ WORKREPO_BLOCK="push([[:space:]]+[^[:space:]]+)*[[:space:]]+($STRICT_NAMES)([[:s
 
 if [ -n "$REPO_NAME" ] && echo "$REPO_NAME" | grep -qE "^($PERSONAL_REPOS)$"; then
   # Personal repo: main allowed, master/staging/develop blocked.
-  if echo "$COMMAND" | grep -qE "$PERSONAL_BLOCK"; then
+  if echo "$PUSH_SEGS" | grep -qE "$PERSONAL_BLOCK"; then
     echo "BLOCKED: 不能直接 push 到 master/staging/develop。" >&2
     exit 2
   fi
 else
   # Product repo, or a target we could not identify: block them all.
-  if echo "$COMMAND" | grep -qE "$WORKREPO_BLOCK"; then
+  if echo "$PUSH_SEGS" | grep -qE "$WORKREPO_BLOCK"; then
     echo "BLOCKED: 產品 repo 不允許直接 push main/master/staging（改開 PR，只能 push 自己的 feature/bugfix 分支）。" >&2
     exit 2
   fi
