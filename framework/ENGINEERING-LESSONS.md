@@ -24,6 +24,7 @@
 - **Read the helper before you build on it — stubs log success** — 依賴既有 helper/service method 前先讀它的實作，不能只看名字和回傳型別。真實案例：SFTP `moveFile()` 是空 stub — `ensureConnected()` 後直接 log "File moved successfully" 回 `{success:true}`，從未呼叫 client，任何 caller 都拿到假成功且無錯誤可觀察。判斷法：宣稱有副作用的 method 內若沒有對應的 client/IO 呼叫即是 stub；接手時先補真實作（含 timeout）+ 行為級 unit test，再開始建上層功能。
 - **對非決定性元件下「在退化」結論前，先量同一輸入的重複變異** — 固定同一份輸入重跑 N 次先建立變異帶，再判斷新樣本是否落在帶外；跨樣本單點串成的趨勢線分不出退化與雜訊，而「換掉它症狀就沒了」也只證明兩個元件不同。適用: 判斷模型/供應商換版是否退步、監控生成式輸出品質、設輸出量（長度/分數/count）的 guard 與告警閾值時。
 - **Validate the grader before believing a regression** — 評測出現 0%/100% 等極端值時，先用一個已知正確的答案回灌，確認判定條件**可被滿足**，再懷疑受測系統。適用: 自動化 grader、CI 斷言、監控閾值——任何判定邏輯與受測對象分離的量測。判定條件若是設定檔裡的 pattern，特別要查解析路徑（無依賴時的 fallback parser 常靜默吃掉跳脫字元，使 pattern 恆不命中）；並保留失敗當下的原始輸出，否則「不可評分 / 真的答錯 / 不穩定」三者事後無法分辨。
+- **會 fail-open 的 gate 要計數 — 沒有計數器的 gate，實際覆蓋率是未知數** — 品質/安全 gate（LLM-as-judge、驗證器、風控檢查）遇到自身依賴故障時 default-allow 是**對的設計**（不能讓一次 503 掐死所有輸出），但 fail-open 若只留一行 WARN，「gate 放行了 100 筆」與「gate 今天整天是關的」在 log 上長得一樣，而後者代表那段時間的產出**完全沒被檢查過**。硬規則：每條 default-allow 路徑要有自己的計數器（fail-open 次數 / 佔比），超過閾值就告警；`gate_passed` 與 `gate_unavailable` 必須是兩個不同的結果值，不能都記成通過。判斷這條路徑罕不罕見不能憑直覺——gate 通常掛在**與主流程同一個**不穩定依賴上（同一個 LLM 供應商、同一個外部 API），主流程忙 = 供應商過載 = gate 最可能失效的時刻，兩者是正相關不是獨立。適用: LLM-as-judge / 內容審核 / fact-check 驗證器 / feature-flag 預設放行 / 憑證服務不可用時的 allow-by-default。姊妹規則：上面的 stub 教訓是「機制根本沒在做事」，這條是「機制在做事但會靜默退場」，共同判準是**成功訊號要能區分「檢查過且通過」與「沒檢查」**。
 
 ## 變更範圍紀律
 
