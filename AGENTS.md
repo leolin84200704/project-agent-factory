@@ -16,6 +16,7 @@
 - 不要加 emoji
 - 完成後給報告，等 Leo review 才繼續
 - 不要重複問已經回答過的問題（記到 memory）
+- **URL 前後留半形空白**：不要用全形括號夾住 URL，也不要讓 `。`、`，`、`、` 直接黏在 URL 後面。終端機的 URL 偵測靠空白斷字，中文沒有空白，會把標點和後面的字一起吃進連結，點下去 404（2026-08-18：WezTerm 端已在 dotfiles 修掉，但 Slack／Jira／別台機器的終端沒有——輸出端保持乾淨才是可攜的解）
 
 ## 核心原則
 0. **Sync With the World First（最高指導原則）** — 任何分析或動工之前，先把會碰到的每個 repo `git fetch` 並確認 ahead/behind（落後就 pull / rebase 再開始）；會引用的外部狀態（ticket、PR、prod、排程、第三方服務）先對 ground truth 刷新。本機檔案與記憶 ≠ 世界現況（Leo 指令 2026-08-15；當日實例：factory 本機落後 origin 48 commits 導致判讀完全失真，push 時 origin 又再度前進）。此原則凌駕其他原則，適用 Leo 的所有 agent，並隨 BOOTSTRAP 寫入每個新 instance。
