@@ -26,29 +26,12 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 SESSION=$(echo "$INPUT" | jq -r '.session_id // "nosession"')
 [ -z "$COMMAND" ] && exit 0
 
-# Split the command into shell text (heredoc bodies removed) and the bodies.
-# Quotes are written as \047 / \042 so the awk program needs no escaping.
-split_command() {  # split_command shell|body
-  printf '%s\n' "$COMMAND" | awk -v mode="$1" '
-    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
-    {
-      if (delim != "") {
-        if (trim($0) == delim) { delim = ""; next }
-        if (mode == "body") print
-        next
-      }
-      if (match($0, /<<-?[ \t]*[\047\042]?[A-Za-z_][A-Za-z0-9_]*[\047\042]?/)) {
-        d = substr($0, RSTART, RLENGTH)
-        sub(/^<<-?[ \t]*/, "", d)
-        gsub(/[\047\042]/, "", d)
-        delim = d
-      }
-      if (mode == "shell") print
-    }'
-}
+# Heredoc bodies are data, not commands — see lib/command-text.sh for the
+# measured cases that motivated the split.
+. "$(dirname "$0")/lib/command-text.sh"
 
-SHELL_TEXT=$(split_command shell)
-BODY_TEXT=$(split_command body)
+SHELL_TEXT=$(command_shell_text "$COMMAND")
+BODY_TEXT=$(command_heredoc_bodies "$COMMAND")
 
 # Command position: start of input, or after a pipe/separator/subshell, allowing
 # sudo and leading VAR=value assignments. Word end is spelled with a trailing
