@@ -88,6 +88,51 @@ if [ -n "$cjk_hits" ]; then
   fail=1
 fi
 
+# ---------- guard 3: a memory file must not lose entries or links ----------
+# Scope: agent instance repos, discovered by shape (an LTM directory plus an STM
+# store), never by name.
+#
+# Why: on 2026-08-18 an LTM file was regenerated from a partial base. It stayed
+# well-formed — same 14 sections, same frontmatter keys — while dropping 49 of
+# its 90 `links:` and two entries whose only copy was that file. Nothing in the
+# pipeline noticed: `memory_scoring.py` only ever ADDS links and recomputes
+# `score`, so a narrowed list stays narrow and looks freshly maintained. The
+# regeneration sat uncommitted for a day and would have landed on the next
+# `git add -A`.
+#
+# Distillation legitimately rewrites prose, merges entries and deletes noise, so
+# this does not diff content. It counts the two things that only ever grow in
+# normal operation, and asks for an explicit override when they shrink.
+if [ -d "$repo_root/long-term-memory" ] && [ -d "$repo_root/storage/short_term_memory" ]; then
+  count_entries() { grep -cE '^### \*\*\[\[' 2>/dev/null || true; }
+  count_links() {
+    awk '/^links:/{f=1;next} /^[a-z_]+:/{f=0} f&&/^- /{n++} END{print n+0}' 2>/dev/null || true
+  }
+  entry_ids() { grep -oE '^### \*\*\[\[[^]]*\]\]' 2>/dev/null | sed 's/^### \*\*\[\[//;s/\]\]$//' | sort -u || true; }
+
+  staged_memory="$(git diff --cached --name-only --diff-filter=M -- 'long-term-memory/*.md' 2>/dev/null || true)"
+  for f in $staged_memory; do
+    git cat-file -e "HEAD:$f" 2>/dev/null || continue
+    was_e="$(git show "HEAD:$f" | count_entries)"; now_e="$(git show ":$f" | count_entries)"
+    was_l="$(git show "HEAD:$f" | count_links)";   now_l="$(git show ":$f" | count_links)"
+    lost="$(comm -23 <(git show "HEAD:$f" | entry_ids) <(git show ":$f" | entry_ids) | tr '\n' ' ')"
+    # Counts alone are not enough: the 2026-08-18 file had MORE entries than the
+    # committed one and still dropped VP-16720. An id that disappears is the
+    # signal; the counts catch the rest.
+    [ "$now_e" -ge "$was_e" ] && [ "$now_l" -ge "$was_l" ] && [ -z "$lost" ] && continue
+
+    echo ""
+    echo "x [guard 3] memory file loses content: $f"
+    [ "$now_e" -lt "$was_e" ] && echo "    entries: $was_e -> $now_e"
+    [ "$now_l" -lt "$was_l" ] && echo "    links:   $was_l -> $now_l"
+    [ -n "$lost" ] && echo "    entries no longer present: $lost"
+    echo "    An entry can be the only surviving copy of an incident — check it exists"
+    echo "    elsewhere (STM, journal, another LTM file) before letting this through."
+    echo "    A deliberate merge or rename trips this too; that is what --no-verify is for."
+    fail=1
+  done
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo ""
   echo "If the content is genuinely intentional:  git commit --no-verify"

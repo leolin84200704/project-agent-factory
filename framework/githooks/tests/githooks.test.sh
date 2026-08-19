@@ -69,6 +69,60 @@ printf 'SELECT 1; -- 中文\n' > "$CJK/m.sql"
 git -C "$CJK" add "$CJK/m.sql"
 run 1 "CJK in .sql migration: blocked" "$CJK" pre-commit
 
+echo "--- guard 3: memory files must not lose entries or links ---"
+# Shaped like the real thing: frontmatter with a links list, then entry headings.
+mk_ltm() {  # mk_ltm <path> <n_links> <ids...>
+  local path="$1" nlinks="$2"; shift 2
+  { echo '---'; echo 'id: failures'; echo 'score: 1.0'; echo 'links:'
+    for i in $(seq 1 "$nlinks"); do echo "- VP-$((17000 + i))"; done
+    echo 'tags:'; echo '- failures'; echo '---'; echo ''
+    for id in "$@"; do echo "### **[[$id]]** — note"; echo ''; done
+  } > "$path"
+}
+
+NOTAGENT=$(mkrepo notagent)
+mkdir -p "$NOTAGENT/long-term-memory"
+mk_ltm "$NOTAGENT/long-term-memory/failures.md" 5 A B C
+git -C "$NOTAGENT" add -A && git -C "$NOTAGENT" commit -qm base --no-verify
+mk_ltm "$NOTAGENT/long-term-memory/failures.md" 2 A
+git -C "$NOTAGENT" add -A
+run 0 "no STM store: not an agent repo, out of scope" "$NOTAGENT" pre-commit
+
+MEM=$(mkrepo memrepo)
+mkdir -p "$MEM/long-term-memory" "$MEM/storage/short_term_memory"
+touch "$MEM/storage/short_term_memory/.keep"
+mk_ltm "$MEM/long-term-memory/failures.md" 5 A B C
+git -C "$MEM" add -A && git -C "$MEM" commit -qm base --no-verify
+
+mk_ltm "$MEM/long-term-memory/failures.md" 5 A B C D
+git -C "$MEM" add -A
+run 0 "entries and links grow: allowed" "$MEM" pre-commit
+
+mk_ltm "$MEM/long-term-memory/failures.md" 5 A B
+git -C "$MEM" add -A
+run 1 "an entry disappears: blocked" "$MEM" pre-commit
+
+mk_ltm "$MEM/long-term-memory/failures.md" 2 A B C
+git -C "$MEM" add -A
+run 1 "links list shrinks while entries hold: blocked" "$MEM" pre-commit
+
+# The 2026-08-18 shape: file still well-formed, more entries than before, but
+# quietly missing one and rebuilt from a narrower link base.
+mk_ltm "$MEM/long-term-memory/failures.md" 2 A B D E
+git -C "$MEM" add -A
+run 1 "more entries but one lost and links narrowed: blocked" "$MEM" pre-commit
+
+# Counts can grow while knowledge disappears — the shape that would have slipped
+# through a count-only check.
+mk_ltm "$MEM/long-term-memory/failures.md" 6 A B D E
+git -C "$MEM" add -A
+run 1 "entry swapped out while both counts grow: blocked" "$MEM" pre-commit
+
+mk_ltm "$MEM/long-term-memory/failures.md" 5 A B C
+printf 'note\n' > "$MEM/long-term-memory/notes.md"
+git -C "$MEM" add -A
+run 0 "unchanged memory file plus a new one: allowed" "$MEM" pre-commit
+
 echo "--- chaining to the repo's own hook (git-lfs et al.) ---"
 CHAIN=$(mkrepo chain)
 mkdir -p "$CHAIN/.git/hooks"
