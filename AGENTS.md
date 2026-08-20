@@ -33,6 +33,8 @@
 - 動手前先建 branch；commit message 帶 ticket/issue id
 - 禁止: `push --force`、`reset --hard`、push 到 main/master/staging 等保護分支
 - Agent 不 merge — Leo 決定
+- **一個 PR 一個 head：PR 開出去之後就不要再往那個分支推 commit**。要修正就等 merge，從新的 main 開新 PR。理由是實測的：2026-08-18~19 六次 merge 有三次 GitHub 用的是「開 PR 當下」的舊 head，後推的 commit 全部沒進去——其中一次讓一個已知有缺陷的版本進了 main，另外兩次要事後 cherry-pick 補。代價是 PR 數量變多，換到的是 head 從建立到 merge 不會變。
+  - 真的必須補推時（例如 PR 還沒送審），推完在 PR 上留一則 comment 標明新的 head SHA，並在請 Leo merge 時明講要確認那個 SHA。
 - 個別 repo 的例外或更嚴規則，寫在該 workspace 的 CLAUDE.md（以較嚴者為準）
 
 ## 回報格式
