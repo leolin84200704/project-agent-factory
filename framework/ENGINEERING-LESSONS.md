@@ -71,6 +71,8 @@
 
 ## 流程紀律
 
+- **匹配不到目標的守衛要大聲失敗，不能算通過** — hook / linter / CI gate 只要是靠 glob、路徑或檔名去找它要檢查的東西，佈局一改（設定檔搬家、目錄結構重整、檔案改名）那個 glob 就會匹配到 0 個目標，於是每一次執行都「通過」——而且是**靜默**通過，綠燈與真正合規的綠燈長得一模一樣。守衛失效的當下沒有任何訊號，通常要到有人手動走一次流程、發現規則早就沒在擋，才會知道。硬規則：守衛在檢查之前先斷言「我找到了要檢查的目標」，找不到就報錯而不是放行；對「應該存在的目標數 > 0」下斷言，並把目標路徑寫在錯誤訊息裡。適用: 寫任何靠路徑定位目標的檢查時；搬移設定檔或改目錄結構時（同一個 PR 要一起改守衛）。
+
 - **Agent 自創慣例進共享 repo 前，先問所有權層級** — 動工前確認 repo 是 personal 還是 company/team-owned：personal 由 owner 裁定即可；team-owned 時任何 agent 自創的工作慣例（wave doc、工作紀錄、檔案語言、命名規則）需整個團隊接受才能進 repo，否則放 instance repo 或既有 ticket 系統。單一協作者眼中「合理的慣例」（如英文 codebase 裡出現中文工作單）對團隊就是事故。適用: 建立新工作慣例、往產品 repo 放非產品文件、檔案語言與 repo 既有語言不一致時。子規則「code file 不進 CJK」enforced-by: `framework/hooks/validate-repo-language.sh`。子規則「wave doc 一律進中央 repo `agent-waves` 分 project path，不進 product repo」（Leo 指令 2026-08-16）——把最常見的自創慣例直接移出所有權判斷，product repo 永遠只留產品內容；2026-08-16 已把 industry-intel 的 9 份 wave doc 遷至 `agent-waves/industry-intel/`。
 - **測試中發現的缺陷必須當場變 ticket，筆記不是追蹤** — E2E/測試/triage 過程中發現「不屬於當前工作範圍」的真實缺陷時，必須在同一個 session 內開正式 ticket（有 owner、有狀態、連結 parent），然後筆記引用 ticket id——絕不能反過來只在 memory/STM 寫一句 "proposed follow-up" 就結案。筆記沒有 owner、沒有 queue、對排程不可見；只存在筆記裡的已知缺陷功能上等同未知缺陷，而重新發現的成本往往由外部使用者/夥伴付。收尾檢查：關 ticket 前掃自己的工作紀錄，任何 "follow-up"/"wrinkle"/"proposed" 字樣而沒有對應 ticket id 的，都是還沒歸檔的缺陷。
 - **Ticket 可以自己開，「這是 bug」的定性權在 owner** — 上一條的邊界：發現的問題要歸檔，但 issue type 不是中性欄位。標成 Bug 會進團隊缺陷統計、觸發必填的根因/分類流程、並隱含「現有行為是錯的」的裁決；很多從 code inspection 看到的「反模式」在 owner 眼中是刻意的權衡或待改進的設計，不是缺陷（owner 原話：「很多東西並不一定是這樣的」）。規則：agent 自行開的 ticket 用中性類型（task/story/improvement）並註明分類待 owner 確認，或開之前直接問；只有 owner 確認過才標 Bug。這與「別替其他團隊開 ticket」是同一族——歸檔義務是 agent 的，定性與分派的裁量權是人的。
