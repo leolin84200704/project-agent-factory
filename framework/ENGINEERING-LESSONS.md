@@ -40,6 +40,7 @@
 - **Migrate all readers, no mirror** — 替換 source-of-truth 時，遷移所有 reader（含 generic DTO mapper）然後停寫舊 store；「先雙寫留 mirror」只會 diverge。
 - **Rollback 是有 blast radius 的變更，不是免費的還原鍵** — 「照 runbook 回滾」聽起來安全，但回滾本身會產生副作用，決策時要跟「維持現狀」一起評估。最常見的形態：**consumer group 切換**。A→B 切換期間 group A 停止消費、offset 停在切換點；切回 A 就從那個 offset 重放，下游若沒有 idempotency gate 就是**重複交付**（重複寫入若是覆寫同一列，row count 還會看起來乾乾淨淨，指標騙人）。硬規則：任一方向切換前，先把**目標 group 的 committed offset 推到 high watermark**（`admin.setOffsets`），或明確接受重放。真實案例：回滾重放 1,940 筆造成 ~17 筆重複；切回去前若不先推 offset，另有 8,501 筆待重放。另一個副作用：**重啟會殺掉 in-flight 的 job**（BullMQ 等），留下 `next_retry_at=null` 的孤兒列，不會自癒，必須事後逐筆補跑並驗證。
 - **大改動拆成至少 3 個 commit，切在 revert 邊界上** — 一個把新元件、接線、infra/config 全塞在一起的肥 commit，無法只 revert 有風險的那一片（k8s manifest / prod config），要退就得連安全的部分（新 service + 測試）一起退。寫 code **之前**就規劃邊界：(1) 新能力 + 其單元測試（未接線、inert）→ (2) 接進呼叫端（真正的行為改變）→ (3) infra/config/依賴（最難 revert 的放最後且獨立）。附帶約束：branch 一旦 push，回頭拆需要改寫歷史，而 force-push 在工作 repo 是禁止的——所以要嘛一次切對，要嘛用新 branch 重建。
+- **破壞性指令的批准有保鮮期，狀態要在執行的那一刻重讀** — 人批准的是「丟棄陳舊內容」這個判斷，不是你幾分鐘前看到的那份檔案清單；共用的工作區裡，人與 agent 可能同時在改同一份檔案，而狀態查詢的保鮮期以秒計。硬規則：(1) 執行 reset/restore/clean/rm 之前**立即**重讀狀態，與批准當下的清單逐項比對，有差異就停下來問；(2) 丟棄之前先把現況落成一個可回復的 ref（暫存 commit / stash object），成本一秒，換到「丟錯了還救得回來」。判準：能不能救回來，而不是判斷對不對——判斷正確加上執行不安全，結果一樣是資料永久遺失。適用: 要丟棄未提交的工作時；批准與執行之間隔了其他步驟時；在別人也可能開著的工作區裡動手時。
 - **Capability flag enables a pipeline** — backfill 或開 flag 前，確認下游 pipeline 的相依 config 都在，否則 flag 開了功能還是斷的。
 
 ## 設計判斷
