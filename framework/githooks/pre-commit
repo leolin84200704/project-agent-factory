@@ -43,12 +43,35 @@ prod_yaml="$(ls "$repo_root"/*-config-prod.yaml 2>/dev/null | head -1)"
 # *-config.yaml also matches *-config-prod.yaml on some globs; make sure they differ.
 [ "$dev_yaml" = "$prod_yaml" ] && dev_yaml="$(ls "$repo_root"/*-config.yaml 2>/dev/null | grep -v -- '-config-prod\.yaml$' | head -1)"
 
-if [ -n "$dev_yaml" ] && [ -n "$prod_yaml" ]; then
-  added_vars="$(git diff --cached --unified=0 -- '*.ts' '*.js' 2>/dev/null \
-    | grep '^+' | grep -v '^+++' \
-    | grep -oE 'process\.env\.[A-Za-z_][A-Za-z0-9_]*' \
-    | sed 's/process\.env\.//' | sort -u || true)"
+added_vars="$(git diff --cached --unified=0 -- '*.ts' '*.js' 2>/dev/null \
+  | grep '^+' | grep -v '^+++' \
+  | grep -oE 'process\.env\.[A-Za-z_][A-Za-z0-9_]*' \
+  | sed 's/process\.env\.//' | sort -u || true)"
 
+# The guard is opt-in by shape, and that is deliberate — but a repo can opt OUT
+# by accident. When the config files are renamed or moved (a repo migrating to
+# kustomize, say), this glob starts matching nothing and the guard passes every
+# commit unconditionally, with a green result indistinguishable from a real one.
+# Observed: one repo where the ConfigMap became a build-time export that exists
+# only inside a CI workspace, so no developer checkout has ever had the file —
+# the guard had been inert for an unknown number of commits and was only noticed
+# when someone walked the checklist by hand.
+#
+# A warning rather than a failure, on purpose: a library repo with no deployment
+# config at all is a legitimate case, and failing it would be a false positive on
+# every commit that touches process.env. But staying silent when there IS
+# something to check and nowhere to check it is how a mechanised rule decays back
+# into prose without anyone noticing.
+if [ -n "$added_vars" ] && { [ -z "$dev_yaml" ] || [ -z "$prod_yaml" ]; }; then
+  echo ""
+  echo "! [guard 1] SKIPPED — could not find the ConfigMap pair to check against"
+  echo "  staged code adds: $(echo "$added_vars" | tr '\n' ' ')"
+  echo "  looked for: $repo_root/*-config.yaml and $repo_root/*-config-prod.yaml"
+  echo "  If this repo declares deployment config somewhere else, this guard is"
+  echo "  not protecting it — point it at the real location or drop the rule."
+fi
+
+if [ -n "$dev_yaml" ] && [ -n "$prod_yaml" ]; then
   if [ -n "$added_vars" ]; then
     yaml_has_key() { grep -qE "^[[:space:]]+$1:" "$2" 2>/dev/null; }
     missing=""
