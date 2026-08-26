@@ -1,0 +1,13 @@
+# Directories of instance-owned pre-commit guards, one per line.
+#
+# Each line is a directory of *.sh guards shipped inside an instance's own repo,
+# so they survive a fresh clone (unlike .git/hooks/). Every guard decides its own
+# scope and prints nothing when the repo is out of scope; a non-zero exit blocks
+# the commit. Missing directories are skipped silently — this file is shared
+# across machines and clone locations differ, so list every plausible path rather
+# than assuming one.
+#
+# Guards that are genuinely universal belong in this hook itself, not here.
+
+~/src/vibrant-america-working-agent/githooks/guards.d
+~/personal_project/vibrant-america-working-agent/githooks/guards.d
