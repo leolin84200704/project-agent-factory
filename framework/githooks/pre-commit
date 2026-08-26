@@ -35,42 +35,47 @@ fi
 
 fail=0
 
-# ---------- guard 1: config coupled with code ----------
-# Scope: repos that ship a ConfigMap pair at the root. Discovered by shape, not
-# hardcoded by name, so a repo opts in simply by having the files.
-dev_yaml="$(ls "$repo_root"/*-config.yaml 2>/dev/null | head -1)"
-prod_yaml="$(ls "$repo_root"/*-config-prod.yaml 2>/dev/null | head -1)"
-# *-config.yaml also matches *-config-prod.yaml on some globs; make sure they differ.
-[ "$dev_yaml" = "$prod_yaml" ] && dev_yaml="$(ls "$repo_root"/*-config.yaml 2>/dev/null | grep -v -- '-config-prod\.yaml$' | head -1)"
-
-if [ -n "$dev_yaml" ] && [ -n "$prod_yaml" ]; then
-  added_vars="$(git diff --cached --unified=0 -- '*.ts' '*.js' 2>/dev/null \
-    | grep '^+' | grep -v '^+++' \
-    | grep -oE 'process\.env\.[A-Za-z_][A-Za-z0-9_]*' \
-    | sed 's/process\.env\.//' | sort -u || true)"
-
-  if [ -n "$added_vars" ]; then
-    yaml_has_key() { grep -qE "^[[:space:]]+$1:" "$2" 2>/dev/null; }
-    missing=""
-    for v in $added_vars; do
-      miss=""
-      yaml_has_key "$v" "$dev_yaml"  || miss="$miss dev"
-      yaml_has_key "$v" "$prod_yaml" || miss="$miss prod"
-      [ -n "$miss" ] && missing="$missing
-  - $v   (missing in:$miss)"
+# ---------- instance-owned guards ----------
+# Not every guard is universal. A rule that encodes one workplace's deployment
+# convention has no business firing in the other 47 repos this hook is wired
+# into — and per the header, a guard that fires where it was never agreed is a
+# guard that gets the whole hook disabled.
+#
+# But an instance cannot simply keep its guards in `.git/hooks/`: that directory
+# cannot be committed and vanishes on a fresh clone, which is the entire reason
+# this file exists. So instances ship their guards inside their own repo, and
+# register the directory in `guard-paths` next to this file.
+#
+# Contract for an instance guard:
+#   * it receives `repo_root` in the environment and decides its own scope
+#   * it exits 0 to pass, non-zero to block the commit
+#   * it prints nothing when the repo is out of scope
+# A missing directory is skipped silently: the registry is shared across
+# machines and not every path exists on every one.
+guard_paths_file="$(dirname "$0")/guard-paths"
+if [ -f "$guard_paths_file" ]; then
+  while IFS= read -r guard_dir || [ -n "$guard_dir" ]; do
+    case "$guard_dir" in ''|'#'*) continue ;; esac
+    guard_dir="$(eval echo "$guard_dir")"   # expand ~ and $HOME
+    [ -d "$guard_dir" ] || continue
+    for guard in "$guard_dir"/*.sh; do
+      [ -f "$guard" ] || continue
+      repo_root="$repo_root" sh "$guard" || fail=1
     done
-    if [ -n "$missing" ]; then
-      echo ""
-      echo "x [guard 1] config coupled with code"
-      echo "These process.env vars are referenced by staged code but absent from the ConfigMap:"
-      echo "$missing"
-      echo "Add them to the data: block of BOTH:"
-      echo "  $dev_yaml"
-      echo "  $prod_yaml"
-      fail=1
-    fi
-  fi
+  done < "$guard_paths_file"
 fi
+
+# ---------- guard 1: MOVED OUT ----------
+# The "declare every new process.env in the deployment ConfigMap" guard used to
+# live here. It encoded one workplace's deployment convention: of the repos this
+# hook is wired into, exactly one matched it, and it keyed its scope on the
+# presence of `*-config.yaml` at the repo root — files that are gitignored in
+# that repo, so they exist only in whichever working copy created them. The guard
+# was consequently active or silent depending on which working copy you committed
+# from, and it compared against a stale local snapshot no deploy step reads.
+#
+# It now ships inside that instance's own repo, registered via `guard-paths`
+# above, where it can key on repo identity and check the live source of truth.
 
 # ---------- guard 2: no CJK in code ----------
 # Applies everywhere: source, comments and migrations stay English. Markdown and
