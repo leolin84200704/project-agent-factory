@@ -42,6 +42,7 @@
 - **大改動拆成至少 3 個 commit，切在 revert 邊界上** — 一個把新元件、接線、infra/config 全塞在一起的肥 commit，無法只 revert 有風險的那一片（k8s manifest / prod config），要退就得連安全的部分（新 service + 測試）一起退。寫 code **之前**就規劃邊界：(1) 新能力 + 其單元測試（未接線、inert）→ (2) 接進呼叫端（真正的行為改變）→ (3) infra/config/依賴（最難 revert 的放最後且獨立）。附帶約束：branch 一旦 push，回頭拆需要改寫歷史，而 force-push 在工作 repo 是禁止的——所以要嘛一次切對，要嘛用新 branch 重建。
 - **破壞性指令的批准有保鮮期，狀態要在執行的那一刻重讀** — 人批准的是「丟棄陳舊內容」這個判斷，不是你幾分鐘前看到的那份檔案清單；共用的工作區裡，人與 agent 可能同時在改同一份檔案，而狀態查詢的保鮮期以秒計。硬規則：(1) 執行 reset/restore/clean/rm 之前**立即**重讀狀態，與批准當下的清單逐項比對，有差異就停下來問；(2) 丟棄之前先把現況落成一個可回復的 ref（暫存 commit / stash object），成本一秒，換到「丟錯了還救得回來」。判準：能不能救回來，而不是判斷對不對——判斷正確加上執行不安全，結果一樣是資料永久遺失。適用: 要丟棄未提交的工作時；批准與執行之間隔了其他步驟時；在別人也可能開著的工作區裡動手時。
 - **Capability flag enables a pipeline** — backfill 或開 flag 前，確認下游 pipeline 的相依 config 都在，否則 flag 開了功能還是斷的。
+- **Update 入口收的欄位要與 handler 消費清單對帳** — 由 create 契約自動衍生的 update 契約（PartialType、schema spread）會接受 handler 根本不讀的欄位：驗證過、回 200、什麼都沒改。呼叫端把 silent no-op 當成功，資料在下一次全量重建時被預設值蓋掉才發現。硬規則：新增或修改 update 端點時，把「契約接受的欄位」對「handler 實際寫入的欄位」逐一對帳；不打算支援的欄位要嘛從契約拿掉、要嘛明確 4xx 指向正確入口，不准靜默吞掉。適用: update DTO 繼承/衍生自 create DTO 時；review「為什麼改了沒生效」類 bug 時；給既有 create-only 欄位補 update 路徑時。
 
 ## 設計判斷
 
