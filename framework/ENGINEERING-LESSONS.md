@@ -35,6 +35,7 @@
 
 - **Config coupled with code** — 新增任何 `process.env.X`（或等價設定），同一個變更裡就更新所有部署 config（yaml/ConfigMap），並明說改了哪些。
 - **Schema migration before deploy** — 對非 ORM-managed 的 prod DB，schema 加欄位必須先手動 ALTER 到 prod 才部署，否則整個 model 的讀取會全數失敗。
+- **Staging schema before the staging PR** — merge 即部署的分支，開 PR 前 agent 先自己把 additive migration 套到 staging schema，PR body 只留「prod ALTER 必須先於 main merge」；「誰跑 ALTER？」不能當問題留給人。適用: 非 ORM-managed schema 且 staging 分支 push-to-deploy 時。
 - **Audit callers when adding fallback** — 加 fallback 機制時，同一個 PR audit 並遷移所有同類 caller；revert 一個 service 時 audit 同 server 其他同類風險。
 - **Sync sibling encodings of an invariant** — 改一個值/邊界的語意時，同 function 內所有衍生點（顯示、驗證、查詢窗、search 邊界）要用 single source 一起改；測試別 mock 掉共用路徑（假綠燈）。
 - **Migrate all readers, no mirror** — 替換 source-of-truth 時，遷移所有 reader（含 generic DTO mapper）然後停寫舊 store；「先雙寫留 mirror」只會 diverge。
