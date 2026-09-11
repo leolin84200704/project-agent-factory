@@ -71,6 +71,15 @@ if [ -n "$PUSH_SEGS" ]; then
     echo "BLOCKED: force push 不允許（含 --force / --force-with-lease / -f / +refspec）。" >&2
     exit 2
   fi
+  # (c) --no-verify skips the shared git pre-push gate (framework/githooks/
+  # pre-push: build + Nest DI boot smoke). That gate is the only mechanism
+  # standing between "unit tests green" and "new pods crash-loop" (2026-09-10),
+  # and the pre-push's own failure message names --no-verify as the skip — so
+  # the agent must not be able to take it. A human at a terminal still can.
+  if echo "$PUSH_SEGS" | grep -qE '(^|[[:space:]])--no-verify([[:space:]]|$)'; then
+    echo "BLOCKED: git push --no-verify 會跳過 pre-push 守門（build + Nest DI smoke）。守門失敗就修好再推；真要跳過請 Leo 自己在終端執行。" >&2
+    exit 2
+  fi
 fi
 
 # Resolve the effective repo directory for this push.

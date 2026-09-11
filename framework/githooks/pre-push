@@ -58,6 +58,30 @@ if [ -f "$repo_root/package.json" ] && grep -q '"build"' "$repo_root/package.jso
     exit 1
   fi
   echo "[pre-push] build OK"
+
+  # ---------- Nest DI boot smoke ----------
+  # 2026-09-10: this very build gate passed and both new pods crash-looped on
+  # boot. An @Injectable constructor param typed as an interface (or merely
+  # marked `?`) is a REQUIRED provider registered under `Object` as far as Nest
+  # is concerned; tsc cannot see that, and unit specs that `new` the service by
+  # hand or stub the new provider never ask the real injector. Booting the
+  # compiled app for a few seconds does: the injector reports an unresolved
+  # dependency within ~1 s, long before any database or broker is needed.
+  # Scope: repos already in the gate list whose package.json depends on
+  # @nestjs/core. The smoke runs with an empty environment (see lib/).
+  if grep -q '"@nestjs/core"' "$repo_root/package.json" 2>/dev/null; then
+    echo "[pre-push] nest DI smoke ..."
+    if ! DI_SMOKE_LOG="$log_prefix-di-smoke.log" bash "$(dirname "$0")/lib/nest-di-smoke.sh" "$repo_root"; then
+      echo ""
+      echo "x [pre-push] Nest DI smoke did not pass — not pushing."
+      echo "  The build compiled; the dependency graph did not resolve (or gave no"
+      echo "  sign of running). Fix the provider, then add a spec that compiles the"
+      echo "  REAL module through Test.createTestingModule so the next one is caught"
+      echo "  by jest, not by this gate."
+      echo "log: $log_prefix-di-smoke.log     skip (humans only — the agent's push hook refuses --no-verify): git push --no-verify"
+      exit 1
+    fi
+  fi
 fi
 
 exit 0

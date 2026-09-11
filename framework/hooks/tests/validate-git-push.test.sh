@@ -42,6 +42,14 @@ run 2 'git push origin +feature/x'                          "$PRODUCT"
 run 2 'git push origin +refs/heads/main:refs/heads/main'     "$PERSONAL"
 run 2 'git -C /somewhere push -f'                           "$PERSONAL"
 
+echo "--- --no-verify on a push: BLOCKED (it skips the shared pre-push gate) ---"
+run 2 'git push --no-verify origin feature/x'               "$PRODUCT"
+run 2 'git push origin feature/x --no-verify'               "$PERSONAL"
+run 2 'git push --no-verify'                                "$PERSONAL"
+# Only the push segment is inspected: a --no-verify on the chained commit is
+# the pre-COMMIT hooks' business, not this guard's.
+run 0 'git commit --no-verify -m x && git push origin feature/x' "$PERSONAL"
+
 echo "--- non-push commands carrying -f / +: ALLOWED ---"
 run 0 'rm -f tmp.js'                                        "$PERSONAL"
 run 0 'tail -f logs/app.log'                                "$PERSONAL"
