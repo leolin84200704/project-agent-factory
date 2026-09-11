@@ -20,7 +20,9 @@ fi
 # Deliberately opt-in rather than "any repo with a build script": forcing a build
 # on every push in every JS repo is a workflow change nobody agreed to, and a
 # guard that fires where it was not wanted is a guard that gets turned off.
-BUILD_GATE_REPOS='lis-backend-emr-v2'
+# 2026-09-11 (Leo): every LIS NestJS service, so the DI boot smoke that follows
+# the build covers them all. Repos with a build but no NestJS stay out.
+BUILD_GATE_REPOS='lis-backend-emr-v2|LIS-transformer-v2|LIS-transformer|LIS-backend-coreSamples|LIS-backend-dashboard|LIS-backend-results-web|LIS-backend-results-core|LIS-backend-results-grpc|LIS-Sample|LIS-interactive-report|LIS-notification-center|LIS-setting-consumer|LIS-Shipping|Portal-Calendar'
 # ─────────────────────────────────────────────────────────────────
 
 origin="$(git -C "$repo_root" remote get-url origin 2>/dev/null)"
@@ -34,9 +36,20 @@ log_prefix="/tmp/${repo_name}-prepush"
 # branches leaves the generated client matching the OTHER branch's schema, and
 # the resulting type errors look exactly like someone else's pre-existing
 # breakage. That misattribution is the whole reason this gate exists.
+# Prefer the repo's own generate script when it has one: multi-schema repos
+# (measured 2026-09-11: one with 8 schemas, one with 6) generate every client
+# from that script, and a bare `npx prisma generate` only refreshes the default
+# schema — leaving the other clients on the previous branch's shape, which is
+# the exact misattribution described above.
 if [ -f "$repo_root/prisma/schema.prisma" ] || grep -q '"prisma"' "$repo_root/package.json" 2>/dev/null; then
-  echo "[pre-push] prisma generate ..."
-  if ! npx prisma generate > "$log_prefix-prisma.log" 2>&1; then
+  gen_cmd="npx prisma generate"
+  for script in prisma:generate generate:prisma prisma:generate:all; do
+    if grep -qE "\"$script\"[[:space:]]*:" "$repo_root/package.json" 2>/dev/null; then
+      gen_cmd="npm run $script"; break
+    fi
+  done
+  echo "[pre-push] $gen_cmd ..."
+  if ! $gen_cmd > "$log_prefix-prisma.log" 2>&1; then
     echo ""
     echo "x [pre-push] prisma generate failed — not pushing"
     tail -n 20 "$log_prefix-prisma.log"
