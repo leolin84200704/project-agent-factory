@@ -63,9 +63,16 @@ the output:
 
 | verdict | rule | exit |
 |---|---|---|
-| PASS | ≥1 `<Module> dependencies initialized` (or "successfully started") and no DI error | 0 |
+| PASS | no DI error, and evidence the injector finished: the preload's `NestFactory.create resolved` marker (logger-independent), or ≥1 `<Module> dependencies initialized`, or "successfully started" / "running on", or the process is listening on a TCP port | 0 |
 | FAIL | `UnknownDependenciesException` / `can't resolve dependencies` / circular, undefined-module … | 1 |
 | INCONCLUSIVE | no sign the injector ran at all — treated as FAIL; `DI_SMOKE_ALLOW_SILENT=1` accepts | 3 |
+
+The app is started with `node -r lib/nest-di-smoke-preload.js`, which wraps the
+app's own `NestFactory.create` and prints a marker when its promise resolves —
+Nest returns from `create()` only after every provider is instantiated, so this
+is the DI verdict itself, independent of `logger: false` / `logger: ["error"]`
+and of how long the app then takes to `listen()`. A rejection is printed too,
+even when `bootstrap()` swallows it.
 
 Whether the app finishes booting is *not* the criterion: with no database it
 will die on a config check or wait on a connection, and both are fine — Nest
@@ -81,9 +88,23 @@ injector is the only thing that can tell, and it tells within a second.
 
 `.env.example` is deliberately not read: it added zero modules on the reference
 repo, and such files carry real internal hosts (gRPC targets, Kafka brokers, a
-staging consumer-group id) a booting app would contact. A repo that needs
-dummies to get past an early config check puts them in a git-ignored
-`.env.di-smoke`, or sets `DI_SMOKE_ENV_FILES=".env.example"` knowingly.
+staging consumer-group id) a booting app would contact. An app that validates
+config at module load (`ConfigModule.forRoot` + Joi: `"JWT_SECRET" is required`)
+dies before the injector and comes out INCONCLUSIVE; give it dummies in the
+**per-machine** file `~/.config/nest-di-smoke/<origin-repo-name>.env` — one
+file per repo per machine, shared by all its clones and worktrees, never inside
+a product repo. The INCONCLUSIVE report prints the exact path and the keys it
+saw demanded. A repo-local git-ignored `.env.di-smoke` is also read (wins on
+conflicts); `DI_SMOKE_ENV_FILES` overrides the whole list. The same file may
+carry `DI_SMOKE_ALLOW_SILENT=1` / `DI_SMOKE_TIMEOUT=…` for an app whose DI phase
+awaits real infrastructure (an async provider connecting to Redis/Kafka before
+the graph completes): the silent verdict is then accepted, while a printed DI
+error still fails. Measured 2026-09-11: one repo needed exactly this.
+
+The prisma step before the build prefers the repo's own `prisma:generate` /
+`generate:prisma` script when it has one: multi-schema repos generate every
+client there, and a bare `npx prisma generate` refreshes only the default
+schema.
 
 Standalone, from a repo root after a build:
 

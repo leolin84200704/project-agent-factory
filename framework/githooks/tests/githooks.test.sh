@@ -152,6 +152,18 @@ run 1 "gated repo with a failing build: blocked" "$GATED" pre-push
 printf '{"scripts":{"build":"exit 0"}}\n' > "$GATED/package.json"
 run 0 "gated repo with a passing build: allowed" "$GATED" pre-push
 
+echo "--- pre-push prisma step prefers the repo's own generate script ---"
+# Multi-schema repos generate every client from a package.json script; a bare
+# `npx prisma generate` would refresh only the default schema. The fake script
+# drops a marker the fake build then requires.
+PRISMA=$(mkrepo prisma 'git@github.com:Vibrant-America/lis-backend-emr-v2.git')
+mkdir -p "$PRISMA/prisma" && touch "$PRISMA/prisma/schema.prisma"
+printf '{"scripts":{"prisma:generate":"touch .all-clients","build":"test -f .all-clients"}}\n' > "$PRISMA/package.json"
+run 0 "repo with prisma:generate script: npm run script, then build sees its output" "$PRISMA" pre-push
+printf '{"scripts":{"generate:prisma":"touch .all-clients","build":"test -f .all-clients"}}\n' > "$PRISMA/package.json"
+rm -f "$PRISMA/.all-clients"
+run 0 "generate:prisma spelling is honoured too" "$PRISMA" pre-push
+
 echo "--- pre-push Nest DI smoke: gated Nest repos must boot their build ---"
 # The 2026-09-10 shape: build green, injector throws on the first module import.
 # dist/main.js stands in for the compiled app; the "build" is a no-op that
@@ -178,6 +190,23 @@ run 0 "app starts and stays up: allowed (killed, not waited out)" "$NEST" pre-pu
 mk_nest "$NEST" "$LOADER setInterval(function(){},1000);"
 run 0 "graph resolved, then hangs on a connection until the timeout: allowed" "$NEST" pre-push
 
+# `logger: false` shape (measured 2026-09-11): nothing Nest-shaped is ever
+# printed, but the app reaches listen(). The open socket is the evidence.
+mk_nest "$NEST" "require('http').createServer().listen(0, '127.0.0.1');"
+run 0 "silent logger but the process listens on a port: allowed" "$NEST" pre-push
+
+# Fully silent app (logger: ["error"]), slow to listen: the only evidence is the
+# preload seeing the app's own NestFactory.create() resolve. A fake @nestjs/core
+# in the fake repo's node_modules stands in for the real one.
+mkdir -p "$NEST/node_modules/@nestjs/core"
+printf '%s\n' "exports.NestFactory = { create: function () { return new Promise(function (r) { setTimeout(function () { r({ listen: function () { return new Promise(function () {}); } }); }, 300); }); } };" > "$NEST/node_modules/@nestjs/core/index.js"
+mk_nest "$NEST" "require('@nestjs/core').NestFactory.create().then(function (app) { return app.listen(); });"
+run 0 "silent app, no socket yet, but NestFactory.create resolved (preload marker): allowed" "$NEST" pre-push
+printf '%s\n' "exports.NestFactory = { create: function () { var e = new Error(\"Nest can't resolve dependencies of the FooStore (ConfigService, ?)\"); e.name = 'UnknownDependenciesException'; return Promise.reject(e); } };" > "$NEST/node_modules/@nestjs/core/index.js"
+mk_nest "$NEST" "require('@nestjs/core').NestFactory.create().catch(function () { setInterval(function(){},1000); });"
+run 1 "bootstrap swallows the DI rejection; the preload still reports it: blocked" "$NEST" pre-push
+rm -rf "$NEST/node_modules"
+
 mk_nest "$NEST" "process.exit(0);"
 run 1 "no sign the injector ran: inconclusive, blocked (fail-safe)" "$NEST" pre-push
 DI_SMOKE_ALLOW_SILENT=1 run 0 "...unless the repo explicitly accepts a silent boot" "$NEST" pre-push
@@ -190,6 +219,21 @@ printf 'FOO="bar" # comment\nBAZ=1  # comment\nexport QUX=q\nNODE_ENV=production
 mk_nest "$NEST" "$LOADER var e=process.env; if(e.FOO!=='bar'||e.BAZ!=='1'||e.QUX!=='q'||e.NODE_ENV!=='test'||e.LEAKED){ $DI_ERR process.exit(1);} process.exit(0);"
 LEAKED=1 run 0 "env file parsed, NODE_ENV forced, caller's shell vars do not leak" "$NEST" pre-push
 rm "$NEST/.env.di-smoke"
+
+# Per-machine env file, found by ORIGIN repo name (not the worktree's directory
+# name), so one file serves every clone/worktree of a repo on the box.
+MACHINE_ENV="$TMP/xdg/nest-di-smoke"; mkdir -p "$MACHINE_ENV"
+printf 'JWT_SECRET=dummy\n' > "$MACHINE_ENV/lis-backend-emr-v2.env"
+mk_nest "$NEST" "if(!process.env.JWT_SECRET){console.error('Config validation error: \"JWT_SECRET\" is required'); process.exit(1);} $LOADER process.exit(0);"
+XDG_CONFIG_HOME="$TMP/xdg" run 0 "config-at-load app fed from the per-machine env file (keyed by origin name): allowed" "$NEST" pre-push
+XDG_CONFIG_HOME="$TMP/nowhere" run 1 "...and without that file it dies before the injector: blocked" "$NEST" pre-push
+# The knob can live in that file too — for apps whose DI phase awaits real infra.
+printf 'DI_SMOKE_ALLOW_SILENT=1\nDI_SMOKE_TIMEOUT=2\n' > "$MACHINE_ENV/lis-backend-emr-v2.env"
+mk_nest "$NEST" "if(process.env.DI_SMOKE_ALLOW_SILENT){ $DI_ERR process.exit(1);} setInterval(function(){},1000);"
+XDG_CONFIG_HOME="$TMP/xdg" run 0 "DI_SMOKE_ALLOW_SILENT=1 in the per-machine file: silent boot accepted, knob not leaked to the child" "$NEST" pre-push
+mk_nest "$NEST" "$DI_ERR process.exit(1);"
+XDG_CONFIG_HOME="$TMP/xdg" run 1 "...but a printed DI error still fails even with ALLOW_SILENT" "$NEST" pre-push
+rm -rf "$TMP/xdg"
 
 # Scope: a gated repo WITHOUT @nestjs/core gets the build gate only.
 mkdir -p "$GATED/dist"
