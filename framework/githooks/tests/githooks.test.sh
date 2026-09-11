@@ -152,5 +152,50 @@ run 1 "gated repo with a failing build: blocked" "$GATED" pre-push
 printf '{"scripts":{"build":"exit 0"}}\n' > "$GATED/package.json"
 run 0 "gated repo with a passing build: allowed" "$GATED" pre-push
 
+echo "--- pre-push Nest DI smoke: gated Nest repos must boot their build ---"
+# The 2026-09-10 shape: build green, injector throws on the first module import.
+# dist/main.js stands in for the compiled app; the "build" is a no-op that
+# leaves it in place. Exit codes come from the smoke's verdict, not the script.
+NEST=$(mkrepo nest 'git@github.com:Vibrant-America/lis-backend-emr-v2.git')
+mk_nest() {  # mk_nest <repo> <main.js body>
+  mkdir -p "$1/dist"
+  printf '{"scripts":{"build":"exit 0"},"dependencies":{"@nestjs/core":"^11"}}\n' > "$1/package.json"
+  printf '%s\n' "$2" > "$1/dist/main.js"
+}
+LOADER='console.log(JSON.stringify({level:"log",context:"InstanceLoader",message:"AppModule dependencies initialized"}));'
+DI_ERR='console.error("UnknownDependenciesException [Error]: Nest can'"'"'t resolve dependencies of the FooStore (ConfigService, ?)");'
+export DI_SMOKE_TIMEOUT=5
+
+mk_nest "$NEST" "$LOADER $DI_ERR process.exit(1);"
+run 1 "DI error after some modules initialised: blocked" "$NEST" pre-push
+
+mk_nest "$NEST" "$LOADER console.error('Error: JWT_SECRET environment variable is required'); process.exit(1);"
+run 0 "graph resolved, then a config hard-check kills it: allowed" "$NEST" pre-push
+
+mk_nest "$NEST" "$LOADER console.log('Nest application successfully started'); setInterval(function(){},1000);"
+run 0 "app starts and stays up: allowed (killed, not waited out)" "$NEST" pre-push
+
+mk_nest "$NEST" "$LOADER setInterval(function(){},1000);"
+run 0 "graph resolved, then hangs on a connection until the timeout: allowed" "$NEST" pre-push
+
+mk_nest "$NEST" "process.exit(0);"
+run 1 "no sign the injector ran: inconclusive, blocked (fail-safe)" "$NEST" pre-push
+DI_SMOKE_ALLOW_SILENT=1 run 0 "...unless the repo explicitly accepts a silent boot" "$NEST" pre-push
+
+# Env handling: the child sees the repo-local dummies (quotes and trailing
+# comments stripped, `export` tolerated), NODE_ENV forced to test, and nothing
+# from the caller's shell. A wrong value is reported as a DI error so the
+# assertion rides on the exit code like every other case here.
+printf 'FOO="bar" # comment\nBAZ=1  # comment\nexport QUX=q\nNODE_ENV=production\n' > "$NEST/.env.di-smoke"
+mk_nest "$NEST" "$LOADER var e=process.env; if(e.FOO!=='bar'||e.BAZ!=='1'||e.QUX!=='q'||e.NODE_ENV!=='test'||e.LEAKED){ $DI_ERR process.exit(1);} process.exit(0);"
+LEAKED=1 run 0 "env file parsed, NODE_ENV forced, caller's shell vars do not leak" "$NEST" pre-push
+rm "$NEST/.env.di-smoke"
+
+# Scope: a gated repo WITHOUT @nestjs/core gets the build gate only.
+mkdir -p "$GATED/dist"
+printf '%s\n' "$DI_ERR process.exit(1);" > "$GATED/dist/main.js"
+run 0 "gated repo without @nestjs/core: build only, no smoke" "$GATED" pre-push
+unset DI_SMOKE_TIMEOUT
+
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; exit 1; fi

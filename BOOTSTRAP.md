@@ -76,6 +76,7 @@
 ### 5. Workspace 接線
 - 若 Leo 從 workspace 根目錄（非 instance repo 內）啟動 session：workspace 根放一份 `CLAUDE.md`，內容一行 `@{instance}/CLAUDE.md`
 - 這份工作專屬的 skills 放 `{instance}/.claude/skills/`，並 symlink 到 `{workspace}/.claude/skills/`（讓從 workspace 啟動的 session 也能發現）
+- 每台機器一次 `bash $FACTORY/framework/githooks/install.sh`，把 git 層的 pre-commit／pre-push 接到 factory（global `core.hooksPath`；含 build gate 與 Nest DI boot smoke，說明在 `framework/githooks/README.md`）。這層與下面的 Claude Code hooks 互補：hooks 只擋 agent 下的指令，githooks 擋所有 push——包含 Leo 自己終端的
 - Workspace 及各工作 repo 放 `.claude/settings.local.json`：`autoMemoryEnabled: false` + **hooks 用絕對路徑指回 factory `framework/hooks/`**（git 安全 ×2 + engineering-lessons 提醒 + verification-asset 保護 + repo-language 攔截（`git commit` 時 staged 的非 .md 檔含 CJK 即攔）；單一源頭、不複製檔案進產品 repo）。工作 repo 是 git 的話把 `.claude/` 加進 `.git/info/exclude`（本地 ignore，不產生 commit — 對 push-to-deploy 的 repo 尤其重要）
 
 ### 6. 驗收（新開一個 session 測）
