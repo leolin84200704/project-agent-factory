@@ -71,7 +71,7 @@
 - **Caller 能自己修正的失敗要回 4xx，不要回 5xx** — 合法輸入推導出空結果是**拒絕**不是崩潰；回可被對方引用的 reason/code，且用對方送進來的詞彙回答，不要回內部 id。適用: 寫對外 API 的錯誤路徑、把上游錯誤往外轉、或看到 5xx 落在合法請求上時。
 - **長期記憶的 dedup/merge 沒證明不縮水，就是套在迴圈裡的有損壓縮** — 相似度判準禁用「新項目長度」當分母（短項目會單向吃掉長項目），命中後取聯集或較長者而非無條件取新值；監控**總 bytes**，項目數是門面指標。適用: 設計 agent memory / user profile / knowledge base 的 dedup、compaction、decay，或看到注入 context 的 token 數只跌不漲時。
 - **預算「迴圈開頭檢查、單位做完才累加」= 地板不是天花板** — 這種寫法的實際上限恆為 `budget + 最後一個單位的成本`，單位成本波動越大超支越兇，且**每一輪都會超**（不是偶發）。要真封頂就用已完成單位的實績做 pre-flight 預估，估完會超就不開下一個單位；調低 budget 只是把地板下移，超支比例不變。適用: 設 token/spend/時間預算、批次迴圈、rate limiter、任何「跑到額度用完為止」的無人值守工作。
-
+- **可選建構子參數要 `@Optional() @Inject(TOKEN)`** — 為測試留「可注入假物件」口時，`param?: Interface` 在靠 type metadata 解析的 DI 容器裡是**必要**的 `Object` 依賴，整個 app 起不來；改用顯式 token + optional 標記，production 不提供該 token 即解析為 undefined、類別自建預設實作。適用: 任何 @Injectable／@Component 類在 constructor 開測試注入口、或以 interface／type alias 當依賴型別時；PR review 看到 `?:` 接 interface 就該問。
 
 ## 流程紀律
 
