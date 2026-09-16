@@ -77,6 +77,7 @@
 
 ## 流程紀律
 
+- **效能計劃裡的「事實」要用現行 code 加一筆新 trace 重驗再動工** — 自呼叫、N+1 次數、hop 目標這類前提先 grep 現行 code 並對照新抓的 trace，再排優先序與估效益。適用: 依既有分析報告、舊 trace 或會議結論開工的效能票。
 - **匹配不到目標的守衛要大聲失敗，不能算通過** — hook / linter / CI gate 只要是靠 glob、路徑或檔名去找它要檢查的東西，佈局一改（設定檔搬家、目錄結構重整、檔案改名）那個 glob 就會匹配到 0 個目標，於是每一次執行都「通過」——而且是**靜默**通過，綠燈與真正合規的綠燈長得一模一樣。守衛失效的當下沒有任何訊號，通常要到有人手動走一次流程、發現規則早就沒在擋，才會知道。硬規則：守衛在檢查之前先斷言「我找到了要檢查的目標」，找不到就報錯而不是放行；對「應該存在的目標數 > 0」下斷言，並把目標路徑寫在錯誤訊息裡。適用: 寫任何靠路徑定位目標的檢查時；搬移設定檔或改目錄結構時（同一個 PR 要一起改守衛）。
 
 - **Agent 自創慣例進共享 repo 前，先問所有權層級** — 動工前確認 repo 是 personal 還是 company/team-owned：personal 由 owner 裁定即可；team-owned 時任何 agent 自創的工作慣例（wave doc、工作紀錄、檔案語言、命名規則）需整個團隊接受才能進 repo，否則放 instance repo 或既有 ticket 系統。單一協作者眼中「合理的慣例」（如英文 codebase 裡出現中文工作單）對團隊就是事故。適用: 建立新工作慣例、往產品 repo 放非產品文件、檔案語言與 repo 既有語言不一致時。子規則「code file 不進 CJK」enforced-by: `framework/hooks/validate-repo-language.sh`。子規則「wave doc 一律進中央 repo `agent-waves` 分 project path，不進 product repo」（Leo 指令 2026-08-16）——把最常見的自創慣例直接移出所有權判斷，product repo 永遠只留產品內容；2026-08-16 已把 industry-intel 的 9 份 wave doc 遷至 `agent-waves/industry-intel/`。
