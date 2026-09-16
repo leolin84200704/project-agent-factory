@@ -7,6 +7,7 @@
 
 ## 驗證紀律
 
+- **零行為變更的重構，golden spec 要把每個階段的失敗與降級路徑一起釘住** — 只釘 happy path 抓不到「失敗時副作用順序被改變」；每個下游各寫一個失敗案例並比對全回應。適用: 並行化、提前發送、換傳輸路徑等聲稱不影響功能的重構。
 - **Test before push** — 會影響 prod 的 push 前必跑 unit test，且涵蓋新 logic 的每個分支。compile pass ≠ behavior correct。
 - **Verified means live, not mock** — 別把 mock unit test 說成「線上驗證」。prod 行為的結論要用真實 DB / 部署中的 service 重現。
 - **Verify peer-observed state** — 修 network/lifecycle 問題時，驗證對端可觀察的狀態（對方的 session count、connection 數），不只看自己這邊的 log。
