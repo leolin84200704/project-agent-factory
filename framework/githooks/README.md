@@ -37,6 +37,7 @@ A guard that fires where it was never agreed is a guard that gets turned off.
 | no CJK in code | everywhere | `.ts` / `.js` / `.sql` only; markdown exempt |
 | build before push | opt-in list | origin repo name matches `BUILD_GATE_REPOS` |
 | Nest DI boot smoke | opt-in list, Nest repos only | in `BUILD_GATE_REPOS` **and** `package.json` depends on `@nestjs/core` |
+| related unit tests before push | opt-in list | origin repo name matches `TEST_GATE_REPOS` **and** `package.json` mentions jest |
 
 The build gate is a list rather than "any repo with a build script" on purpose:
 forcing a build on every push in every JS repo is a workflow change nobody
@@ -116,6 +117,39 @@ Knobs: `DI_SMOKE_ENTRY`, `DI_SMOKE_TIMEOUT`, `DI_SMOKE_ENV_FILES`, `DI_SMOKE_LOG
 `DI_SMOKE_ALLOW_SILENT`. The cheaper, per-PR habit that makes this gate
 redundant: one spec per module that does
 `Test.createTestingModule({ imports: [ConfigModule.forRoot(...), TheRealModule] }).compile()`.
+
+## Related unit tests before push (pre-push, after the DI smoke)
+
+The build gate proves the code compiles; the DI smoke proves the graph resolves;
+neither proves one branch of the new logic behaves. **Test before push** in
+ENGINEERING-LESSONS sat at ladder step 7 (prose) until 2026-09-18 — the canary
+that motivates the ladder measured prose lessons at 0/3 compliance.
+
+For repos in `TEST_GATE_REPOS` the hook diffs `HEAD` against where the branch
+left `origin/main` (falls back to `origin/master`, then `@{upstream}`; with none
+of the three it skips and says so), keeps the changed `.ts` under `src/ apps/
+libs/` that still exist — dropping `.d.ts`, `*.integration.spec.ts` and e2e
+specs, which need live infrastructure — and hands them to
+`jest --findRelatedTests`. Jest runs every suite that imports those files; a
+changed spec selects itself. Nothing changed → skipped, one line says so. The
+repo's `pretest` script runs first when it has one (emr-v2 regenerates its test
+prisma client there), and `node_modules/.bin/jest` is preferred over `npx`.
+
+Measured 2026-09-18: one emr-v2 service file → 7 suites in 6 s; the
+transformer-v2 hub `src/tool.ts` → 33 suites in 60 s; both full suites take
+minutes. A spec that no longer compiles fails the gate on purpose — it means the
+contract it pinned moved and nothing re-pinned it (found the same day on an
+emr-v2 branch: a spec passing 9 constructor arguments to a 7–8 argument
+constructor).
+
+Why a git hook and not a Claude PreToolUse hook: this one fires for every
+pusher, Leo's terminal included, and it already sits in the pipeline that the
+agent cannot `--no-verify` past. Scope is a list for the same reason the build
+gate is: a gate that fires where nobody agreed to it gets turned off. Pre-
+existing red suites on `main` would block every push in that repo — check with
+`npx jest` on a fresh `main` before adding a repo. (2026-09-18: transformer-v2
+looked red locally because the clone was 24 commits behind; fresh `main` was
+green.)
 
 ## Escape hatch
 

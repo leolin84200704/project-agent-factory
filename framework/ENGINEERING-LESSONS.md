@@ -8,7 +8,7 @@
 ## 驗證紀律
 
 - **零行為變更的重構，golden spec 要把每個階段的失敗與降級路徑一起釘住** — 只釘 happy path 抓不到「失敗時副作用順序被改變」；每個下游各寫一個失敗案例並比對全回應。適用: 並行化、提前發送、換傳輸路徑等聲稱不影響功能的重構。
-- **Test before push** — 會影響 prod 的 push 前必跑 unit test，且涵蓋新 logic 的每個分支。compile pass ≠ behavior correct。
+- **Test before push** — 會影響 prod 的 push 前必跑 unit test，且涵蓋新 logic 的每個分支。compile pass ≠ behavior correct。 enforced-by: `framework/githooks/pre-push`（`TEST_GATE_REPOS` 內的 repo 在 build + DI smoke 後跑 `jest --findRelatedTests`，對象為本分支相對 origin/main 改動的 `.ts`；任一相關 suite 失敗或編不過即拒推）+ `framework/hooks/validate-git-push.sh`（agent 不得 `--no-verify` 繞過）。機制只保證「相關 suite 綠」，「涵蓋新 logic 每個分支」仍靠 review。
 - **Verified means live, not mock** — 別把 mock unit test 說成「線上驗證」。prod 行為的結論要用真實 DB / 部署中的 service 重現。
 - **Verify peer-observed state** — 修 network/lifecycle 問題時，驗證對端可觀察的狀態（對方的 session count、connection 數），不只看自己這邊的 log。
 - **Rolling deploy 完成的判準是新 pod 本身，不是 deployment 聚合欄位** — k8s rolling update 期間 `deployment.status.readyReplicas` 計入**舊** pod，所以「spec image 已更新 + ready≥1」會在新 pod 還沒起來時就成立，是假完成訊號；照它開跑驗證會打到舊版 code，測試結果全部作廢。正確判準：存在一個 **image == 目標版本** 且 `containerStatuses[].ready==true` 的 pod（必要時再確認舊 pod 已終止）；最終確認 = **exec 進 pod 驗證編譯產物內容**（grep 本次變更的具體字串）——tag/ready 都對不代表跑的是新 code，同日兩次假陽性都是靠 content 驗證擋下。同理適用任何滾動替換系統：完成訊號要綁「新實例的身份+就緒」，不能用會混入舊實例的聚合計數。旁註：切換過程中單次 API 讀值可能出現 transient 異常值，關鍵判斷要重讀確認、不要憑單次讀值行動。
