@@ -30,27 +30,22 @@ run() {  # run <expected_exit> <label> <repo> <hook> [args...]
   return 0
 }
 
-echo "--- guard 1: config coupled with code ---"
+echo "--- guard 1 (ConfigMap coupling) moved to the instance repo: shared hook stays silent ---"
+# The guard itself lives in the instance repo via guard-paths (see the "MOVED
+# OUT" block in pre-commit). The two cases that expected THIS hook to block were
+# stale and failed on every machine; removed 2026-09-18 (Leo). What remains pins
+# the inverse: the shared hook must not fire on that shape.
 NOYAML=$(mkrepo noyaml)
 printf 'const a = process.env.BRAND_NEW_VAR;\n' > "$NOYAML/x.ts"
 git -C "$NOYAML" add -A
-run 0 "repo without a ConfigMap pair: out of scope, allowed" "$NOYAML" pre-commit
+run 0 "new env var, no ConfigMap pair: allowed" "$NOYAML" pre-commit
 
 WITHYAML=$(mkrepo withyaml)
 printf 'data:\n  EXISTING: "1"\n' > "$WITHYAML/svc-config.yaml"
 printf 'data:\n  EXISTING: "1"\n' > "$WITHYAML/svc-config-prod.yaml"
 printf 'const a = process.env.BRAND_NEW_VAR;\n' > "$WITHYAML/x.ts"
 git -C "$WITHYAML" add -A
-run 1 "new env var missing from both ConfigMaps: blocked" "$WITHYAML" pre-commit
-
-printf 'data:\n  EXISTING: "1"\n  BRAND_NEW_VAR: "2"\n' > "$WITHYAML/svc-config.yaml"
-printf 'data:\n  EXISTING: "1"\n  BRAND_NEW_VAR: "2"\n' > "$WITHYAML/svc-config-prod.yaml"
-git -C "$WITHYAML" add -A
-run 0 "same var present in both ConfigMaps: allowed" "$WITHYAML" pre-commit
-
-printf 'data:\n  EXISTING: "1"\n' > "$WITHYAML/svc-config-prod.yaml"
-git -C "$WITHYAML" add -A
-run 1 "present in dev but missing in prod: blocked" "$WITHYAML" pre-commit
+run 0 "new env var missing from a ConfigMap pair: not this hook's guard any more, allowed" "$WITHYAML" pre-commit
 
 echo "--- guard 2: no CJK in code ---"
 CJK=$(mkrepo cjk)
