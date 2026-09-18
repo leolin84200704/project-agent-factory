@@ -241,5 +241,75 @@ printf '%s\n' "$DI_ERR process.exit(1);" > "$GATED/dist/main.js"
 run 0 "gated repo without @nestjs/core: build only, no smoke" "$GATED" pre-push
 unset DI_SMOKE_TIMEOUT
 
+echo "--- pre-push related-tests gate: opt-in, diff-scoped, specs select themselves ---"
+# A fake jest in node_modules/.bin records its argv and exits per a marker file,
+# so the tests assert WHICH files the gate hands to jest, not jest's verdict.
+mk_testrepo() {  # mk_testrepo <name> <origin-url>
+  local d; d=$(mkrepo "$1" "$2")
+  printf '{"scripts":{"build":"exit 0"},"jest":{}}\n' > "$d/package.json"
+  mkdir -p "$d/node_modules/.bin" "$d/src"
+  cat > "$d/node_modules/.bin/jest" <<'JEST'
+#!/bin/sh
+printf '%s\n' "$@" > "$(git rev-parse --show-toplevel)/.jest-argv"
+[ -f "$(git rev-parse --show-toplevel)/.jest-fail" ] && { echo "FAIL src/x.spec.ts"; echo "Tests: 1 failed, 1 total"; exit 1; }
+echo "Tests: 1 passed, 1 total"; exit 0
+JEST
+  chmod +x "$d/node_modules/.bin/jest"
+  printf 'export const a = 1;\n' > "$d/src/base.ts"
+  git -C "$d" add -A && git -C "$d" commit -qm base
+  git -C "$d" update-ref refs/remotes/origin/main HEAD
+  git -C "$d" checkout -qb feature/x
+  echo "$d"
+}
+jest_saw() { [ -f "$1/.jest-argv" ] && grep -qx "$2" "$1/.jest-argv"; }
+
+TG=$(mk_testrepo testgate 'git@github.com:Vibrant-America/lis-backend-emr-v2.git')
+run 0 "gated repo, nothing changed since origin/main: skipped, allowed" "$TG" pre-push
+[ ! -f "$TG/.jest-argv" ] || { echo "        FAIL: jest was invoked with no changed files"; fails=$((fails+1)); }
+
+printf 'export const b = 2;\n' > "$TG/src/b.service.ts"
+printf 'it("x",()=>{});\n' > "$TG/src/b.service.spec.ts"
+printf 'it("x",()=>{});\n' > "$TG/src/b.integration.spec.ts"
+printf 'export {};\n' > "$TG/src/types.d.ts"
+mkdir -p "$TG/scripts" && printf 'export const s = 1;\n' > "$TG/scripts/tool.ts"
+git -C "$TG" add -A && git -C "$TG" commit -qm change
+run 0 "changed source + spec, fake jest passes: allowed" "$TG" pre-push
+jest_saw "$TG" "src/b.service.ts"       || { echo "        FAIL: changed source not handed to jest"; fails=$((fails+1)); }
+jest_saw "$TG" "src/b.service.spec.ts"  || { echo "        FAIL: changed spec not handed to jest"; fails=$((fails+1)); }
+jest_saw "$TG" "src/b.integration.spec.ts" && { echo "        FAIL: integration spec must stay out"; fails=$((fails+1)); }
+jest_saw "$TG" "src/types.d.ts"         && { echo "        FAIL: .d.ts must stay out"; fails=$((fails+1)); }
+jest_saw "$TG" "scripts/tool.ts"        && { echo "        FAIL: files outside src/apps/libs must stay out"; fails=$((fails+1)); }
+grep -qx -- "--findRelatedTests" "$TG/.jest-argv" || { echo "        FAIL: --findRelatedTests not passed"; fails=$((fails+1)); }
+
+touch "$TG/.jest-fail"
+run 1 "changed source, fake jest fails: blocked" "$TG" pre-push
+rm -f "$TG/.jest-fail" "$TG/.jest-argv"
+
+git -C "$TG" rm -q src/b.service.ts && git -C "$TG" commit -qm delete
+run 0 "a file deleted on the branch is not handed to jest" "$TG" pre-push
+jest_saw "$TG" "src/b.service.ts" && { echo "        FAIL: deleted file handed to jest"; fails=$((fails+1)); }
+
+# pretest runs first when the repo declares one (emr-v2 generates its test prisma client there).
+printf '{"scripts":{"build":"exit 0","pretest":"touch .pretest-ran"},"jest":{}}\n' > "$TG/package.json"
+git -C "$TG" add -A && git -C "$TG" commit -qm pretest
+run 0 "repo with a pretest script: it runs before jest" "$TG" pre-push
+[ -f "$TG/.pretest-ran" ] || { echo "        FAIL: pretest did not run"; fails=$((fails+1)); }
+printf '{"scripts":{"build":"exit 0","pretest":"exit 1"},"jest":{}}\n' > "$TG/package.json"
+git -C "$TG" add -A && git -C "$TG" commit -qm pretest-fail
+run 1 "pretest fails: blocked" "$TG" pre-push
+
+NOTG=$(mk_testrepo notestgate 'git@github.com:Vibrant-America/LIS-backend-dashboard.git')
+printf 'export const b = 2;\n' > "$NOTG/src/b.ts"
+git -C "$NOTG" add -A && git -C "$NOTG" commit -qm change
+touch "$NOTG/.jest-fail"
+run 0 "build-gated repo NOT in the test-gate list: jest never runs" "$NOTG" pre-push
+[ ! -f "$NOTG/.jest-argv" ] || { echo "        FAIL: jest invoked outside the test-gate list"; fails=$((fails+1)); }
+
+NOBASE=$(mkrepo nobase 'git@github.com:Vibrant-America/LIS-transformer-v2.git')
+printf '{"scripts":{"build":"exit 0"},"jest":{}}\n' > "$NOBASE/package.json"
+mkdir -p "$NOBASE/src" && printf 'export const a = 1;\n' > "$NOBASE/src/a.ts"
+git -C "$NOBASE" add -A && git -C "$NOBASE" commit -qm only
+run 0 "no origin/main and no upstream: cannot scope the diff, skipped with a note" "$NOBASE" pre-push
+
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; exit 1; fi

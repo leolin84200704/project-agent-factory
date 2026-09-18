@@ -97,4 +97,72 @@ if [ -f "$repo_root/package.json" ] && grep -q '"build"' "$repo_root/package.jso
   fi
 fi
 
+# ---------- related unit tests ----------
+# "Test before push" (ENGINEERING-LESSONS) lived only as prose until 2026-09-18:
+# the build gate proves the code compiles, the DI smoke proves the graph
+# resolves, and neither proves a single branch of the new logic behaves.
+# INCIDENT-20260601 was a SFTP patch pushed on a green build alone.
+# This runs the jest suites that import the TypeScript changed since the branch
+# left main (`jest --findRelatedTests`), not the whole suite: measured
+# 2026-09-18, one emr-v2 service file -> 7 suites in 6 s; a transformer-v2 hub
+# file -> 33 suites in 60 s; the full suites are minutes. Opt-in by repo name,
+# like the build gate, and for the same reason.
+TEST_GATE_REPOS='lis-backend-emr-v2|LIS-transformer-v2'
+if echo "$repo_name" | grep -qE "^($TEST_GATE_REPOS)$" \
+   && [ -f "$repo_root/package.json" ] && grep -q '"jest"' "$repo_root/package.json" 2>/dev/null; then
+  # Base = where this branch left the default branch. origin/main is preferred
+  # over the push's remote sha (stdin) because a first push of a new branch has
+  # no remote sha, and a chained repo-local hook may already have drained stdin.
+  test_base=""
+  for ref in origin/main origin/master; do
+    if git rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1; then
+      test_base="$(git merge-base HEAD "$ref" 2>/dev/null)" && [ -n "$test_base" ] && break
+    fi
+  done
+  [ -z "$test_base" ] && test_base="$(git rev-parse -q --verify '@{upstream}' 2>/dev/null)"
+
+  if [ -z "$test_base" ]; then
+    echo "[pre-push] related tests: no origin/main, origin/master or upstream to diff against — skipped"
+  else
+    # Source and spec files under the code roots; specs select themselves.
+    # Integration / e2e specs need live infrastructure and stay out, as do
+    # declaration files and files deleted on the branch.
+    changed_ts="$(git diff --name-only --diff-filter=ACMR "$test_base" HEAD -- '*.ts' 2>/dev/null \
+      | grep -E '^(src|apps|libs)/' \
+      | grep -vE '\.(integration|e2e)[-.]spec\.ts$|\.e2e-spec\.ts$|\.d\.ts$' \
+      | while IFS= read -r f; do [ -f "$repo_root/$f" ] && printf '%s\n' "$f"; done)"
+    if [ -z "$changed_ts" ]; then
+      echo "[pre-push] related tests: no TypeScript changed since $(git rev-parse --short "$test_base") — skipped"
+    else
+      # `npm test` would run the repo's pretest (emr-v2: prisma generate for the
+      # test schema); calling jest directly skips it, so run it here when present.
+      if grep -qE '"pretest"[[:space:]]*:' "$repo_root/package.json" 2>/dev/null; then
+        if ! npm run -s pretest > "$log_prefix-pretest.log" 2>&1; then
+          echo ""
+          echo "x [pre-push] npm run pretest failed — not pushing"
+          tail -n 20 "$log_prefix-pretest.log"
+          echo "log: $log_prefix-pretest.log"
+          exit 1
+        fi
+      fi
+      jest_bin="npx jest"
+      [ -x "$repo_root/node_modules/.bin/jest" ] && jest_bin="$repo_root/node_modules/.bin/jest"
+      n_changed=$(printf '%s\n' "$changed_ts" | grep -c .)
+      echo "[pre-push] related tests for $n_changed changed .ts file(s) since $(git rev-parse --short "$test_base") ..."
+      # shellcheck disable=SC2086
+      if ! printf '%s\n' "$changed_ts" | xargs $jest_bin --ci --passWithNoTests --findRelatedTests > "$log_prefix-tests.log" 2>&1; then
+        echo ""
+        echo "x [pre-push] related unit tests failed — not pushing."
+        echo "  These suites import code this branch changed. A spec that no longer"
+        echo "  compiles counts: it means the contract it pinned moved and nothing"
+        echo "  re-pinned it. Fix the code or the spec; do not delete the assertion."
+        grep -E '^(FAIL|Tests:|Test Suites:)' "$log_prefix-tests.log" | head -n 20
+        echo "log: $log_prefix-tests.log     skip (humans only — the agent's push hook refuses --no-verify): git push --no-verify"
+        exit 1
+      fi
+      grep -E '^(Tests:|Test Suites:)' "$log_prefix-tests.log" | sed 's/^/[pre-push] /'
+    fi
+  fi
+fi
+
 exit 0
