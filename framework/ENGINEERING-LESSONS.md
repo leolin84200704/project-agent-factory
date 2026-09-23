@@ -36,6 +36,8 @@
 
 ## 變更範圍紀律
 
+- **跨環境的預設值是最壞的一種 fallback —— 因為它會成功** — 為「連哪個服務」這類設定寫 `process.env.X || '<某個位址>'` 之前先問兩件事：這個變數在**每個**環境都設了嗎？各環境的值**一樣**嗎？很常見的組合是兩個都否——變數到處都沒設（所以 fallback 才是實際生效值），而各環境指向不同的後端——於是你把某一個環境的位址烤進了所有環境。致命的地方在於它通常**連得上**：測試環境往往打得到正式環境的服務，所以錯誤設定不會 fail fast，而是安靜地讀了另一個環境的資料，把「比對/驗證/影子流量」變成一份看起來很漂亮但毫無意義的報告。正確形狀是沒有預設值：值為空就代表「這個環境沒有配置這條路」，功能退回既有行為；啟用要兩個刻意動作（先配位址、再開開關）而非一個。驗證法：從**每一個**環境各一個節點，對**所有**候選位址做連通測試——會通的那些才是你真正的風險面。適用: 加服務位址/端點/資料庫連線的設定、寫 `||` 或 `??` 當 fallback、或設計分階段切換的開關。
+
 - **Config coupled with code** — 新增任何 `process.env.X`（或等價設定），同一個變更裡就更新所有部署 config（yaml/ConfigMap），並明說改了哪些。
 - **Schema migration before deploy** — 對非 ORM-managed 的 prod DB，schema 加欄位必須先手動 ALTER 到 prod 才部署，否則整個 model 的讀取會全數失敗。
 - **Staging schema before the staging PR** — merge 即部署的分支，開 PR 前 agent 先自己把 additive migration 套到 staging schema，PR body 只留「prod ALTER 必須先於 main merge」；「誰跑 ALTER？」不能當問題留給人。適用: 非 ORM-managed schema 且 staging 分支 push-to-deploy 時。
