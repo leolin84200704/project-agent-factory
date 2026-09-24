@@ -30,6 +30,16 @@ run() {  # run <expected_exit> <label> <repo> <hook> [args...]
   return 0
 }
 
+run_says() {  # run_says <expected_exit> <required substring> <label> <repo> <hook>
+  local want="$1" needle="$2" label="$3" repo="$4" hook="$5"
+  local out got mark='ok  '
+  out=$(cd "$repo" && "$HOOKS/$hook" 2>&1); got=$?
+  if [ "$got" != "$want" ] || ! printf '%s' "$out" | grep -qF "$needle"; then mark='FAIL'; fails=$((fails+1)); fi
+  printf '[%s] want=%s got=%s | %s\n' "$mark" "$want" "$got" "$label"
+  [ "$mark" = FAIL ] && { echo "        (needle: $needle)"; echo "$out" | sed 's/^/        /'; }
+  return 0
+}
+
 echo "--- guard 1 (ConfigMap coupling) moved to the instance repo: shared hook stays silent ---"
 # The guard itself lives in the instance repo via guard-paths (see the "MOVED
 # OUT" block in pre-commit). The two cases that expected THIS hook to block were
@@ -229,6 +239,34 @@ XDG_CONFIG_HOME="$TMP/xdg" run 0 "DI_SMOKE_ALLOW_SILENT=1 in the per-machine fil
 mk_nest "$NEST" "$DI_ERR process.exit(1);"
 XDG_CONFIG_HOME="$TMP/xdg" run 1 "...but a printed DI error still fails even with ALLOW_SILENT" "$NEST" pre-push
 rm -rf "$TMP/xdg"
+
+echo "--- pre-push DI smoke: the gate owns the boot environment, not the checkout ---"
+# Measured 2026-09-24 on a real service: the smoke claimed an empty environment
+# and got 126 variables, because the app called dotenv.config() on <cwd>/.env
+# and a generated Prisma client loaded a .env by an ABSOLUTE path baked at
+# generate time. So the verdict followed the directory rather than the commit —
+# the same commit passed in the main clone and failed in a worktree — and the
+# passing run booted against live infrastructure with a real signing key.
+MACHINE_ENV="$TMP/xdg/nest-di-smoke"; mkdir -p "$MACHINE_ENV"
+printf 'PROVISIONED=1\n' > "$MACHINE_ENV/lis-backend-emr-v2.env"
+printf 'CHECKOUT_ONLY=fromtherepo\n' > "$NEST/.env"
+
+# An app that notices the checkout's .env. Reading it must fail under containment.
+READS_ENV="try{require('fs').readFileSync('.env','utf8'); $DI_ERR process.exit(1);}catch(e){if(e.code!=='ENOENT'){throw e;}} $LOADER process.exit(0);"
+mk_nest "$NEST" "$READS_ENV"
+XDG_CONFIG_HOME="$TMP/xdg" run 0 "the checkout's .env is refused; the gate's own env file still feeds the child" "$NEST" pre-push
+# Control group: with containment off the same fixture DOES see the file, so the
+# case above is evidence about containment and not about an unreadable path.
+DI_SMOKE_CONTAIN=0 XDG_CONFIG_HOME="$TMP/xdg" run 1 "...and with containment off it reads it: the fixture is meaningful" "$NEST" pre-push
+
+# An app that only boots when the checkout's .env is readable.
+NEEDS_ENV="try{require('fs').readFileSync('.env','utf8');}catch(e){process.exit(0);} $LOADER process.exit(0);"
+mk_nest "$NEST" "$NEEDS_ENV"
+XDG_CONFIG_HOME="$TMP/nowhere" run_says 0 "boots only with a .env from the checkout" \
+  "unprovisioned repo whose boot needs the checkout .env: passes, divergence named" "$NEST" pre-push
+XDG_CONFIG_HOME="$TMP/xdg" run 1 "...but once the repo is provisioned the contained verdict is final" "$NEST" pre-push
+rm -f "$NEST/.env"
+rm -rf "$TMP/xdg" "$TMP/nowhere"
 
 # Scope: a gated repo WITHOUT @nestjs/core gets the build gate only.
 mkdir -p "$GATED/dist"
