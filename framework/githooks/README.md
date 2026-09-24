@@ -102,6 +102,48 @@ awaits real infrastructure (an async provider connecting to Redis/Kafka before
 the graph completes): the silent verdict is then accepted, while a printed DI
 error still fails. Measured 2026-09-11: one repo needed exactly this.
 
+### Containment: the gate owns the boot environment
+
+The smoke starts the child with `env -i`. On its own that proves nothing.
+Measured 2026-09-24 on a reference service, the child reached **126 variables
+instead of 3** by two routes the gate did not control: the app's own
+`dotenv.config()` reading `<cwd>/.env`, and a generated Prisma client loading
+the `.env` recorded next to its schema by an **absolute** path — which fires
+even from a checkout that has no `.env` of its own.
+
+Both consequences were worse than the missing keys they hid. The verdict
+followed the directory rather than the commit (the same commit passed in the
+main clone and failed in a worktree, and the standing workaround was to copy the
+real `.env` into every worktree), and the passing run booted the service against
+live database, broker and RPC targets with a real signing key, on every push.
+
+So `DI_SMOKE_CONTAIN=1` (the default) has the preload refuse every `.env*` read
+except the gate's own files. Provision a repo once per machine:
+
+```bash
+node $FACTORY/framework/githooks/lib/nest-di-smoke-init.js <repo-root> [--force] [--print]
+```
+
+It writes `~/.config/nest-di-smoke/<origin-repo-name>.env` from the repo's env
+**key names** and value **shapes** — `scheme://…` keeps its scheme and port and
+points at loopback, `host:port` becomes `127.0.0.1:port`, numbers and
+switch-like words are kept, everything else becomes a placeholder. No value is
+copied: run it with `--print` and check. (The first version did copy three bare
+internal IPs, which the leak check on the generated file caught; hence the
+explicit host rules.)
+
+Provisioning is what arms strictness. Until that file exists the gate cannot be
+strict without breaking pushes in every gated repo at once, so an inconclusive
+contained run is retried **uncontained**; if that retry passes, the report says
+the boot depends on a checkout-local `.env`, names the command to fix it, and
+lets the push through. Once the file exists the repo is provisioned and the
+contained verdict is final — no retry, no silent pass. So do not generate the
+file for a repo you have not then watched pass.
+
+Every verdict prints which checkout env files were refused, because a refusal
+the report never mentions is a difference from a clean CI box that nobody would
+have known about.
+
 The prisma step before the build prefers the repo's own `prisma:generate` /
 `generate:prisma` script when it has one: multi-schema repos generate every
 client there, and a bare `npx prisma generate` refreshes only the default
@@ -114,7 +156,7 @@ bash $FACTORY/framework/githooks/lib/nest-di-smoke.sh
 ```
 
 Knobs: `DI_SMOKE_ENTRY`, `DI_SMOKE_TIMEOUT`, `DI_SMOKE_ENV_FILES`, `DI_SMOKE_LOG`,
-`DI_SMOKE_ALLOW_SILENT`. The cheaper, per-PR habit that makes this gate
+`DI_SMOKE_ALLOW_SILENT`, `DI_SMOKE_CONTAIN=0`. The cheaper, per-PR habit that makes this gate
 redundant: one spec per module that does
 `Test.createTestingModule({ imports: [ConfigModule.forRoot(...), TheRealModule] }).compile()`.
 

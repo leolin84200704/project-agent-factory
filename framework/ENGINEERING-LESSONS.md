@@ -82,7 +82,7 @@
 
 ## 流程紀律
 
-- **Gate 宣稱的環境要由 gate 自己控制，不能靠受測程式碼的 dotenv** — 受測 code 內的 `dotenv.config()` 會讀 cwd 的 .env，同一 gate 在有 .env 的 clone 通過、乾淨 worktree 失敗；gate 要明確指定 env 來源並在無 .env 的目錄驗證過。適用: DI/boot smoke、pre-push hook、任何「空環境」啟動檢查。
+- **Gate 宣稱的環境要由 gate 自己控制，不能靠受測程式碼的 dotenv** — 受測 code 的 `dotenv.config()`（以及 ORM client 烙進去的絕對路徑）會把 .env 讀回來，同一 commit 在有 .env 的 clone 通過、乾淨 worktree 失敗，而通過的那次是拿正式環境憑證開機。gate 要自己擋掉那些讀取並在無 .env 的目錄驗證過。適用: DI/boot smoke、pre-push hook、任何「空環境」啟動檢查。 enforced-by: `framework/githooks/lib/nest-di-smoke-preload.js`（`DI_SMOKE_CONTAIN=1` 拒絕 gate 自有檔案以外的所有 `.env*` 讀取）+ `lib/nest-di-smoke-init.js`（依 key 名與值形狀產生佈建檔；佈建後該 repo 的 contained 判決為最終）。
 - **效能計劃裡的「事實」要用現行 code 加一筆新 trace 重驗再動工** — 自呼叫、N+1 次數、hop 目標這類前提先 grep 現行 code 並對照新抓的 trace，再排優先序與估效益。適用: 依既有分析報告、舊 trace 或會議結論開工的效能票。
 - **匹配不到目標的守衛要大聲失敗，不能算通過** — hook / linter / CI gate 只要是靠 glob、路徑或檔名去找它要檢查的東西，佈局一改（設定檔搬家、目錄結構重整、檔案改名）那個 glob 就會匹配到 0 個目標，於是每一次執行都「通過」——而且是**靜默**通過，綠燈與真正合規的綠燈長得一模一樣。守衛失效的當下沒有任何訊號，通常要到有人手動走一次流程、發現規則早就沒在擋，才會知道。硬規則：守衛在檢查之前先斷言「我找到了要檢查的目標」，找不到就報錯而不是放行；對「應該存在的目標數 > 0」下斷言，並把目標路徑寫在錯誤訊息裡。適用: 寫任何靠路徑定位目標的檢查時；搬移設定檔或改目錄結構時（同一個 PR 要一起改守衛）。
 
