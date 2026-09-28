@@ -24,3 +24,20 @@ Needs a second case from a different domain before an ENGINEERING-LESSONS PR.
 ## Target
 
 ENGINEERING-LESSONS (git / workspace hygiene) if a cross-domain second case appears.
+
+## Second case (2026-09-25, same instance — still single-domain)
+
+A different mechanism, same command: an `npm install` of one missing package
+re-ran a code generator whose output tree is committed to the repository. The
+following `git add -A` during an amend swept 12 regenerated files, including
+three 100 MB+ binaries, into the pull request. No gate caught it: the pre-push
+hooks check build and dependency injection, not diff contents. It was found only
+when a reviewer asked "is this right?" and the author re-read `git diff --stat`.
+
+Sharpened lesson text: **whole-tree staging is unsafe whenever anything other
+than you writes into the working copy — another actor, or a build step.**
+Stage by name, and read the full `git status` immediately before committing,
+especially after any install or build. Mechanisable: a pre-commit hook that
+refuses staged paths under known generated directories.
+
+Still one instance and one engineering domain, so it stays in the inbox.
