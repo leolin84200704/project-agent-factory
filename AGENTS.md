@@ -18,6 +18,18 @@
 - 不要重複問已經回答過的問題（記到 memory）
 - **URL 前後留半形空白**：不要用全形括號夾住 URL，也不要讓 `。`、`，`、`、` 直接黏在 URL 後面。終端機的 URL 偵測靠空白斷字，中文沒有空白，會把標點和後面的字一起吃進連結，點下去 404（2026-08-18：WezTerm 端已在 dotfiles 修掉，但 Slack／Jira／別台機器的終端沒有——輸出端保持乾淨才是可攜的解）
 
+### 替 Leo 起草對外文字（email / Jira comment / 給客戶或廠商的說明）— 用 Leo 的語氣，不是 agent 的
+- 結論先給；五個字講得完就不要五行（成果整段被換成 "The flow looks good to go."）
+- 不慶祝、不報里程碑、不列我們內部 pipeline 的每一站
+- 不複述對方修好了什麼，也不寫我們怎麼查證的——查證細節是給 Leo 的內部回報，不進對外信
+- 給對方**該做什麼**（替代值、動作），不給我們內部**怎麼判斷**（code 的分支邏輯）
+- 不安排對方的工作節奏（測試量、批次時程）
+- 別人的交付只 @ 擁有者本人；不重述需求、不解釋、不代為承諾、不安慰對方說「這不擋你」
+- 取捨界線是**歸屬**不是「有沒有被問到」：我方系統的事實該講，對方怎麼做事不該講
+- 精確度只給對方用得到的（「25 September」要，「at 18:30 UTC」不要）
+> Leo 定版 2026-09-29（devcom/BioInsights 回信）。此條是 Leo 的**回覆偏好**，任何 instance 只要在替他
+> 起草對外文字就適用；逐項刪改對照留在該次工作的 workspace STM。
+
 ## 核心原則
 0. **Sync With the World First（最高指導原則）** — 任何分析或動工之前，先把會碰到的每個 repo `git fetch` 並確認 ahead/behind（落後就 pull / rebase 再開始）；會引用的外部狀態（ticket、PR、prod、排程、第三方服務）先對 ground truth 刷新。本機檔案與記憶 ≠ 世界現況（Leo 指令 2026-08-15；當日實例：factory 本機落後 origin 48 commits 導致判讀完全失真，push 時 origin 又再度前進）。此原則凌駕其他原則，適用 Leo 的所有 agent，並隨 BOOTSTRAP 寫入每個新 instance。
    - **同步一次，不是每個 turn 一次**：每個 repo 每 session `git fetch origin {需要的 branch}`（不要 `--all --prune`，大 repo 很慢）+ 一次 `git status -sb` 確認沒有 behind/diverged。
