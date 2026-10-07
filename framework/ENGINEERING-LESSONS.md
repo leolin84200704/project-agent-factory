@@ -37,6 +37,7 @@
 
 ## 變更範圍紀律
 
+- **A reference in source is not a caller — trace to a reachable entrypoint before migrating or redirecting it** — 看到 URL 字串、env 讀取、method 定義就當成「活的呼叫端」會把死碼當遷移目標：先從該引用往上追到一個真正可達的 entrypoint（route handler、scheduler、consumer）並確認路徑沒被註解或改接，追不到就是刪除題不是遷移題。適用: 盤點某條 route/proxy 的 callers、替依賴方準備搬遷 patch、或 code search 命中就想開 ticket 要別組改 code 時。
 - **跨環境的預設值是最壞的一種 fallback —— 因為它會成功** — 為「連哪個服務」這類設定寫 `process.env.X || '<某個位址>'` 之前先問兩件事：這個變數在**每個**環境都設了嗎？各環境的值**一樣**嗎？很常見的組合是兩個都否——變數到處都沒設（所以 fallback 才是實際生效值），而各環境指向不同的後端——於是你把某一個環境的位址烤進了所有環境。致命的地方在於它通常**連得上**：測試環境往往打得到正式環境的服務，所以錯誤設定不會 fail fast，而是安靜地讀了另一個環境的資料，把「比對/驗證/影子流量」變成一份看起來很漂亮但毫無意義的報告。正確形狀是沒有預設值：值為空就代表「這個環境沒有配置這條路」，功能退回既有行為；啟用要兩個刻意動作（先配位址、再開開關）而非一個。驗證法：從**每一個**環境各一個節點，對**所有**候選位址做連通測試——會通的那些才是你真正的風險面。適用: 加服務位址/端點/資料庫連線的設定、寫 `||` 或 `??` 當 fallback、或設計分階段切換的開關。
 
 - **Config coupled with code** — 新增任何 `process.env.X`（或等價設定），同一個變更裡就更新所有部署 config（yaml/ConfigMap），並明說改了哪些。
