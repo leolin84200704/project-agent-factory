@@ -116,3 +116,4 @@
 - **Shadow 比對的「不一致」必須把「兩邊都失敗」分離出來** — 雙路比對若寫成 `equal = aOk && bOk && deepEqual(a, b)`，一次共同的下游失敗會被記成「兩邊答案不同」，於是儀器自己製造出假的 cutover blocker；反向的寫法（失敗仍算 equal）則會把真分歧藏起來。比對至少分 `equal` / `differ` / `both_failed` 三態，切換決策只看 `differ`。適用: 設計 shadow / 雙寫 / 影子讀的比對欄位，或看到 shadow 報出極少數不一致而準備因此暫停切換時。
 - **Debug 從 header/證據本身下手** — 例：debug CORS 永遠 grep `access-control-allow-origin` 本身；framework 可能回 204 + 其他 header 造成假象。
 - **宣稱「更乾淨」前先驗隱藏相依** — 追求更好的設計沒問題，但改之前確認沒有隱藏耦合（env、cache、singleton）。
+- **等第三方回答的上線不算完成** — 自己這端結構性驗不到、要靠對方確認的 canary／cutover，把「問對方」寫成 open item 就關票等於沒人追：答案會以客訴形式回來。要嘛票不關，要嘛那個問題有 owner 與日期並寫在票上，到期沒答案就主動回滾或升級。適用: 上線後的正確性取決於合作夥伴／外部系統的實際行為，而我方只能觀察到自己的「送出成功」時。
