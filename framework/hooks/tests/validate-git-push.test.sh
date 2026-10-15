@@ -88,6 +88,16 @@ run 0 "cd $PERSONAL && git push origin main"                "$PRODUCT"
 run 2 "git -C $PRODUCT push origin main"                    "$PERSONAL"
 run 0 "git -C $PERSONAL push origin main"                   "$PRODUCT"
 
+echo "--- a cd AFTER the push does not move it (2026-10-15 regression) ---"
+# The harness strips a no-op leading `cd <cwd> &&`, so the hook saw the cd that
+# came after the push and blocked a legal personal-repo main push.
+run 0 'git push origin main && WT=.git-worktrees/x && cd $WT && echo hi'   "$PERSONAL"
+run 0 "git push origin main && cd /private/tmp && echo hi"                 "$PERSONAL"
+run 2 "git push origin main && cd $PERSONAL && echo hi"                    "$PRODUCT"
+run 0 "cd $PRODUCT && cd $PERSONAL && git push origin main && cd $PRODUCT" "$PRODUCT"
+run 2 "cd $PERSONAL && cd $PRODUCT && git push origin main"                "$PERSONAL"
+run 2 'cd $UNRESOLVED && git push origin main'                             "$PERSONAL"
+
 echo "--- only the git-push segments are inspected, not the whole command ---"
 # The PR-body case that blocked real work on 2026-08-18: a legal branch push
 # chained to a `gh pr create` whose body text mentions a protected branch. The
