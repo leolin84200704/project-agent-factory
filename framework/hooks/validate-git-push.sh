@@ -83,10 +83,23 @@ if [ -n "$PUSH_SEGS" ]; then
 fi
 
 # Resolve the effective repo directory for this push.
-# Priority: `git -C <path>` in the command > a leading `cd <path> &&` > session cwd.
-REPO_DIR=$(echo "$COMMAND" | grep -oE 'git[[:space:]]+-C[[:space:]]+[^[:space:]]+' | head -1 | awk '{print $3}')
-if [ -z "$REPO_DIR" ]; then
-  REPO_DIR=$(echo "$COMMAND" | grep -oE '(^|&&|;)[[:space:]]*cd[[:space:]]+[^[:space:]]+' | head -1 | awk '{print $NF}')
+# Priority: `git -C <path>` on the push itself > the LAST `cd <path>` that runs
+# BEFORE the push > session cwd.
+#
+# Only a cd that precedes the push can move it. The earlier version took the
+# first `cd` anywhere in the command, which went wrong on 2026-10-15: the
+# harness drops a leading `cd <cwd> &&` that is a no-op before handing the
+# command to this hook, so in `cd <repo> && git push origin main && cd $WT`
+# the first cd the hook could see was the one AFTER the push. `$WT` does not
+# resolve, the repo became "unidentified", and a legal main push to a personal
+# repo was blocked as a product-repo push.
+PUSH_C=$(echo "$PUSH_SEGS" | grep -oE 'git[[:space:]]+-C[[:space:]]+[^[:space:]]+' | head -1 | awk '{print $3}')
+if [ -n "$PUSH_C" ]; then
+  REPO_DIR="$PUSH_C"
+else
+  REPO_DIR=$(command_shell_text "$COMMAND" | tr ';&|\n' '\n\n\n\n' \
+    | awk '/(^|[[:space:]])git([[:space:]]|$)/ && /(^|[[:space:]])push([[:space:]]|$)/ {exit} {print}' \
+    | grep -oE '^[[:space:]]*cd[[:space:]]+[^[:space:]]+' | tail -1 | awk '{print $NF}')
 fi
 [ -z "$REPO_DIR" ] && REPO_DIR="$CWD"
 REPO_DIR="${REPO_DIR/#\~/$HOME}"   # expand a leading ~
