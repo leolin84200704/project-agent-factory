@@ -86,6 +86,7 @@
 - **預算「迴圈開頭檢查、單位做完才累加」= 地板不是天花板** — 這種寫法的實際上限恆為 `budget + 最後一個單位的成本`，單位成本波動越大超支越兇，且**每一輪都會超**（不是偶發）。要真封頂就用已完成單位的實績做 pre-flight 預估，估完會超就不開下一個單位；調低 budget 只是把地板下移，超支比例不變。適用: 設 token/spend/時間預算、批次迴圈、rate limiter、任何「跑到額度用完為止」的無人值守工作。
 - **可選建構子參數要 `@Optional() @Inject(TOKEN)`** — 為測試留「可注入假物件」口時，`param?: Interface` 在靠 type metadata 解析的 DI 容器裡是**必要**的 `Object` 依賴，整個 app 起不來；改用顯式 token + optional 標記，production 不提供該 token 即解析為 undefined、類別自建預設實作。適用: 任何 @Injectable／@Component 類在 constructor 開測試注入口、或以 interface／type alias 當依賴型別時；PR review 看到 `?:` 接 interface 就該問。
 - **PID 1 的 runtime 要自己呼叫 exit** — 容器裡以 PID 1 跑的 process 收到 SIGTERM 後必須明確 `exit()`；靠「拿掉 handler 再把訊號丟回給自己」收尾的框架（如 Nest `enableShutdownHooks`）在 PID 1 上會被 kernel 忽略，process 活到 SIGKILL。適用: 把 entrypoint 從 npm/shell 改成直接跑 runtime、或 graceful shutdown 量到「hook 都跑完卻不退出」。
+- **Retry 分類器要涵蓋 transport 層，未知錯誤預設為可重試** — 只認應用層狀態碼的分類器，會把不帶狀態碼的網路錯誤（`fetch failed`/`ETIMEDOUT`/`ECONNRESET`/`socket hang up`）判成永久失敗，而下游的 backfill/re-queue 常以同一個判斷當入口條件，於是一個 regex 漏字就靜默關掉整條補救鏈。永久的代價是丟資料，重試的代價只是多跑幾次（用次數上限控成本）。配套：補救機制的入口條件要跟失敗的**實際落點**對齊——枚舉「失敗會停在哪些狀態」，別假設失敗一定寫進 failed（成功一半才死的工作常停在中間狀態，補救查詢撈不到它）。適用: 寫 isTransient/shouldRetry 判斷、為長時外部呼叫設 timeout、或設計 backfill 的挑選條件時。
 
 ## 流程紀律
 
