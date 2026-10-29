@@ -85,3 +85,8 @@ Factory clone 位置依機器而異，**依序探測**：`~/src/project-agent-fa
 - 動 DB / 部署 / prod 相關工作 → 先讀 `framework/ENGINEERING-LESSONS.md`（歷史事故蒸餾的通用紀律）
 - 讓既有服務變快 / 拿掉一層 / 退役舊路由 → `framework/OPTIMIZATION.md`（phase 順序與判準）
 - 初始化新工作/專案的 agent → `$FACTORY/BOOTSTRAP.md`
+
+<!-- postman-cli:installation:start -->
+Postman CLI is installed on this device, and can be used for API Engineering work.
+It is not on PATH; run it as /Users/hung.l/.local/bin/postman.
+<!-- postman-cli:installation:end -->

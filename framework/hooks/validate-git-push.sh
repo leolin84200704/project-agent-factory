@@ -33,7 +33,7 @@ CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 # single source wired by absolute path from several instances, so a local edit
 # would be overwritten by the next factory pull. A new personal repo goes in
 # this list; a one-off can be added for a session via AGENT_PERSONAL_REPOS.
-PERSONAL_REPOS='project-agent-factory|agent-waves|vibrant-america-working-agent|industry-intel-code-agent|job-applier-code-agent'
+PERSONAL_REPOS='project-agent-factory|agent-waves|vibrant-america-working-agent|industry-intel-code-agent|job-applier-code-agent|vibrant-america-auto'
 [ -n "${AGENT_PERSONAL_REPOS:-}" ] && PERSONAL_REPOS="$PERSONAL_REPOS|$AGENT_PERSONAL_REPOS"
 # Extra protected branch names beyond main/master/staging/develop — project
 # staging branches with non-standard names. Leave empty if none.
