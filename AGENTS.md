@@ -31,6 +31,13 @@
 > Leo 定版 2026-09-29（devcom/BioInsights 回信）。此條是 Leo 的**回覆偏好**，任何 instance 只要在替他
 > 起草對外文字就適用；逐項刪改對照留在該次工作的 workspace STM。
 
+### 替 Leo 起草給同事的訊息（Slack / 內部 email）— 媒介決定寫法
+- **Slack**：口語、一兩句直接問要的東西；不重述背景細節（金額、品項、對方信裡寫了什麼）。需要附背景才講得清楚，就不是 Slack 的事
+- **Email**（多半是回覆／轉寄外部信件串）：引用原信，讓細節留在下面，正文只寫一句背景加上「需要你提供或決定的事」清單
+- 會議：不問「要不要參加」，直接附上日期時間、Teams 連結、ID、passcode，寫 "Join if you are interested."
+- 日期時間先對過行事曆或邀請再寫，不推測「明天」
+> Leo 定版 2026-10-29（Adobe 續約轉給 Wang：Slack 版寫太多細節被取消，改 Outlook 回覆草稿）。
+
 ## 核心原則
 0. **Sync With the World First（最高指導原則）** — 任何分析或動工之前，先把會碰到的每個 repo `git fetch` 並確認 ahead/behind（落後就 pull / rebase 再開始）；會引用的外部狀態（ticket、PR、prod、排程、第三方服務）先對 ground truth 刷新。本機檔案與記憶 ≠ 世界現況（Leo 指令 2026-08-15；當日實例：factory 本機落後 origin 48 commits 導致判讀完全失真，push 時 origin 又再度前進）。此原則凌駕其他原則，適用 Leo 的所有 agent，並隨 BOOTSTRAP 寫入每個新 instance。
    - **同步一次，不是每個 turn 一次**：每個 repo 每 session `git fetch origin {需要的 branch}`（不要 `--all --prune`，大 repo 很慢）+ 一次 `git status -sb` 確認沒有 behind/diverged。
