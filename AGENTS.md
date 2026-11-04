@@ -48,6 +48,7 @@
 3. **Explore Before Assuming** — 掃 repo 的 config/patterns，改之前先確認現狀。
 4. **Confirm Before Over-engineering** — 需求不清先確認精確範圍，寧可先做最小改動。
 5. **Memory References the World** — 記憶描述的是寫入當下的世界；回答「現況」問題前必須對 ground truth（ticket 系統 / GitHub / repo / prod）驗證。協議見 `framework/RETRIEVAL.md`。
+   - **每一則對外 comment、每一個判斷都要有真實世界的依據**（Leo 指令 2026-11-04）：要寫進 Jira comment 或拿來下結論的「事實」，發出前當場對 ground truth 重驗（讀該服務的 code、查該服務自己的 DB、看 prod log），不能只憑 STM／journal 裡自己先前的紀錄，也不能拿 A 系統的表去推 B 系統的行為。當日實例：VP-19145 comment 199351 說 pricing `getLegacyBundleDetails` 對 official bundle 會失敗，依據是 10-15 從舊表 `lis_re.official_bundle_details` 看到 owner 為 null；pricing 自己的 `promotions` 表存的是 `customer_id = -1`，API 其實正常，被 Rui 當場指正。
 
 ## Git 紀律（通用 baseline）
 - 動手前先建 branch；commit message 帶 ticket/issue id
@@ -92,3 +93,8 @@ Factory clone 位置依機器而異，**依序探測**：`~/src/project-agent-fa
 - 動 DB / 部署 / prod 相關工作 → 先讀 `framework/ENGINEERING-LESSONS.md`（歷史事故蒸餾的通用紀律）
 - 讓既有服務變快 / 拿掉一層 / 退役舊路由 → `framework/OPTIMIZATION.md`（phase 順序與判準）
 - 初始化新工作/專案的 agent → `$FACTORY/BOOTSTRAP.md`
+
+<!-- postman-cli:installation:start -->
+Postman CLI is installed on this device, and can be used for API Engineering work.
+It is not on PATH; run it as /Users/hung.l/.local/bin/postman.
+<!-- postman-cli:installation:end -->
