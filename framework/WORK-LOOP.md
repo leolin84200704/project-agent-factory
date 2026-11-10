@@ -24,11 +24,22 @@
 ## Step 3: Debate（正反辯論 — 按風險分級）
 先分級再決定要不要辯論：
 - **Routine**（完全照既有 pattern 的 config/設定類 ticket）→ **跳過 debate**，直接進 Step 4，但要在方案裡註明「依循 {過去 ticket} 的既有 pattern」。
-- **Code change / 新 pattern / incident / 影響 prod 資料** → 派兩個子 agent 同時辯論：
-  - 正方：為推薦方案辯護（優點、可行性）
-  - 反方：質疑方案（風險、邊界案例、更簡單的替代方案），且**必問可測試性**：
-    這個方案的測試會不會全是 mock？seam（注入點）在哪？寫不出行為級測試的部分是哪一塊？
-  - 綜合雙方論點調整方案，記錄到 STM: Approaches Considered
+- **Code change / 新 pattern / incident / 影響 prod 資料** → 派三個子 agent，**每個給不同的輸入、要自己去拿證據**：
+  - 正方：輸入 = ticket + 推薦方案。為方案辯護，每個「可行」的主張要附它自己讀到的 code 位置（`file:line`）或查到的資料
+  - 反方：輸入 = 推薦方案 + 相關 code，**不給**主 agent 的推理過程（避免被同一套框架帶著走）。
+    質疑風險、邊界案例、更簡單的替代方案，至少做一次**實際的反證嘗試**（跑 query、重現、找反例 row），
+    不能只寫推論；且**必問可測試性**：這個方案的測試會不會全是 mock？seam（注入點）在哪？寫不出行為級測試的部分是哪一塊？
+  - 裁判：輸入 = 正反兩份報告與其附的證據，**不給**主 agent 的方案草稿推理。逐條把主張標成
+    `evidenced`（附了自己拿的證據）或 `inferred`（只有推論）；**`inferred` 的主張不計入結論**，
+    只列成「待驗證」帶進 Step 4。輸出：採納 / 修改 / 退回，加上待驗證清單
+  - 主 agent 依裁判結果調整方案，記錄到 STM: Approaches Considered
+- **為什麼不是加更多 agent 投票**：同一個模型、同一份輸入的 agent，錯誤高度相關，10 票一致 ≈ 同一個判斷講 10 次，
+  不會讓信心度變高。信心度來自**輸入不同、證據不同**，以及確定性檢查（測試、staging A/B、prod 唯讀驗證），不是票數。
+  agent 口述的「信心度 X%」沒有校準，不能拿來當放行門檻。
+- **Verdict ledger**：每次 debate 結束，在 `{memory_root}/storage/debate_ledger.md` 追加一列
+  `| 日期 | ticket | 裁判結論 | evidenced/inferred 數 | outcome |`，outcome 先留 `pending`，由 Step 8 回填。
+  這份 ledger 是將來談「什麼條件下可以少一道人工 review」的唯一依據：**累積 ≥30 筆已回填 outcome 之前，不提任何自動放行門檻**；
+  要提門檻時用 ledger 算出的實際命中率走 PR，由使用者決定。
 
 ## Step 4: Discuss with User（暫停等使用者確認）
 呈現分析結果和方案：
@@ -79,6 +90,9 @@
    （hook / grader / constraint / regression 題）而非 prose？參
    `framework/ENFORCEMENT-LADDER.md`，不變量日誌格式見 RETROSPECTIVE.md § 失敗分析
 5. **信心度**: 1-5 自評（1=完全依賴指導，5=獨立完成）
+   - **回填 debate ledger**：這張 ticket 若在 Step 3 有 debate，把 ledger 那列的 outcome 改成
+     `clean`（上線後無 rework、無 incident）/ `rework`（上線後要再修）/ `incident`（造成事故）/ `abandoned`，
+     並寫一句「裁判漏掉或抓到了什麼」。還沒上 prod 就保持 `pending`，等結案那次再填
 6. **Factory 蒸餾檢查（必做，不是選項）**: 問「這次學到的東西有沒有跨 instance 可攜的？」有 → 立刻開 lesson PR 到 project-agent-factory（規格見該 repo CONTRIBUTING.md：一條 lesson 一個 PR、檔案內容去識別化、細節寫在 PR body）。判斷標準：拿掉公司名/系統名之後規則仍然成立、且換一個工作環境仍會踩到 → 可攜。沒有就明說「本次無可蒸餾」。這一步做不做，決定 factory 會不會退化成死文件。
 記錄到 STM: Retrospective + Lessons Learned
 

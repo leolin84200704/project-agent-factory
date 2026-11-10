@@ -5,10 +5,11 @@ How the work loop (WORK-LOOP.md) uses Claude Code subagents. These are patterns,
 ## explore (Work Loop Step 2)
 Read-only Explore subagent: given a ticket, sweep the relevant repos for the files, configs, and existing patterns the change will touch. Returns conclusions, not file dumps. Always used before proposing a solution.
 
-## debate pair (Work Loop Step 3 — gated)
-Two subagents launched in parallel, only for non-routine work (code changes, new patterns, incidents, prod-data impact):
-- **正方**: defends the recommended approach — merits, feasibility
-- **反方**: attacks it — risks, edge cases, simpler alternatives
+## debate trio (Work Loop Step 3 — gated)
+Three subagents, only for non-routine work (code changes, new patterns, incidents, prod-data impact). Each gets a **different input** and must fetch its own evidence — same-model agents on the same input make correlated errors, so more voters does not add confidence:
+- **正方** (input: ticket + plan): defends the approach; every feasibility claim cites `file:line` or data it read itself
+- **反方** (input: plan + code, not the drafter's reasoning): attacks it — risks, edge cases, simpler alternatives, testability; makes at least one real falsification attempt (query, repro, counter-example row)
+- **裁判** (input: the two reports + their evidence only): tags each claim `evidenced` / `inferred`; only `evidenced` claims count, `inferred` ones go to Step 4 as open items. Verdict is appended to the instance's debate ledger (see WORK-LOOP Step 3)
 
 Routine config tickets that exactly follow an existing pattern skip the debate and cite the past ticket whose pattern they follow.
 
