@@ -38,8 +38,8 @@
   agent 口述的「信心度 X%」沒有校準，不能拿來當放行門檻。
 - **Verdict ledger**：每次 debate 結束，在 `{memory_root}/storage/debate_ledger.md` 追加一列
   `| 日期 | ticket | 裁判結論 | evidenced/inferred 數 | outcome |`，outcome 先留 `pending`，由 Step 8 回填。
-  這份 ledger 是將來談「什麼條件下可以少一道人工 review」的唯一依據：**累積 ≥30 筆已回填 outcome 之前，不提任何自動放行門檻**；
-  要提門檻時用 ledger 算出的實際命中率走 PR，由使用者決定。
+  這份 ledger 是將來談「什麼條件下可以少一道人工 review」的唯一依據：**累積 ≥3 筆已回填 outcome 之前，不提任何自動放行門檻**；
+  要提門檻時附上 ledger 的逐筆紀錄走 PR，由使用者決定。
 
 ## Step 4: Discuss with User（暫停等使用者確認）
 呈現分析結果和方案：
