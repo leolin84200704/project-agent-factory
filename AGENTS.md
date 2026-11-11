@@ -19,6 +19,19 @@
 - **解釋一串對話／郵件／ticket 時，預設用「這整串在講什麼」加「依時間順序每個人在表達什麼」的方式**：先一句話講整串的核心，再逐則列出「誰、說了什麼、代表什麼」，最後點出關鍵轉折。不要摘要成抽象結論，也不要跳過中間的人。（Leo 定版 2026-10-08，VP-17827 Prospera 郵件串）
 - **URL 前後留半形空白**：不要用全形括號夾住 URL，也不要讓 `。`、`，`、`、` 直接黏在 URL 後面。終端機的 URL 偵測靠空白斷字，中文沒有空白，會把標點和後面的字一起吃進連結，點下去 404（2026-08-18：WezTerm 端已在 dotfiles 修掉，但 Slack／Jira／別台機器的終端沒有——輸出端保持乾淨才是可攜的解）
 
+### 文字要讓人讀一遍就懂（所有輸出都適用）
+適用範圍：給 Leo 的回覆（終端機、Telegram）、Slack、email、Jira ticket 與 comment、PR 內容；中文英文都一樣。
+- **主詞只做它真的會做的事**：不讓沒有生命的東西做人或動物的動作，也不用比喻。讀者猜不到這種搭配，就得停下來重讀。
+  - 不寫「這串對話在吃自己的尾巴」，寫「這串對話一直在重複同一個問題」
+  - 不寫 "The retry loop is fighting the timeout"，寫 "The retry starts again before the timeout expires"
+- **主詞和動詞放在一起**：修飾語不要插在主詞和動詞中間；修飾語長就拆成兩句。
+  - 不寫 "The order that the practice sent on Monday after the integration was rebuilt failed"，寫 "The order failed. The practice sent it on Monday, after the integration was rebuilt."
+- **不為了省字而壓縮**：連接詞（因為、所以、但是、that、which）要留著；不用箭頭或符號代替句子；不用沒解釋過的縮寫，也不用自己取的代號。「簡潔」是指少講不需要的事，不是把需要的句子縮短到難讀。
+- **不寫「不是 A，而是 B」**去否定沒有人提過的說法，直接講 B。不用「賦能、抓手、深刻的變革」這類聽起來有份量但沒有內容的詞。
+- 送出前自己讀一遍：有哪一句需要讀第二次才懂，就改寫那一句。
+> Leo 指令 2026-11-11，依據論文《Why is AI-generated language so hard to understand?》：模型為了省字，會選
+> 讀者猜不到的詞語搭配，也會把主詞和動詞隔得很遠，兩者都讓人讀得慢。
+
 ### 替 Leo 起草對外文字（email / Jira comment / 給客戶或廠商的說明）— 用 Leo 的語氣，不是 agent 的
 - 結論先給；五個字講得完就不要五行（成果整段被換成 "The flow looks good to go."）
 - 不慶祝、不報里程碑、不列我們內部 pipeline 的每一站
