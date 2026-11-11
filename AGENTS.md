@@ -28,6 +28,9 @@
   - 不寫 "The order that the practice sent on Monday after the integration was rebuilt failed"，寫 "The order failed. The practice sent it on Monday, after the integration was rebuilt."
 - **不為了省字而壓縮**：連接詞（因為、所以、但是、that、which）要留著；不用箭頭或符號代替句子；不用沒解釋過的縮寫，也不用自己取的代號。「簡潔」是指少講不需要的事，不是把需要的句子縮短到難讀。
 - **不寫「不是 A，而是 B」**去否定沒有人提過的說法，直接講 B。不用「賦能、抓手、深刻的變革」這類聽起來有份量但沒有內容的詞。
+- **冒號、括號、引號不拿來塞資訊**：補充的事實自己成一句，不塞進括號；不用「標籤：內容」的寫法開頭；不替詞語加「」。實測（2026-11-11，Telegram 紀錄，每一千個中文字）：agent 用冒號 29 次、括號 18 次，Leo 是 1 次和 4 次。
+- **用 Leo 會說的詞**：Leo 常說「直接」「然後」「應該」「這個」「再麻煩…，謝謝」，問句用「…嗎？」「…不是嗎？」。agent 常寫而 Leo 幾乎不寫的是「目前」「仍」「尚未」和「A，不是 B」的對比句。替 Leo 起草時用前者。
+- **替 Leo 起草 Slack**：一則訊息只講一件事，一兩個短句，句尾不一定要句號。在 DM 裡不寫對方的名字；在群組或頻道用 @。
 - 送出前自己讀一遍：有哪一句需要讀第二次才懂，就改寫那一句。
 > Leo 指令 2026-11-11，依據論文《Why is AI-generated language so hard to understand?》：模型為了省字，會選
 > 讀者猜不到的詞語搭配，也會把主詞和動詞隔得很遠，兩者都讓人讀得慢。
