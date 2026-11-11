@@ -16,6 +16,7 @@
 - **冷啟動後的第一個請求是獨立的測試案例** — 部署驗證要對每個**新** pod 打第一發業務請求並看回應，health 200 不算；lazy connect、offline queue 關閉、連線池與快取預熱的缺陷只在冷啟動後那一發出現，第二發起永遠正常，事後重現不出來。適用: 任何 lazyConnect／enableOfflineQueue:false／warm-up 相關設定的變更，以及 rolling deploy 收尾的 live 驗證（上一條判定「新 pod 起來了」之後的下一步）。
 - **並發 merge 會讓舊 build 蓋掉新 artifact — 收尾要驗 serving 版本身分** — per-commit 觸發的 CI/CD 有個 race：兩個 PR 相隔很近 merge，會觸發重疊的 build，較早 commit 的 build 可能**最後**完成，把新 commit 的 image/artifact 蓋回舊 code。「build 綠燈」≠「新 code 正在服務」。根因是 build 之間無 commit-ordering 保證、deploy 又是「最後完成者勝」。連續 merge（尤其打同一條 pipeline 的兩個 PR）後，必須驗證實際 serving 的 revision/image digest 對得上目標 commit，而不是只看最後一次 build 回綠。這是上一條 rolling-deploy 教訓的姊妹：兩者都要求收尾時綁定「正在服務的 artifact 身分」，而非任何聚合或「已觸發」訊號。
 - **Batch DB verify 100%** — 批次 INSERT/UPDATE 後驗證全部 rows，絕不抽查。
+- **Staging 驗證要從盤點的每個邊界類各取一筆** — 資料盤點或 dry-run 列出的每類邊界資料（缺欄位、無法分組、測試資料）至少各取一筆走過 staging，不只驗 happy path。適用: 資料遷移、新 API 上 staging 驗收時。
 - **JOIN scope reverse audit** — prod UPDATE-WHERE-JOIN 跑完後，用更廣的 criterion 反向 SELECT 找漏網 row；SQL 的 `NULL = NULL` 是 false，會靜默漏掉。
 - **盤點缺漏要對「應有全集」，不要從錯誤 log 反推** — 查「少了哪些」時先建應有集合（上游 feed / 排程表 / 型錄）再 diff 實有產出；錯誤 log 只記系統知道的失敗，crash、race 蓋寫、靜默丟棄都不在裡面。適用: 任何「缺了一筆/一集/一單」的 triage，以及 backfill 後驗證完整性時。
 - **End-to-end equivalence before swap** — 替換 RPC/service 實作前，diff 前後 output 完全相同；proto 相同 ≠ marshalling 相同。
