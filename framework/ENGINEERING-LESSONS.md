@@ -90,6 +90,7 @@
 - **可選建構子參數要 `@Optional() @Inject(TOKEN)`** — 為測試留「可注入假物件」口時，`param?: Interface` 在靠 type metadata 解析的 DI 容器裡是**必要**的 `Object` 依賴，整個 app 起不來；改用顯式 token + optional 標記，production 不提供該 token 即解析為 undefined、類別自建預設實作。適用: 任何 @Injectable／@Component 類在 constructor 開測試注入口、或以 interface／type alias 當依賴型別時；PR review 看到 `?:` 接 interface 就該問。
 - **PID 1 的 runtime 要自己呼叫 exit** — 容器裡以 PID 1 跑的 process 收到 SIGTERM 後必須明確 `exit()`；靠「拿掉 handler 再把訊號丟回給自己」收尾的框架（如 Nest `enableShutdownHooks`）在 PID 1 上會被 kernel 忽略，process 活到 SIGKILL。適用: 把 entrypoint 從 npm/shell 改成直接跑 runtime、或 graceful shutdown 量到「hook 都跑完卻不退出」。
 - **Retry 分類器要涵蓋 transport 層，未知錯誤預設為可重試** — 只認應用層狀態碼的分類器，會把不帶狀態碼的網路錯誤（`fetch failed`/`ETIMEDOUT`/`ECONNRESET`/`socket hang up`）判成永久失敗，而下游的 backfill/re-queue 常以同一個判斷當入口條件，於是一個 regex 漏字就靜默關掉整條補救鏈。永久的代價是丟資料，重試的代價只是多跑幾次（用次數上限控成本）。配套：補救機制的入口條件要跟失敗的**實際落點**對齊——枚舉「失敗會停在哪些狀態」，別假設失敗一定寫進 failed（成功一半才死的工作常停在中間狀態，補救查詢撈不到它）。適用: 寫 isTransient/shouldRetry 判斷、為長時外部呼叫設 timeout、或設計 backfill 的挑選條件時。
+- **LLM judge 要拿到和 generator 一樣的 grounding** — 每個會下判斷的模型呼叫點各自注入 grounding（今天日期、餵給 generator 的外部 context、完整 evidence）；修好 generator 不代表 judge 也好了。judge 缺 context 時，草稿裡正確的事實會被判成幻覺，然後被 false-HOLD。適用: 加 LLM-as-judge / ship-gate、改 generator prompt 的 context、查「gate 一直 HOLD 但草稿看起來沒錯」。
 
 ## 流程紀律
 
