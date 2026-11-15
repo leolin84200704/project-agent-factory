@@ -140,15 +140,35 @@ MAX_STATUS_CHARS = 40
 TOP_KEY_RE = re.compile(r"^([A-Za-z0-9_-]+)\s*:(.*)$")
 
 
+def _is_closed_quoted(raw: str) -> bool:
+    s = raw.strip()
+    if len(s) < 2:
+        return False
+    if s.startswith("'"):
+        rest = s[1:].replace("''", "\x00\x00")
+        return rest.endswith("'")
+    if s.startswith('"'):
+        rest = s[1:].replace("\\\\", "\x00\x00").replace('\\"', "\x00\x00")
+        return rest.endswith('"')
+    return False
+
+
+def _unescape_double_quoted(inner: str) -> str:
+    escapes = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}
+    return re.sub(r"\\(.)", lambda m: escapes.get(m.group(1), m.group(0)), inner)
+
+
 def _parse_scalar(raw: str) -> Any:
     raw = raw.strip()
-    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
-        inner = raw[1:-1]
-        return inner.replace('\\"', '"').replace("\\\\", "\\")
-    if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
-        return raw[1:-1].replace("''", "'")
+    if _is_closed_quoted(raw):
+        if raw.startswith('"'):
+            return _unescape_double_quoted(raw[1:-1])
+        if raw.startswith("'"):
+            return raw[1:-1].replace("''", "'")
     if raw in ("", "null", "~"):
         return None
+    if raw == "{}":
+        return {}
     if raw.lower() == "true":
         return True
     if raw.lower() == "false":
@@ -161,47 +181,153 @@ def _parse_scalar(raw: str) -> Any:
     return raw
 
 
+def _finalize_block_scalar(lines: list[str], style: str) -> str:
+    trimmed = list(lines)
+    while trimmed and not trimmed[0]:
+        trimmed.pop(0)
+    while trimmed and not trimmed[-1]:
+        trimmed.pop()
+    if not trimmed:
+        return ""
+    if not style.startswith(">"):
+        return "\n".join(trimmed)
+    out: list[str] = []
+    blank_run = 0
+    for ln in trimmed:
+        if ln == "":
+            blank_run += 1
+        else:
+            if not out:
+                out.append(ln)
+            elif blank_run > 0:
+                out.append("\n" * blank_run + ln)
+            elif ln[0].isspace() or out[-1].split("\n")[-1][:1].isspace():
+                out.append("\n" + ln)
+            else:
+                out.append(" " + ln)
+            blank_run = 0
+    return "".join(out)
+
+
 def _parse_flat_yaml(text: str) -> dict[str, Any]:
-    """Minimal fallback YAML parser supporting block scalars, block lists, and flow lists."""
+    """Minimal fallback YAML parser supporting literal/folded block scalars,
+    nested 1-level maps, folded multiline scalars, block lists, and flow lists."""
     meta: dict[str, Any] = {}
     list_key: str | None = None
+    nested_map_key: str | None = None
+    nested_sub_key: str | None = None
+    cont_scalar_key: str | None = None
+    cont_scalar_buf: list[str] = []
     block_scalar_key: str | None = None
+    block_scalar_style: str = "|"
     block_scalar_lines: list[str] = []
+
+    def _finish_cont() -> None:
+        nonlocal cont_scalar_key, cont_scalar_buf
+        if cont_scalar_key is not None:
+            meta[cont_scalar_key] = _parse_scalar(" ".join(cont_scalar_buf))
+            cont_scalar_key = None
+            cont_scalar_buf = []
+
+    def _finish_block() -> None:
+        nonlocal block_scalar_key, block_scalar_lines
+        if block_scalar_key is not None:
+            meta[block_scalar_key] = _finalize_block_scalar(
+                block_scalar_lines, block_scalar_style
+            )
+            block_scalar_key = None
+            block_scalar_lines = []
 
     for line in text.splitlines():
         if block_scalar_key is not None:
             if line.startswith(("  ", "\t")) or not line.strip():
-                stripped = line[2:] if line.startswith("  ") else line.lstrip("\t")
+                stripped = (
+                    line[2:]
+                    if line.startswith("  ")
+                    else (line[1:] if line.startswith("\t") else "")
+                )
                 block_scalar_lines.append(stripped)
                 continue
-            meta[block_scalar_key] = "\n".join(block_scalar_lines).strip()
-            block_scalar_key = None
-            block_scalar_lines = []
+            _finish_block()
 
         if not line.strip() or line.strip().startswith("#"):
             continue
-        if line.lstrip().startswith("- ") and list_key is not None:
-            meta.setdefault(list_key, []).append(_parse_scalar(line.lstrip()[2:]))
+
+        # Indented lines: either nested mapping (`relations:\n  sibling:\n  - X`),
+        # indented block-list item, or folded scalar continuation (`summary: '...\n  more'`).
+        if line[0].isspace():
+            stripped_in = line.strip()
+            if stripped_in.startswith("- "):
+                item_val = _parse_scalar(stripped_in[2:])
+                if nested_map_key is not None and nested_sub_key is not None:
+                    sub_map = meta.get(nested_map_key)
+                    if isinstance(sub_map, dict):
+                        sub_list = sub_map.setdefault(nested_sub_key, [])
+                        if isinstance(sub_list, list):
+                            sub_list.append(item_val)
+                    continue
+                if list_key is not None:
+                    meta.setdefault(list_key, []).append(item_val)
+                    continue
+            if (list_key is not None or nested_map_key is not None) and ":" in stripped_in:
+                parent_k = nested_map_key or list_key
+                assert parent_k is not None
+                if not isinstance(meta.get(parent_k), dict):
+                    meta[parent_k] = {}
+                nested_map_key = parent_k
+                list_key = None
+                sk, _, sraw = stripped_in.partition(":")
+                sk, sraw = sk.strip(), sraw.strip()
+                nested_sub_key = sk
+                if sraw == "{}":
+                    meta[parent_k][sk] = {}
+                elif sraw.startswith("[") and sraw.endswith("]"):
+                    inner = sraw[1:-1].strip()
+                    meta[parent_k][sk] = (
+                        [_parse_scalar(x) for x in inner.split(",")] if inner else []
+                    )
+                elif not sraw:
+                    meta[parent_k][sk] = []
+                else:
+                    meta[parent_k][sk] = _parse_scalar(sraw)
+                continue
+            if cont_scalar_key is not None:
+                cont_scalar_buf.append(stripped_in)
             continue
-        if ":" not in line or line[0].isspace():
+
+        _finish_cont()
+        nested_map_key = None
+        nested_sub_key = None
+
+        if line.startswith("- ") and list_key is not None:
+            meta.setdefault(list_key, []).append(_parse_scalar(line[2:]))
+            continue
+        if ":" not in line:
             continue
         key, _, raw = line.partition(":")
         key, raw = key.strip(), raw.strip()
         list_key = None
         if raw in ("|", ">", "|-", ">-"):
             block_scalar_key = key
+            block_scalar_style = raw
             block_scalar_lines = []
+        elif raw == "{}":
+            meta[key] = {}
+            nested_map_key = key
         elif raw.startswith("[") and raw.endswith("]"):
             inner = raw[1:-1].strip()
             meta[key] = [_parse_scalar(x) for x in inner.split(",")] if inner else []
         elif not raw:
             list_key = key
             meta[key] = []
-        else:
+        elif raw.startswith(("'", '"')) and _is_closed_quoted(raw):
             meta[key] = _parse_scalar(raw)
+        else:
+            cont_scalar_key = key
+            cont_scalar_buf = [raw]
 
-    if block_scalar_key is not None:
-        meta[block_scalar_key] = "\n".join(block_scalar_lines).strip()
+    _finish_cont()
+    _finish_block()
     return meta
 
 
@@ -237,28 +363,78 @@ def _parse_lenient_yaml(block: str) -> dict[str, Any]:
     return meta
 
 
+def _needs_yaml_quoting(val: str) -> bool:
+    if val == "" or val != val.strip():
+        return True
+    if val.lower() in ("null", "~", "true", "false") or val in ("{}", "[]"):
+        return True
+    if val[0] in ("[", "{", "'", '"', "|", ">", "-", "?", ":", "@", "`", "&", "*", "!", "%"):
+        return True
+    if ":" in val or "#" in val or '"' in val or "\\" in val:
+        return True
+    for cast in (int, float):
+        try:
+            cast(val)
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+def _format_inline_scalar(val: Any) -> str:
+    if val is None:
+        return "null"
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, str):
+        if _needs_yaml_quoting(val):
+            escaped = (
+                val.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\n")
+                .replace("\t", "\\t")
+                .replace("\r", "\\r")
+            )
+            return f'"{escaped}"'
+        return val
+    return str(val)
+
+
+def _dump_nested_dict_lines(key: str, val: dict[str, Any]) -> list[str]:
+    if not val:
+        return [f"{key}: {{}}"]
+    out = [f"{key}:"]
+    for sk, sval in val.items():
+        if isinstance(sval, list):
+            if not sval:
+                out.append(f"  {sk}: []")
+            else:
+                out.append(f"  {sk}:")
+                out.extend(f"  - {_format_inline_scalar(item)}" for item in sval)
+        elif isinstance(sval, dict) and not sval:
+            out.append(f"  {sk}: {{}}")
+        else:
+            out.append(f"  {sk}: {_format_inline_scalar(sval)}")
+    return out
+
+
 def _dump_flat_yaml(meta: dict[str, Any]) -> str:
     lines: list[str] = []
     for key, val in meta.items():
-        if isinstance(val, list):
+        if isinstance(val, dict):
+            lines.extend(_dump_nested_dict_lines(key, val))
+        elif isinstance(val, list):
             if not val:
                 lines.append(f"{key}: []")
             else:
                 lines.append(f"{key}:")
-                lines.extend(f"- {v}" for v in val)
-        elif isinstance(val, bool):
-            lines.append(f"{key}: {'true' if val else 'false'}")
+                lines.extend(f"- {_format_inline_scalar(v)}" for v in val)
         elif isinstance(val, str) and "\n" in val:
             lines.append(f"{key}: |")
             for sub in val.splitlines():
                 lines.append(f"  {sub}" if sub else "")
-        elif isinstance(val, str) and (
-            ":" in val or "#" in val or '"' in val or val != val.strip()
-        ):
-            escaped = val.replace("\\", "\\\\").replace('"', '\\"')
-            lines.append(f'{key}: "{escaped}"')
         else:
-            lines.append(f"{key}: {val if val is not None else ''}")
+            lines.append(f"{key}: {_format_inline_scalar(val)}")
     return "\n".join(lines)
 
 
@@ -309,15 +485,20 @@ def write_frontmatter(path: Path, meta: dict[str, Any]) -> None:
 
 
 def _render_field_lines(key: str, val: Any, list_style: str) -> list[str]:
+    if isinstance(val, dict):
+        return _dump_nested_dict_lines(key, val)
     if isinstance(val, list):
         if list_style == "block":
             if not val:
                 return [f"{key}: []"]
-            return [f"{key}:", *[f"- {v}" for v in val]]
-        return [f"{key}: [{', '.join(str(v) for v in val)}]"]
-    if isinstance(val, bool):
-        return [f"{key}: {'true' if val else 'false'}"]
-    return [f"{key}: {val}"]
+            return [f"{key}:", *[f"- {_format_inline_scalar(v)}" for v in val]]
+        return [f"{key}: [{', '.join(_format_inline_scalar(v) for v in val)}]"]
+    if isinstance(val, str) and "\n" in val:
+        out = [f"{key}: |"]
+        for sub in val.splitlines():
+            out.append(f"  {sub}" if sub else "")
+        return out
+    return [f"{key}: {_format_inline_scalar(val)}"]
 
 
 def update_frontmatter_fields(
@@ -565,6 +746,8 @@ def relation_targets(meta: dict[str, Any]) -> set[str]:
                 out.update(str(x) for x in val)
             elif val:
                 out.add(str(val))
+    elif isinstance(rel, list):
+        out.update(str(x) for x in rel if x)
     return out
 
 

@@ -32,7 +32,13 @@ if [ -f "$repo_root/.agent-verify.json" ]; then
     exit 1
   fi
   echo "[pre-push] paf verify (.agent-verify.json) ..."
-  if ! "$paf_bin" verify --repo "$repo_root" --mode pre-push; then
+  # Unset GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR exported by git hook execution
+  # so child test suites running `git init` or `git config` in temp dirs never
+  # inherit and mutate the pushed repository's `.git/config`.
+  if ! (
+    for v in $(git rev-parse --local-env-vars 2>/dev/null); do unset "$v"; done
+    "$paf_bin" verify --repo "$repo_root" --mode pre-push
+  ); then
     echo "x [pre-push] .agent-verify.json verification failed -- not pushing."
     exit 1
   fi

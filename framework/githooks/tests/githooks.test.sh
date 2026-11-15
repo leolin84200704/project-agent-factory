@@ -361,5 +361,20 @@ printf '{"version":1,"zone":"autonomous","commands":{"unit_test":["python3 -c '\
 git -C "$AVFAIL" add -A && git -C "$AVFAIL" commit -qm broken
 run 1 "repo with failing .agent-verify.json unit_test: pre-push blocked" "$AVFAIL" pre-push
 
+# Regression: when git invokes pre-push, GIT_DIR/GIT_COMMON_DIR are exported.
+# Child unit_test commands that run `git init` / `git config` in a temp dir
+# must NOT inherit GIT_DIR and corrupt the pushed repo's `.git/config` (e.g. core.bare=true).
+AVGIT=$(mkrepo avgit 'git@github.com:Some-Org/high-trust-git-test.git')
+printf 'x = 1\n' > "$AVGIT/app.py"
+cat <<'EOF' > "$AVGIT/.agent-verify.json"
+{"version":1,"zone":"autonomous","commands":{"unit_test":["tmp=$(mktemp -d) && git init -q -b main \"$tmp\" && git -C \"$tmp\" config user.email leaked@example.invalid && rm -rf \"$tmp\""]}}
+EOF
+git -C "$AVGIT" add -A && git -C "$AVGIT" commit -qm init
+GIT_DIR="$AVGIT/.git" GIT_COMMON_DIR="$AVGIT/.git" run 0 "pre-push scrubs GIT_DIR before running .agent-verify.json unit_test" "$AVGIT" pre-push
+if [ "$(git -C "$AVGIT" config --bool core.bare)" != "false" ] || [ "$(git -C "$AVGIT" config user.email)" = "leaked@example.invalid" ]; then
+  echo "        FAIL: GIT_DIR leaked into unit_test and mutated parent .git/config"
+  fails=$((fails+1))
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; exit 1; fi
