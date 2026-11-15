@@ -267,12 +267,32 @@ def _split_top_level_commas(blob: str) -> list[str]:
     return parts
 
 
+GIT_LOCAL_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
+
+
+def _clean_git_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for var in GIT_LOCAL_ENV_VARS:
+        env.pop(var, None)
+    return env
+
+
 def _iter_repo_files(repo_root: Path, changed_only: bool = False) -> list[Path]:
+    git_env = _clean_git_env()
     if changed_only and (repo_root / ".git").exists():
         try:
             diff_proc = subprocess.run(
                 ["git", "diff", "--name-only", "--diff-filter=ACMR", "HEAD"],
                 cwd=repo_root,
+                env=git_env,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -280,6 +300,7 @@ def _iter_repo_files(repo_root: Path, changed_only: bool = False) -> list[Path]:
             untracked_proc = subprocess.run(
                 ["git", "ls-files", "--others", "--exclude-standard"],
                 cwd=repo_root,
+                env=git_env,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -300,6 +321,7 @@ def _iter_repo_files(repo_root: Path, changed_only: bool = False) -> list[Path]:
             proc = subprocess.run(
                 ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
                 cwd=repo_root,
+                env=git_env,
                 capture_output=True,
                 text=True,
                 check=True,
@@ -342,11 +364,11 @@ def lint_file(repo_root: Path, file_path: Path, cfg: dict) -> list[Finding]:
 
     findings: list[Finding] = []
 
-    # DUNE005: secret literal scan across non-test text/code files
+    # DUNE005: secret literal scan across non-test text/code/markdown files
     if (
         "DUNE005" not in disabled_rules
         and not is_test
-        and ext in (CODE_EXTS | {".json", ".yaml", ".yml", ".toml"})
+        and ext in (CODE_EXTS | {".json", ".yaml", ".yml", ".toml", ".md"})
     ):
         for idx, line in enumerate(lines, start=1):
             if any(rx.search(line) for rx in SECRET_RES):

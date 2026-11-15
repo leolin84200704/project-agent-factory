@@ -139,15 +139,20 @@ def main() -> int:
     else:
         print("PASS DUNE004 CJK code guard (including extensionless shebang scripts)")
 
-    # 5. DUNE005: hardcoded API secret detection
+    # 5. DUNE005: hardcoded API secret detection (code + markdown deployment docs)
     fake_gemini_key = "AIzaSy" + ("A" * 33)
-    findings = run_case({"src/llm.ts": f'const KEY = "{fake_gemini_key}";\n'})
-    codes = [(f.code, f.rel_path) for f in findings]
-    if codes != [("DUNE005", "src/llm.ts")]:
+    findings = run_case(
+        {
+            "src/llm.ts": f'const KEY = "{fake_gemini_key}";\n',
+            "docs/deployment.md": f" Key: `{fake_gemini_key}`\n",
+        }
+    )
+    codes = sorted((f.code, f.rel_path) for f in findings)
+    if codes != [("DUNE005", "docs/deployment.md"), ("DUNE005", "src/llm.ts")]:
         print(f"FAIL DUNE005: got {codes}")
         failures += 1
     else:
-        print("PASS DUNE005 secret literal detection")
+        print("PASS DUNE005 secret literal detection (code + markdown)")
 
     # 6. Actionable remediation text must accompany every finding
     if not all("Remediation:" in f.format() for f in findings):

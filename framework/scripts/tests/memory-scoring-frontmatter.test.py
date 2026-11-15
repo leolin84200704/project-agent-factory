@@ -196,7 +196,26 @@ def test_code_instance_and_no_yaml_fallback() -> bool:
         "- api\n"
         "- docker\n"
         "- service\n"
+        "relations:\n"
+        "  unblocked_by: []\n"
+        "  sibling:\n"
+        "  - VP-18589\n"
         'summary: "Ticket: alpha \\"quoted\\" detail"\n'
+        "owner: null\n"
+        "tilde: ~\n"
+        'numeric_id: "12345"\n'
+        'bool_str: "true"\n'
+        'empty_str: ""\n'
+        "empty_map: {}\n"
+        'escaped_multiline: "hello \\"\n'
+        '  world\\""\n'
+        "folded_note: >\n"
+        "  first folded line\n"
+        "  second folded line\n"
+        "\n"
+        "  second paragraph\n"
+        "unblock_when: 'First line of folded single quote\n"
+        "  second line with ''escaped'' quote'\n"
         "note: |\n"
         "  line one of note\n"
         "  line two of note\n"
@@ -226,21 +245,51 @@ def test_code_instance_and_no_yaml_fallback() -> bool:
             ms.run_for_agent(root, write=True)
         meta1 = ms.read_frontmatter(t1)
         raw1 = t1.read_text(encoding="utf-8")
-        # Also test write_frontmatter round-trip with multiline + quotes when yaml is None
+        # Also test write_frontmatter -> read_frontmatter round-trip with relations,
+        # null, empty strings, quoted numbers/booleans, and multiline when yaml is None
         rt_path = root / "rt.md"
         ms.write_frontmatter(
             rt_path,
-            {"id": "RT-1", "summary": 'Say: "hello"', "note": "first line\nsecond line"},
+            {
+                "id": "RT-1",
+                "owner": None,
+                "numeric_id": "12345",
+                "bool_str": "true",
+                "empty_str": "",
+                "empty_map": {},
+                "relations": {"unblocked_by": [], "sibling": ["VP-18589"]},
+                "summary": 'Say: "hello"',
+                "note": "first line\nsecond line",
+            },
         )
         rt_meta = ms.read_frontmatter(rt_path)
+        rt_targets = ms.relation_targets(rt_meta)
     finally:
         ms.yaml = saved_yaml
 
     ok = (
         "line one of note\n  line two of note" in raw1
-        and "links:\n- ticket-2\n" in raw1
+        and "links:\n- VP-18589\n- ticket-2\n" in raw1
         and '\\\\"' not in raw1
-        and meta1.get("links") == ["ticket-2"]
+        and meta1.get("links") == ["VP-18589", "ticket-2"]
+        and meta1.get("owner") is None
+        and meta1.get("tilde") is None
+        and meta1.get("numeric_id") == "12345"
+        and isinstance(meta1.get("numeric_id"), str)
+        and meta1.get("bool_str") == "true"
+        and isinstance(meta1.get("bool_str"), str)
+        and meta1.get("empty_str") == ""
+        and meta1.get("empty_map") == {}
+        and meta1.get("escaped_multiline") == 'hello " world"'
+        and meta1.get("folded_note") == "first folded line second folded line\nsecond paragraph"
+        and "second line with 'escaped' quote" in str(meta1.get("unblock_when", ""))
+        and rt_meta.get("owner") is None
+        and rt_meta.get("numeric_id") == "12345"
+        and rt_meta.get("bool_str") == "true"
+        and rt_meta.get("empty_str") == ""
+        and rt_meta.get("empty_map") == {}
+        and rt_meta.get("relations") == {"unblocked_by": [], "sibling": ["VP-18589"]}
+        and rt_targets == {"VP-18589"}
         and rt_meta.get("summary") == 'Say: "hello"'
         and rt_meta.get("note") == "first line\nsecond line"
     )

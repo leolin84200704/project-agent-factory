@@ -21,8 +21,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,22 @@ MEMORY_SCORING_PATH = FACTORY_ROOT / "framework" / "scripts" / "memory_scoring.p
 DUNE_LINT_PATH = FACTORY_ROOT / "framework" / "checks" / "dune_lint.py"
 GIT_BIN = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
 RESTRICTED_PRIVATE_REPO = "mind" + "-" + "state"
+GIT_LOCAL_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
+
+
+def _clean_git_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(base_env if base_env is not None else os.environ)
+    for var in GIT_LOCAL_ENV_VARS:
+        env.pop(var, None)
+    return env
 
 
 def _load_module(name: str, path: Path) -> Any:
@@ -48,6 +66,7 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
     return subprocess.run(
         [GIT_BIN, *args],
         cwd=repo,
+        env=_clean_git_env(),
         text=True,
         capture_output=True,
         check=check,
@@ -100,7 +119,7 @@ def _load_verify_config(repo: Path) -> dict[str, Any]:
 
 def _run_shell_step(repo: Path, stage: str, command: str, timeout_sec: int = 900) -> dict[str, Any]:
     t0 = time.monotonic()
-    env = os.environ.copy()
+    env = _clean_git_env()
     env["PAF_AUTONOMOUS"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     proc = subprocess.run(
@@ -468,12 +487,9 @@ def _capture_failed_ci_logs(repo: Path, head_sha: str) -> Path | None:
 def _auto_revert_merge(repo: Path, base_branch: str, bad_merge_sha: str) -> tuple[bool, str]:
     short_bad = bad_merge_sha[:10]
     rev_branch = f"revert/auto-{short_bad}"
-    git_common = _git_common_dir(repo)
-    wt_rev = git_common / f"wt-revert-{short_bad}"
+    wt_rev = Path(tempfile.mkdtemp(prefix=f"paf-wt-revert-{short_bad}-"))
 
     _git(repo, "fetch", "origin", base_branch, check=False)
-    if wt_rev.exists():
-        _git(repo, "worktree", "remove", "--force", str(wt_rev), check=False)
 
     add_wt = _git(
         repo,
@@ -486,6 +502,7 @@ def _auto_revert_merge(repo: Path, base_branch: str, bad_merge_sha: str) -> tupl
         check=False,
     )
     if add_wt.returncode != 0:
+        shutil.rmtree(wt_rev, ignore_errors=True)
         return False, f"Failed creating isolated revert worktree: {add_wt.stderr}"
 
     try:
@@ -498,7 +515,7 @@ def _auto_revert_merge(repo: Path, base_branch: str, bad_merge_sha: str) -> tupl
                 return False, f"Automatic git revert failed: {rev.stderr} / {rev_m1.stderr}"
 
         rev_sha = _git_head_sha(wt_rev)
-        push_env = os.environ.copy()
+        push_env = _clean_git_env()
         push_env["PAF_PRE_PUSH_VERIFIED"] = rev_sha
         push_res = subprocess.run(
             [GIT_BIN, "push", "-u", "origin", rev_branch],
@@ -575,6 +592,7 @@ def _auto_revert_merge(repo: Path, base_branch: str, bad_merge_sha: str) -> tupl
         return True, f"Auto-reverted {short_bad} via {pr_url}"
     finally:
         _git(repo, "worktree", "remove", "--force", str(wt_rev), check=False)
+        shutil.rmtree(wt_rev, ignore_errors=True)
         _git(repo, "branch", "-D", rev_branch, check=False)
 
 
@@ -674,7 +692,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
                 return 1
 
     # Step 2: Push branch (pre-push hook recognizes PAF_PRE_PUSH_VERIFIED=<head_sha>)
-    push_env = os.environ.copy()
+    push_env = _clean_git_env()
     push_env["PAF_PRE_PUSH_VERIFIED"] = head_sha
     push_proc = subprocess.run(
         [GIT_BIN, "push", "-u", "origin", branch],
@@ -821,14 +839,12 @@ def cmd_ship(args: argparse.Namespace) -> int:
             _git(repo, "branch", "-D", branch, check=False)
             post_repo = repo
         else:
-            wt_tmp = git_common / f"wt-post-merge-{merged_sha[:8]}"
+            wt_tmp = Path(tempfile.mkdtemp(prefix=f"paf-wt-post-merge-{merged_sha[:8]}-"))
             _git(repo, "worktree", "add", "--detach", str(wt_tmp), merged_sha, check=True)
             post_repo = wt_tmp
             cleanup_wt = wt_tmp
     else:
-        wt_tmp = git_common / f"wt-post-merge-{merged_sha[:8]}"
-        if wt_tmp.exists():
-            _git(repo, "worktree", "remove", "--force", str(wt_tmp), check=False)
+        wt_tmp = Path(tempfile.mkdtemp(prefix=f"paf-wt-post-merge-{merged_sha[:8]}-"))
         _git(repo, "worktree", "add", "--detach", str(wt_tmp), merged_sha, check=True)
         post_repo = wt_tmp
         cleanup_wt = wt_tmp
@@ -842,6 +858,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
     finally:
         if cleanup_wt is not None:
             _git(repo, "worktree", "remove", "--force", str(cleanup_wt), check=False)
+            shutil.rmtree(cleanup_wt, ignore_errors=True)
 
     if post_ok:
         print(f"SHIPPED_AND_VERIFIED: {pr_url} -> {base_branch}@{merged_sha[:12]}")
