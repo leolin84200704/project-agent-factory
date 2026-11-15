@@ -1,6 +1,6 @@
 # General Problem Solving Skill
 
-> Handles tickets outside of EMR Integration domain
+> Universal engineering triage and behavior-first implementation skill across domains
 
 ---
 
@@ -16,12 +16,12 @@ priority: medium
 
 ## Purpose
 
-Handle various types of tickets that don't fit into specialized skills:
+Handle cross-cutting engineering issues that do not belong to a single domain skill:
 - Bug reports
-- File size issues
-- Performance problems
-- Configuration issues
-- Integration problems (non-EMR)
+- Payload and file size limits
+- Performance bottlenecks
+- Configuration drift
+- Partner / webhook / API integration failures
 
 ---
 
@@ -107,22 +107,22 @@ Read("src/modules/{domain}/services/{service}.ts")
 grep -r "function.*{action}" src/
 ```
 
-**Example**: For "resend result", first read:
-- `src/modules/result/services/result-generation.service.ts`
-- Look for `generateResultHl7`, `getSampleRelevantInfo`, etc.
+**Example**: For "resend delivery", first read:
+- `src/modules/delivery/services/payload-generation.service.ts`
+- Look for `buildDeliveryPayload`, `fetchOrderSnapshot`, etc.
 
 ### 2. USE REAL DATA, NEVER FAKE DATA
 
-**❌ FORBIDDEN**:
-- Generating fake HL7 with fake patient names
-- Hardcoding values like "TEST_PATIENT"
-- Making up test results
+**FORBIDDEN**:
+- Generating fake payloads with synthetic customer records in live operations
+- Hardcoding placeholder IDs like `"TEST_ACCOUNT"`
+- Fabricating delivery receipts
 
-**✅ REQUIRED**:
-- Call gRPC services to get real data
-- Query database for existing records
-- Download real PDFs from APIs
-- Use actual customer/patient IDs from tickets
+**REQUIRED**:
+- Call upstream RPC/HTTP services to fetch authoritative records
+- Query the database for existing persisted records
+- Download real artifacts from storage APIs
+- Use actual tenant/order IDs from the ticket
 
 ### 3. ALWAYS VERIFY OUTPUT
 
@@ -131,68 +131,68 @@ grep -r "function.*{action}" src/
 # Database operations - verify record created/updated
 echo "SELECT * FROM {table} WHERE {id} = '{value}';"
 
-# SFTP uploads - verify file exists on server
-# 1. List directory
-# 2. Find your file
-# 3. Compare file sizes
+# Remote uploads - verify artifact exists on destination
+# 1. List remote directory or object prefix
+# 2. Locate uploaded artifact
+# 3. Compare byte sizes / checksums
 ```
 
-**If verification fails**: STOP, report the error, suggest fix
+**If verification fails**: STOP, inspect root cause, repair or revert cleanly
 
 ### 4. QUERY CONFIGURATION, DON'T HARDCODE
 
-**❌ WRONG**:
+**WRONG**:
 ```typescript
-const sftpPath = '/results/';  // Hardcoded!
+const uploadPath = '/deliveries/';  // Hardcoded!
 ```
 
-**✅ RIGHT**:
+**RIGHT**:
 ```typescript
-const integration = await prisma.ehrIntegration.findFirst({
-  where: { customer_id: '28080', legacy_emr_service: 'MDHQ' },
+const integration = await prisma.partnerIntegration.findFirst({
+  where: { tenant_id: tenantId, partner_code: partnerCode },
 });
-const sftpPath = integration.sftp_result_path;  // "/rthmemr/results/" or similar
+const uploadPath = integration.remote_delivery_path;
 ```
 
 ### 5. UNDERSTAND "RESEND" vs "CREATE NEW"
 
 | Term | Meaning |
 |------|---------|
-| **Resend** | Find EXISTING result, re-send to SAME destination |
-| **Create New** | Generate NEW result for a sample (rare) |
+| **Resend** | Find EXISTING artifact, re-deliver to SAME destination |
+| **Create New** | Generate NEW artifact from scratch (rare) |
 
-**Default assumption**: When ticket says "resend", find existing result first!
+**Default assumption**: When a ticket says "resend", locate the existing persisted artifact first.
 
 ---
 
-## Example: VP-15942 (File Size Issue)
+## Example: Outbound Payload Size Limit
 
 ### Problem
-- Cerbo limit: 15MB
-- We sent: 28MB
-- Result: Cerbo couldn't process
+- Partner ingress limit: 15MB
+- Outbound artifact size: 28MB
+- Result: Partner endpoint rejected delivery
 
 ### Investigation
 ```bash
-# Check compression service
-grep -r "ENABLE_ADOBE_PDF_COMPRESSION" .env k8s/
+# Check compression configuration
+grep -r "ENABLE_ARTIFACT_COMPRESSION" .env deploy/
 
 # Check compression threshold
 grep -r "compressionThreshold" src/
 
-# Check file size validation
-grep -r "file.*size.*limit" src/
+# Check payload size validation
+grep -r "maxPayloadBytes" src/
 ```
 
 ### Findings
-1. Adobe PDF Compression disabled by default
-2. Threshold 12MB, Cerbo limit 15MB
-3. No validation before sending
+1. Artifact compression disabled by default
+2. Compression threshold mismatched against partner ingress cap
+3. No pre-flight size validation before outbound transfer
 
 ### Solution
-1. Enable compression
-2. Add file size validation
-3. Set Cerbo-specific threshold (14MB)
+1. Enable artifact compression for oversized payloads
+2. Add pre-flight byte-size validation with actionable 4xx/alerting
+3. Configure partner-specific size threshold below the 15MB ceiling
 
 ---
 

@@ -12,7 +12,7 @@
 2. Grep `{memory_root}/storage/short_term_memory/` 找類似的過去 ticket；有相似 ticket 就讀其 STM，特別關注 Failures 區段
 3. Grep `{memory_root}/long-term-memory/` 找相關技術知識
 4. **Lesson injection（sparse — 只挑 1~2 條）**：用 ticket 的關鍵字 grep `framework/ENGINEERING-LESSONS.md`（本檔所在 factory repo），挑**最相關的 1~2 條**（不要更多 — 實測 k=1 檢索勝過 k=4，塞多反而害）把原文抄進 STM 的 Ticket Analysis；Step 4 呈報方案時明說遵守了哪條。CLAUDE.md 的 hot-lessons 常駐區塊涵蓋最高風險紀律，此步補的是 task-specific 的其他條目。
-5. **L4 驗證**：從 `{ticket_system}` 取得 ticket 現況（status / comments / links）。STM 說的一律以 ticket 系統為準；發現不同步，同一 turn 修正 STM。
+5. **L4 驗證（含父單／姊妹單結案核對）**：從 `{ticket_system}` 取得 ticket 現況（status / comments / links）；若為遷移、拆分或系列子單，必先讀父單與已完成姊妹單的結案結論，排除已被證實為死碼或已退役的範圍。STM 說的一律以 ticket 系統為準；發現不同步，同一 turn 修正 STM。
 
 ## Step 2: Analyze（分析理解）
 1. 從 `{ticket_system}` 取得 ticket 內容
@@ -41,8 +41,8 @@
   這份 ledger 是將來談「什麼條件下可以少一道人工 review」的唯一依據：**累積 ≥3 筆已回填 outcome 之前，不提任何自動放行門檻**；
   要提門檻時附上 ledger 的逐筆紀錄走 PR，由使用者決定。
 
-## Step 4: Discuss with User（暫停等使用者確認）
-呈現分析結果和方案：
+## Step 4: Plan & Gate by Trust Zone（方案與信任區分流）
+整理分析結果與 Test Plan（寫入 STM）：
 ```
 ## Ticket: {ticket_id} - {summary}
 ### 分析摘要
@@ -50,31 +50,31 @@
 ### Test plan（這個改動怎麼被驗證、seam 在哪、哪些部分只能 mock 及原因）
 ### 需要確認
 ```
-**必須等使用者確認才能進入 Step 5**；**寫不出 Test plan 的方案不能進 Step 5**——
-測不動是設計問題，回頭改方案，不是進實作後再發現。
+**寫不出 Test plan 的方案不能進 Step 5**——測不動是設計問題，回頭改方案，不是進實作後再發現。
+- **`zone: "autonomous"`（個人倉庫）**：只要需求明確、無 T3 花費與公開授權變更，記錄完 Test plan 即**直接進入 Step 5**，不暫停等人工確認。
+- **`zone: "guarded"`（公司／團隊倉庫）**：若涉及跨服務契約、DB schema 變更或需求有歧義，暫停等使用者確認；明確的獨立修復可推進至預演驗證，唯 `main` 合併前必停。
 
 ## Step 5: Execute（執行實作）
-1. 建立 Git branch: `git checkout -b {branch_pattern}`
+1. 建立 Git branch（或獨立 worktree）: `git checkout -b {branch_pattern}`
 2. **先寫行為級測試骨架，再寫實作**（照 Step 4 的 Test plan；骨架 = arrange/assert
    的空殼即可）。骨架寫不出來 = 設計缺 seam，回 Step 4 修方案，不要硬寫——
    順序本身強迫注入點存在
-3. 逐步執行修改，每步驗證
+3. 逐步執行修改，每步驗證（含 `paf lint-code` 確保無 CJK、無未捕獲 `void` promise、無寫死環境變數 fallback 與憑證）
 4. 失敗時立即記錄到 STM Failures，分析 root cause
 5. 記錄到 STM: Code Changes
 
-## Step 6: Review with User（暫停等使用者 Review）
-1. 執行 `git diff --stat` 整理變更摘要
-2. 執行測試——新 logic 必附**行為級**測試（mock 掉共用路徑的假綠燈不算，見
-   ENGINEERING-LESSONS「Sync sibling encodings」條）；無法附測試時必須在 Review
-   報告明寫原因——「寫不出測試」本身就是難測 code 的警報，要浮上來給人裁決，
-   不得靜默跳過
-3. 呈現 Review 報告
-4. **必須等使用者確認才能進入 Step 7**
-5. 使用者要求修改 → 回到 Step 5
+## Step 6: Deterministic Verify & Blind Adversarial Review（雙重驗證）
+1. 執行 `paf verify --repo {repo} --mode pre-push`，產生綁定 `HEAD` SHA 的 Verification Artifact（含 Dune static checks、build、typecheck、行為級 unit test、boot smoke）。新 logic 必附**行為級**測試（mock 掉共用路徑的假綠燈不算）。
+2. **派獨立 Blind Adversarial Reviewer 子代理（`research` 唯讀）**：
+   - 輸入**僅限** `git diff {base}...HEAD` 與測試輸出，**絕不傳入**主 agent 的推理過程或為何這樣寫的辯護。
+   - 審查重點：測試是否漏測失敗分支、是否 mock 掉受測標的、是否有跨環境寫死預設值、是否違反安全邊界。
+   - 審查通過後執行 `paf record-review --repo {repo} --verdict approve --reviewer blind-subagent --summary "..."` 寫入 SHA 綁定收據；若為 `request_changes` 則回 Step 5 修正並重跑新 SHA 的驗證與審查。
 
-## Step 7: Complete（收尾）
-1. Commit: `git commit -m "[{ticket_id}] {描述}"`
-2. Push（使用者同意時）
+## Step 7: Ship & Post-Merge Self-Healing（交付與善後閉環）
+1. Commit（明確指定路徑暫存，禁用 `git add -A`）: `git commit -m "[{ticket_id}] {描述}"`
+2. 依 `.agent-verify.json` 的 `zone` 執行 `paf ship`：
+   - **`zone: "autonomous"`（個人倉庫）**：`paf ship` 全自動執行 push → 開立附帶 Verification Artifact 與 Blind Review 收據的 PR → 等待 GitHub Actions CI 全綠（失敗自動抓取 `gh run view --log-failed` 進除錯迴圈）→ `gh pr merge --squash --delete-branch --match-head-commit <SHA>` 原子合併進 `main` → 同步 `main` 並執行 `post-merge` 驗收（失敗立即自動開立 revert PR 回滾善後）。全程不需人類介入。
+   - **`zone: "guarded"`（公司／團隊倉庫）**：自動完成 PR、CI 與 `stage_test` 驗證；對 `main` 執行 `paf ship` 時停在 `PAUSED_FOR_MAIN_APPROVAL` 呈報使用者。**一旦使用者回覆 `approve`**，立即執行 `paf ship --approved-main`，自動跑完原子 merge、部署後測試、異常自動除錯或自動回滾閉環。
 3. **文件比對** — 這次改的行為，去 fetch 描述它的文件並搜尋，確認仍然成立。
    新的 error code / reason / status 值也算。文件寫過舊行為時要明講「先前版本說 X，
    當時為真，現已不是」，不要默默覆蓋。仍然不寫尚未部署的行為。
@@ -110,9 +110,6 @@
 3. 風險低 → 修復後繼續；風險高 → 暫停回報使用者
 
 ## 暫停規則
-以下情況必須暫停等使用者：
-- Step 4（方案確認前）
-- Step 6（Review 前）
-- 需求不清楚
-- 遇到不可逆操作
-- 無法自行解決的錯誤
+依 `.agent-verify.json` 信任區執行：
+- **`zone: "autonomous"`（個人倉庫）**：不因常規方案、PR Review 或 merge `main` 暫停；僅在需求自相矛盾、涉及 T3 花費、將私有倉庫改公開／新增開源 `LICENSE`、或自動除錯與自動回滾失敗時暫停。
+- **`zone: "guarded"`（公司／團隊倉庫）**：在 `main` 分支合併前（`PAUSED_FOR_MAIN_APPROVAL`）、以人類名義發送外部訊息（Jira/Email/Slack）、DB 破壞性變更或需求不明時暫停；收到 `approve` 後自動完成後續合併、測試與善後閉環。

@@ -1,9 +1,9 @@
 # {Agent Name} — {工作/專案名稱} Code Agent
 
 > Workspace-level context，只放這份工作/專案專屬的內容。
-> 個人習慣與通用紀律來自 `{factory_path}/AGENTS.md`（user-level 自動載入），不要在此重複。
+> 個人溝通與工程通用紀律來自 `{factory_path}/CORE.md` 與 `{factory_path}/AGENTS.md`（自動載入），不要在此重複。
 > 處理 ticket 時先讀 `{factory_path}/framework/WORK-LOOP.md`；memory 檢索深度見 `{factory_path}/framework/RETRIEVAL.md`。
-> （`{factory_path}` 由 BOOTSTRAP 填入本機 factory clone 的絕對路徑，例：`~/src/project-agent-factory`）
+> 本 instance 採 Thin Composition：評分參數放 `.agent-factory/instance.json`（跑 `paf score --dir .`），產品 repo 驗證與雙信任區設定放 `.agent-verify.json`（跑 `paf verify` / `paf ship`）。
 
 ## 角色
 你是 {Agent Name}，Leo 的 AI coding assistant，負責 {domain} 相關專案的維護和開發。

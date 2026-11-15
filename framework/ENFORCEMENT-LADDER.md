@@ -10,12 +10,12 @@
 
 | 階 | 機制 | 產品 code 的例子 | 本系統的對應物 |
 |---|---|---|---|
-| 1 | 表達上不可能 | branded type、discriminated union、private constructor | 檔案格式讓錯誤寫法無法表達（如 `expect_all` 一律 block list） |
-| 2 | 儲存層 constraint | UNIQUE、CHECK、FK、NOT NULL | frontmatter 必填欄位由腳本拒收（`unblock_when:` 缺失即報錯） |
-| 3 | 啟動/開工時失敗 | boot 時驗 config，缺 env 不啟動 | staleness check、`run-regression.py --check`（grader 入庫前自驗） |
-| 4 | 測試失敗 | property-based test、invariant test | regression suite、canary 題、ablation arm |
-| 5 | 攔截層 | lint rule、import boundary | PreToolUse hooks（git 安全、lessons 提醒、驗證資產保護） |
-| 6 | CI / gate 失敗 | migration linter、breaking-change diff | lesson eval gate（REGRESSION.md § Lesson eval gate） |
+| 1 | 表達上不可能 | branded type、discriminated union、private constructor | `paf ship` 強制帶 `--match-head-commit <verified_sha>` 且綁定同 SHA 的 Blind Review JSON，舊 head 結構上無法合併 |
+| 2 | 儲存層 constraint | UNIQUE、CHECK、FK、NOT NULL | `framework/scripts/memory_scoring.py` 強制 `_index.md` 單行壓縮 ≤160 字元；`framework/githooks/pre-commit` guard 3 攔截記憶條目縮水 |
+| 3 | 啟動/開工時失敗 | boot 時驗 config，缺 env 不啟動 | `paf verify` 零測試匹配即拋錯（fail-loud）、`framework/githooks/lib/nest-di-smoke.sh` 空環境 DI 啟動驗證 |
+| 4 | 測試失敗 | property-based test、invariant test | `framework/scripts/tests/*`、`framework/checks/tests/*`、`framework/hooks/tests/*`、`framework/githooks/tests/githooks.test.sh` |
+| 5 | 攔截層 | lint rule、import boundary | `framework/checks/dune_lint.py`（`DUNE001`–`DUNE005` 含內建 Remediation 指引）+ PreToolUse hooks（`PAF_AUTONOMOUS=1` 下硬攔修改驗證資產） |
+| 6 | CI / gate 失敗 | migration linter、breaking-change diff | `.agent-verify.json` + `.github/workflows/ci.yml`（`paf verify --mode ci`）+ `framework/githooks/pre-push` |
 | 7 | 寫成文件 | ADR、wiki | ENGINEERING-LESSONS.md、hot-lessons、CLAUDE.md |
 
 判準：**下層的機制不依賴任何人（或任何模型）「記得」**。第 7 階的遵守率隨

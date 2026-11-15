@@ -15,6 +15,30 @@ if [ -x "$local_hook" ] && [ "$(cd "$(dirname "$local_hook")" && pwd)" != "$(cd 
   "$local_hook" "$@" || exit $?
 fi
 
+# ---------- High-Trust declarative contract (.agent-verify.json) ----------
+# Repos that declare `.agent-verify.json` run `paf verify --mode pre-push`
+# (Dune Architecture static checks + configured lint/typecheck/unit_test/smoke).
+# When invoked from `paf ship`, PAF_PRE_PUSH_VERIFIED=<head_sha> avoids running
+# the identical suite twice back-to-back on the exact same commit.
+if [ -f "$repo_root/.agent-verify.json" ]; then
+  head_sha="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null)"
+  if [ -n "$head_sha" ] && [ "${PAF_PRE_PUSH_VERIFIED:-}" = "$head_sha" ]; then
+    echo "[pre-push] .agent-verify.json already verified for $(printf '%.12s' "$head_sha")"
+    exit 0
+  fi
+  paf_bin="$(cd "$(dirname "$0")/../.." && pwd)/bin/paf"
+  if [ ! -x "$paf_bin" ]; then
+    echo "x [pre-push] paf binary missing or not executable at $paf_bin"
+    exit 1
+  fi
+  echo "[pre-push] paf verify (.agent-verify.json) ..."
+  if ! "$paf_bin" verify --repo "$repo_root" --mode pre-push; then
+    echo "x [pre-push] .agent-verify.json verification failed -- not pushing."
+    exit 1
+  fi
+  exit 0
+fi
+
 # ── ADAPT PER INSTANCE ───────────────────────────────────────────
 # Repos where a build must pass before pushing, matched on the origin repo name.
 # Deliberately opt-in rather than "any repo with a build script": forcing a build
