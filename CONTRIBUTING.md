@@ -10,15 +10,18 @@
 | `lis` | Vibrant America LIS 工作（vibrant-america-working-agent，工作機 `~/src/`；2026-07-06 由 `lis-code-agent` 更名） |
 | `iic` | industry-intel 開發維護（industry-intel-code-agent，個人機 `~/personal_project/`） |
 | `jac` | job-applier pipeline 開發維護（job-applier-code-agent，個人機 `~/personal_project/`） |
+| `pfa` | photo-farm 開發維護（photo-farm-agent，個人機 `~/personal_project/`） |
 
-新 instance 在 BOOTSTRAP 時指定短代號，寫進該 instance 的 CLAUDE.md，並回填此表。
+新 instance 在 BOOTSTRAP 時指定短代號，寫進該 instance 的 CLAUDE.md 與 `.agent-factory/instance.json`，並回填此表。
 
-## 兩類變更、兩條路
+## 兩類變更與 High-Trust Autonomous Ship
+
+`project-agent-factory` 為個人基礎建設倉庫（`.agent-verify.json` `zone: "autonomous"`）：
 
 | 來源 | 流程 | Commit prefix |
 |---|---|---|
-| Leo 直接編輯，或 session 中經 Leo 明確確認的改動 | 直接 commit main | `[core]` / `[framework]` / `[skill]` / `[docs]` |
-| Instance 提案的 global lesson（dream pipeline 蒸餾，或工作 session 中發現但 Leo 尚未逐字確認） | **branch + PR，Leo merge**；agent 不 merge | `[lesson:{instance}]` |
+| 框架／CLI／hooks／文件改動 | 切 feature branch → `paf verify` → Blind Adversarial Review（`paf record-review`）→ `paf ship`（CI 全綠後鎖 SHA 自動 squash-merge 進 `main` 並跑 post-merge 驗證） | `[core]` / `[framework]` / `[skill]` / `[docs]` |
+| Instance 提案的 global lesson | 切 `lesson/{instance}/{slug}` → 去識別化 + ≤50 字檢查 + `paf verify` + Blind Adversarial Review → `paf ship` 自動合併 | `[lesson:{instance}]` / `[lesson-modify:{instance}]` / `[lesson-deprecate:{instance}]` |
 
 ## Lesson PR 規格
 

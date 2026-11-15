@@ -344,5 +344,22 @@ mkdir -p "$NOBASE/src" && printf 'export const a = 1;\n' > "$NOBASE/src/a.ts"
 git -C "$NOBASE" add -A && git -C "$NOBASE" commit -qm only
 run 0 "no origin/main and no upstream: cannot scope the diff, skipped with a note" "$NOBASE" pre-push
 
+echo "--- pre-push declarative .agent-verify.json contract ---"
+AVPASS=$(mkrepo avpass 'git@github.com:Some-Org/high-trust-service.git')
+printf 'def add(a, b):\n    return a + b\n' > "$AVPASS/app.py"
+printf '{"version":1,"zone":"autonomous","commands":{"unit_test":["python3 -c '\''import app; assert app.add(2, 3) == 5'\''"]}}\n' > "$AVPASS/.agent-verify.json"
+git -C "$AVPASS" add -A && git -C "$AVPASS" commit -qm init
+run 0 "repo with passing .agent-verify.json: pre-push passes" "$AVPASS" pre-push
+
+AVSHA=$(git -C "$AVPASS" rev-parse HEAD)
+PAF_PRE_PUSH_VERIFIED="$AVSHA" run_says 0 "already verified" \
+  "repo with PAF_PRE_PUSH_VERIFIED matching HEAD: skips duplicate run" "$AVPASS" pre-push
+
+AVFAIL=$(mkrepo avfail 'git@github.com:Some-Org/high-trust-broken.git')
+printf 'def add(a, b):\n    return a - b\n' > "$AVFAIL/app.py"
+printf '{"version":1,"zone":"autonomous","commands":{"unit_test":["python3 -c '\''import app; assert app.add(2, 3) == 5'\''"]}}\n' > "$AVFAIL/.agent-verify.json"
+git -C "$AVFAIL" add -A && git -C "$AVFAIL" commit -qm broken
+run 1 "repo with failing .agent-verify.json unit_test: pre-push blocked" "$AVFAIL" pre-push
+
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; exit 1; fi

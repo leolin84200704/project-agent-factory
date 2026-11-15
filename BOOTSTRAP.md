@@ -11,20 +11,23 @@
 
 ```
 {instance}/
-├── CLAUDE.md                  ← 從 framework/templates/CLAUDE.instance.md 填入
+├── CLAUDE.md                        ← 從 framework/templates/CLAUDE.instance.md 填入
+├── .agent-factory/
+│   ├── manifest.json                ← factory 版本與元件清單（供 paf audit 追蹤）
+│   └── instance.json                ← Thin Instance 設定（index_style、tier_dirs、category_weights、category_keywords）
 ├── storage/short_term_memory/_index.md
 ├── journal/_index.md
 ├── long-term-memory/
 │   ├── _index.md
-│   ├── ticket-routing.md      ← 初版由 repo 掃描產生
-│   ├── repos.md               ← 初版由 repo 掃描產生
-│   └── patterns.md            ← 初版由 repo 掃描產生
+│   ├── ticket-routing.md            ← 初版由 repo 掃描產生
+│   ├── repos.md                     ← 初版由 repo 掃描產生
+│   └── patterns.md                  ← 初版由 repo 掃描產生
 ├── archive/_index.md
-├── scripts/                   ← 從 framework/scripts/ 複製後改參數
+├── scripts/
+│   └── memory_scoring.py            ← Thin wrapper 委派至 $FACTORY/framework/scripts/memory_scoring.py（絕不複製完整腳本）
 └── .claude/
-    ├── settings.json          ← 從 framework/templates/settings.json 複製
-    ├── hooks/                 ← 從 framework/hooks/ 複製
-    └── skills/                ← 這份工作專屬的 skills（之後累積）
+    ├── settings.json                ← 從 framework/templates/settings.json 填入（hooks 直接指向 {factory_path}/framework/hooks/，不複製 .claude/hooks/）
+    └── skills/                      ← 這份工作專屬的 skills（之後累積）
 ```
 
 ## 步驟
@@ -46,10 +49,12 @@
 - Ticket 系統與取用方式（Jira MCP？GitHub Issues？無？）
 - Branch/commit 慣例、保護分支、deploy 觸發方式
 
-### 2. 建骨架
-- 依上方結構 mkdir + 複製 templates/scripts/hooks
+### 2. 建骨架（Thin Composition — 不複製邏輯）
+- 依上方結構 `mkdir` + 建立 `.agent-factory/manifest.json` 與 `.agent-factory/instance.json`
+- **禁止複製完整 `memory_scoring.py` 或 `.claude/hooks/`**：所有評分與壓縮邏輯集中於 `$FACTORY/framework/scripts/memory_scoring.py`（透過 `paf score --dir {instance}` 或 10 行 thin wrapper 執行）；hooks 在 `.claude/settings.json` 直接填 `{factory_path}/framework/hooks/*.sh`
 - `CLAUDE.md`：填 `framework/templates/CLAUDE.instance.md` 的所有 `{佔位符}`；沒有答案的欄位保留 TODO 並列給 Leo。其中 `{factory_path}` 一律填**本機解析後的絕對路徑**（上方 `$FACTORY` 探測結果）——instance 檔案內不留探測邏輯，烘死路徑
-- 各 `_index.md` 初始化為空表 + `Last updated: {today}`
+- 產品 repo 建立 `.agent-verify.json`（個人倉庫 `zone: "autonomous"`，公司／團隊倉庫 `zone: "guarded"`；個人倉庫同步建立 `.github/workflows/ci.yml` 執行對應的靜態檢查與單元測試，本機 pre-push 與 `paf ship` 由 `paf verify` 驅動）
+- 各 `_index.md` 由 `paf score --dir {instance}` 初始化生成（單列摘要強制壓縮 ≤160 字元，`journal/_index.md` 預設只列最新 50 筆確保 L2 預算恆定）
 
 ### 3. 餵 repos（長出第一版 LTM）
 對每個 repo 派一個 Explore 子 agent（可平行）：
@@ -68,8 +73,8 @@
 - `long-term-memory/guardrail-gaps.md` — 欄杆盤點與提案（上）
 
 ### 4. 接 memory pipeline
-- `scripts/` 內路徑與 ticket 系統參數改成本 instance 的（`ADAPT PER INSTANCE` 標記的 config 區塊）
-- 排程：`bash scripts/install-launchd.sh` 直接裝（label 自動取 instance 目錄名；同機多 instance 用 `DREAM_HOUR`/`DREAM_MINUTE` 錯開）。沒有排程也可，但 CLAUDE.md 要註明「手動跑 run-dream.sh」
+- 將本 instance 的 `category_weights` 與 `category_keywords` 寫入 `.agent-factory/instance.json`，執行 `paf score --dir {instance}` 驗證 `_index.md` 正常產出（絕不 fork 完整 `scripts/memory_scoring.py`）
+- 排程：`bash $FACTORY/framework/scripts/install-launchd.sh --agent-dir {instance}` 安裝（label 自動取 instance 目錄名；同機多 instance 用 `DREAM_HOUR`/`DREAM_MINUTE` 錯開）。沒有排程也可，但 CLAUDE.md 要註明手動跑 dream 與 `paf score`
 - Staleness check 從第一天就生效
 - Native auto memory 關閉（template settings.json 已含 `autoMemoryEnabled: false`；理由見 `framework/RETRIEVAL.md` § Native harness auto memory）
 

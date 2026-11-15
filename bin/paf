@@ -1,0 +1,1074 @@
+#!/usr/bin/env python3
+"""paf — Unified High-Trust Agent Factory CLI.
+
+Shared operational engine for `project-agent-factory` and `personal-agent-factory`.
+
+Commands:
+  paf score          Rebuild memory scores, links, and clamped L2 `_index.md` + `journal/_index.md`
+  paf lint-code      Run Dune Architecture deterministic static checks (`dune_lint.py`)
+  paf verify         Execute `.agent-verify.json` deterministic gates and emit Verification Artifact
+  paf record-review  Record SHA-pinned Blind Adversarial Reviewer receipt in `<git-common-dir>/paf-reviews/`
+  paf ship           Autonomous PR -> CI -> Blind Review -> atomic merge -> post-merge verify -> auto-revert
+  paf audit          Audit agent/product repos for manifest, `.agent-verify.json`, script drift, and index bloat
+  paf garden         Run codebase hygiene checks (dune_lint, stale merged branches, unmerged proposals)
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+FACTORY_ROOT = Path(__file__).resolve().parent.parent
+MEMORY_SCORING_PATH = FACTORY_ROOT / "framework" / "scripts" / "memory_scoring.py"
+DUNE_LINT_PATH = FACTORY_ROOT / "framework" / "checks" / "dune_lint.py"
+GIT_BIN = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+RESTRICTED_PRIVATE_REPO = "mind" + "-" + "state"
+
+
+def _load_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load module {name} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [GIT_BIN, *args],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=check,
+    )
+
+
+def _git_common_dir(repo: Path) -> Path:
+    res = _git(repo, "rev-parse", "--git-common-dir", check=False)
+    if res.returncode == 0 and res.stdout.strip():
+        raw = Path(res.stdout.strip())
+        return (repo / raw).resolve() if not raw.is_absolute() else raw.resolve()
+    return repo / ".git"
+
+
+def _git_head_sha(repo: Path) -> str:
+    res = _git(repo, "rev-parse", "HEAD", check=False)
+    return res.stdout.strip() if res.returncode == 0 else "uncommitted"
+
+
+def _git_branch(repo: Path) -> str:
+    res = _git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    return res.stdout.strip() if res.returncode == 0 else "unknown"
+
+
+def _is_branch_checked_out_elsewhere(repo: Path, branch: str) -> bool:
+    res = _git(repo, "worktree", "list", "--porcelain", check=False)
+    if res.returncode != 0:
+        return False
+    repo_resolved = repo.resolve()
+    cur_wt: Path | None = None
+    target_ref = f"refs/heads/{branch}"
+    for line in res.stdout.splitlines():
+        if line.startswith("worktree "):
+            cur_wt = Path(line[len("worktree ") :].strip()).resolve()
+        elif line.startswith("branch ") and cur_wt is not None:
+            ref = line[len("branch ") :].strip()
+            if ref == target_ref and cur_wt != repo_resolved:
+                return True
+    return False
+
+
+def _load_verify_config(repo: Path) -> dict[str, Any]:
+    cfg_path = repo / ".agent-verify.json"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(
+            f"Missing {cfg_path}. Every High-Trust repo requires a `.agent-verify.json` contract."
+        )
+    return json.loads(cfg_path.read_text(encoding="utf-8"))
+
+
+def _run_shell_step(repo: Path, stage: str, command: str, timeout_sec: int = 900) -> dict[str, Any]:
+    t0 = time.monotonic()
+    env = os.environ.copy()
+    env["PAF_AUTONOMOUS"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    proc = subprocess.run(
+        command,
+        shell=True,
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=timeout_sec,
+        check=False,
+    )
+    dur = round(time.monotonic() - t0, 2)
+    combined = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")).strip()
+    tail_lines = combined.splitlines()[-35:]
+    return {
+        "stage": stage,
+        "command": command,
+        "exit_code": proc.returncode,
+        "passed": proc.returncode == 0,
+        "duration_sec": dur,
+        "output_tail": "\n".join(tail_lines),
+    }
+
+
+def _render_verify_markdown(report: dict[str, Any], review: dict[str, Any] | None = None) -> str:
+    status_str = "PASS" if report["overall_passed"] else "FAIL"
+    lines = [
+        "### Verification Artifact (`paf verify`)",
+        "",
+        f"- **Status**: `{status_str}`",
+        f"- **Mode**: `{report['mode']}`",
+        f"- **Zone**: `{report['zone']}`",
+        f"- **Branch**: `{report['branch']}`",
+        f"- **Commit SHA**: `{report['head_sha']}`",
+        f"- **Timestamp (UTC)**: `{report['timestamp_utc']}`",
+        "",
+        "| Stage | Command | Result | Duration |",
+        "|---|---|---|---|",
+    ]
+    for step in report["steps"]:
+        cmd_clean = step["command"].replace("|", "\\|")
+        res = "PASS" if step["passed"] else f"FAIL (exit {step['exit_code']})"
+        lines.append(
+            f"| `{step['stage']}` | `{cmd_clean}` | `{res}` | {step['duration_sec']:.2f}s |"
+        )
+    if review:
+        lines += [
+            "",
+            "### Blind Adversarial Review Receipt",
+            f"- **Verdict**: `{review.get('verdict')}`",
+            f"- **Reviewer**: `{review.get('reviewer')}`",
+            f"- **Verified Commit**: `{review.get('head_sha')}`",
+            f"- **Summary**: {review.get('summary', '')}",
+        ]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def execute_verify(
+    repo: Path,
+    mode: str = "pre-push",
+    artifact_path: Path | None = None,
+    markdown_path: Path | None = None,
+) -> tuple[bool, dict[str, Any], Path, Path]:
+    repo = repo.expanduser().resolve()
+    cfg = _load_verify_config(repo)
+    zone = str(cfg.get("zone", "autonomous"))
+    commands_cfg: dict[str, list[str]] = cfg.get("commands") or {}
+    dune_cfg = cfg.get("dune_lint") or {}
+    dune_enabled = bool(dune_cfg.get("enabled", True))
+    allow_lint_only = bool(cfg.get("allow_lint_only", False))
+
+    steps: list[dict[str, Any]] = []
+    ran_command_step = False
+
+    if mode in ("pre-push", "ci"):
+        if dune_enabled:
+            t0 = time.monotonic()
+            dl = _load_module("dune_lint", DUNE_LINT_PATH)
+            findings = dl.lint_repo(repo)
+            dur = round(time.monotonic() - t0, 2)
+            out = (
+                "\n".join(f.format() for f in findings[:25])
+                if findings
+                else "dune_lint: 0 violations."
+            )
+            steps.append(
+                {
+                    "stage": "dune_lint",
+                    "command": "paf lint-code",
+                    "exit_code": 1 if findings else 0,
+                    "passed": len(findings) == 0,
+                    "duration_sec": dur,
+                    "output_tail": out,
+                }
+            )
+        stage_order = ("lint", "typecheck", "unit_test", "boot_smoke", "replay")
+        for st in stage_order:
+            for cmd in commands_cfg.get(st) or []:
+                ran_command_step = True
+                step = _run_shell_step(repo, st, cmd)
+                steps.append(step)
+                if not step["passed"]:
+                    break
+        if not ran_command_step and not allow_lint_only:
+            raise RuntimeError(
+                f"Zero behavioral/command verification checks configured in mode '{mode}' for {repo} "
+                "(static `dune_lint` alone is insufficient). Configure at least one command in "
+                "`commands` (`unit_test`, `typecheck`, `lint`, or `boot_smoke`), or set "
+                "`allow_lint_only: true` explicitly."
+            )
+    elif mode == "post-merge":
+        post_cmds = commands_cfg.get("post_merge_check") or []
+        if post_cmds:
+            for cmd in post_cmds:
+                step = _run_shell_step(repo, "post_merge_check", cmd)
+                steps.append(step)
+                if not step["passed"]:
+                    break
+        else:
+            for fallback_stage in ("unit_test", "boot_smoke"):
+                for cmd in commands_cfg.get(fallback_stage) or []:
+                    step = _run_shell_step(repo, f"post_merge:{fallback_stage}", cmd)
+                    steps.append(step)
+                    if not step["passed"]:
+                        break
+    else:
+        raise ValueError(f"Unsupported verify mode: {mode}")
+
+    if not steps:
+        raise RuntimeError(
+            f"Zero verification checks executed in mode '{mode}' for {repo}. "
+            "A gate that matches zero checks must fail loud rather than pass silently."
+        )
+
+    overall = all(s["passed"] for s in steps)
+    head_sha = _git_head_sha(repo)
+    short_sha = head_sha[:12]
+    report = {
+        "schema_version": 1,
+        "repo": str(repo),
+        "zone": zone,
+        "mode": mode,
+        "branch": _git_branch(repo),
+        "head_sha": head_sha,
+        "timestamp_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "overall_passed": overall,
+        "steps": steps,
+    }
+
+    git_common = _git_common_dir(repo)
+    git_common.mkdir(parents=True, exist_ok=True)
+    out_json = artifact_path or (git_common / f"paf-verify-{short_sha}-{mode}.json")
+    out_md = markdown_path or (git_common / f"paf-verify-{short_sha}-{mode}.md")
+
+    review_path = git_common / "paf-reviews" / f"{head_sha}.json"
+    review = (
+        json.loads(review_path.read_text(encoding="utf-8"))
+        if review_path.is_file()
+        else None
+    )
+
+    out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    out_md.write_text(_render_verify_markdown(report, review=review), encoding="utf-8")
+    return overall, report, out_json, out_md
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    ms = _load_module("memory_scoring", MEMORY_SCORING_PATH)
+    argv = ["--dir", str(args.dir.expanduser().resolve())]
+    if args.stats:
+        argv.append("--stats")
+    return int(ms.main(argv))
+
+
+def cmd_lint_code(args: argparse.Namespace) -> int:
+    dl = _load_module("dune_lint", DUNE_LINT_PATH)
+    argv = ["--repo", str(args.repo.expanduser().resolve())]
+    if args.changed_only:
+        argv.append("--changed-only")
+    if args.json:
+        argv.append("--json")
+    return int(dl.main(argv))
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    try:
+        passed, report, out_json, out_md = execute_verify(
+            args.repo,
+            mode=args.mode,
+            artifact_path=args.artifact,
+            markdown_path=args.markdown,
+        )
+    except Exception as exc:
+        print(f"paf verify ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    for step in report["steps"]:
+        flag = "PASS" if step["passed"] else "FAIL"
+        print(f"[{flag}] {step['stage']}: {step['command']} ({step['duration_sec']:.2f}s)")
+        if not step["passed"] and step["output_tail"]:
+            print(step["output_tail"])
+    print(f"Artifact JSON: {out_json}")
+    print(f"Artifact MD:   {out_md}")
+    return 0 if passed else 2
+
+
+def cmd_record_review(args: argparse.Namespace) -> int:
+    repo = args.repo.expanduser().resolve()
+    head_sha = _git_head_sha(repo)
+    if head_sha == "uncommitted":
+        print("Cannot record review on uncommitted repo without HEAD.", file=sys.stderr)
+        return 1
+    reviews_dir = _git_common_dir(repo) / "paf-reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    findings = []
+    if args.findings_json:
+        findings = json.loads(args.findings_json)
+    receipt = {
+        "schema_version": 1,
+        "head_sha": head_sha,
+        "verdict": args.verdict,
+        "reviewer": args.reviewer,
+        "author_independent": True,
+        "summary": args.summary,
+        "findings": findings,
+        "recorded_at_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    out_file = reviews_dir / f"{head_sha}.json"
+    out_file.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    print(f"Recorded Blind Review ({args.verdict}) for {head_sha[:12]} -> {out_file}")
+    return 0
+
+
+def _wait_for_pr_checks(
+    repo: Path,
+    pr_number: int,
+    expected_head_sha: str,
+    max_wait_sec: int,
+) -> tuple[bool, str]:
+    has_workflows = (repo / ".github" / "workflows").is_dir() and any(
+        (repo / ".github" / "workflows").glob("*.y*ml")
+    )
+    deadline = time.monotonic() + max_wait_sec
+    saw_checks = False
+
+    while time.monotonic() < deadline:
+        # Ensure GitHub's PR headRefOid matches expected_head_sha before evaluating checks
+        head_proc = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", "headRefOid"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if head_proc.returncode == 0 and head_proc.stdout.strip().startswith("{"):
+            pr_head = json.loads(head_proc.stdout).get("headRefOid")
+            if pr_head and pr_head != expected_head_sha:
+                time.sleep(3)
+                continue
+
+        proc = subprocess.run(
+            ["gh", "pr", "checks", str(pr_number), "--json", "name,state,bucket,link"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        raw = (proc.stdout or "").strip()
+        checks: list[dict[str, Any]] = []
+        if raw.startswith("["):
+            try:
+                checks = json.loads(raw)
+            except json.JSONDecodeError:
+                checks = []
+
+        if not checks:
+            if not has_workflows:
+                return True, "No GitHub Actions workflows configured; local verification passed."
+            time.sleep(5)
+            if not saw_checks and (deadline - time.monotonic()) < (max_wait_sec - 15):
+                run_proc = subprocess.run(
+                    [
+                        "gh",
+                        "run",
+                        "list",
+                        "--commit",
+                        expected_head_sha,
+                        "--limit",
+                        "10",
+                        "--json",
+                        "status,conclusion,headSha,databaseId,name",
+                    ],
+                    cwd=repo,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if run_proc.returncode == 0 and run_proc.stdout.strip().startswith("["):
+                    runs = [
+                        r
+                        for r in json.loads(run_proc.stdout)
+                        if r.get("headSha") == expected_head_sha
+                    ]
+                    if runs and all(r.get("status") == "completed" for r in runs):
+                        bad = [
+                            r
+                            for r in runs
+                            if r.get("conclusion") not in ("success", "skipped", "neutral")
+                        ]
+                        if not bad:
+                            ids = ", ".join(str(r.get("databaseId")) for r in runs)
+                            return True, f"All workflow runs ({ids}) succeeded for {expected_head_sha[:12]}."
+                        desc = ", ".join(
+                            f"{r.get('name')}:{r.get('conclusion')}" for r in bad
+                        )
+                        return False, f"Workflow runs failed for {expected_head_sha[:12]}: {desc}"
+            continue
+
+        saw_checks = True
+        buckets = [str(c.get("bucket", "")).lower() for c in checks]
+        if any(b in ("fail", "cancel") for b in buckets):
+            failed = [
+                f"{c.get('name')}:{c.get('state')}"
+                for c in checks
+                if str(c.get("bucket", "")).lower() in ("fail", "cancel")
+            ]
+            return False, "CI checks failed: " + ", ".join(failed)
+        if all(b in ("pass", "skipping") for b in buckets):
+            names = ", ".join(str(c.get("name")) for c in checks)
+            return True, f"All CI checks green ({names})."
+        time.sleep(6)
+
+    return False, f"Timed out after {max_wait_sec}s waiting for PR #{pr_number} checks."
+
+
+def _capture_failed_ci_logs(repo: Path, head_sha: str) -> Path | None:
+    proc = subprocess.run(
+        ["gh", "run", "list", "--commit", head_sha, "--limit", "5", "--json", "databaseId,conclusion"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip().startswith("["):
+        return None
+    runs = json.loads(proc.stdout)
+    failed_runs = [r for r in runs if r.get("conclusion") not in (None, "success", "skipped")]
+    if not failed_runs:
+        return None
+    run_id = str(failed_runs[0]["databaseId"])
+    log_proc = subprocess.run(
+        ["gh", "run", "view", run_id, "--log-failed"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    out_path = _git_common_dir(repo) / f"paf-ci-failure-{head_sha[:12]}.log"
+    out_path.write_text((log_proc.stdout or "") + "\n" + (log_proc.stderr or ""), encoding="utf-8")
+    return out_path
+
+
+def _auto_revert_merge(repo: Path, base_branch: str, bad_merge_sha: str) -> tuple[bool, str]:
+    short_bad = bad_merge_sha[:10]
+    rev_branch = f"revert/auto-{short_bad}"
+    git_common = _git_common_dir(repo)
+    wt_rev = git_common / f"wt-revert-{short_bad}"
+
+    _git(repo, "fetch", "origin", base_branch, check=False)
+    if wt_rev.exists():
+        _git(repo, "worktree", "remove", "--force", str(wt_rev), check=False)
+
+    add_wt = _git(
+        repo,
+        "worktree",
+        "add",
+        "-B",
+        rev_branch,
+        str(wt_rev),
+        f"origin/{base_branch}",
+        check=False,
+    )
+    if add_wt.returncode != 0:
+        return False, f"Failed creating isolated revert worktree: {add_wt.stderr}"
+
+    try:
+        rev = _git(wt_rev, "revert", "--no-edit", bad_merge_sha, check=False)
+        if rev.returncode != 0:
+            _git(wt_rev, "revert", "--abort", check=False)
+            rev_m1 = _git(wt_rev, "revert", "--no-edit", "-m", "1", bad_merge_sha, check=False)
+            if rev_m1.returncode != 0:
+                _git(wt_rev, "revert", "--abort", check=False)
+                return False, f"Automatic git revert failed: {rev.stderr} / {rev_m1.stderr}"
+
+        rev_sha = _git_head_sha(wt_rev)
+        push_env = os.environ.copy()
+        push_env["PAF_PRE_PUSH_VERIFIED"] = rev_sha
+        push_res = subprocess.run(
+            [GIT_BIN, "push", "-u", "origin", rev_branch],
+            cwd=wt_rev,
+            env=push_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if push_res.returncode != 0:
+            return False, f"Failed pushing emergency revert branch: {push_res.stderr}"
+
+        pr_create = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--base",
+                base_branch,
+                "--head",
+                rev_branch,
+                "--title",
+                f"[revert] Auto-revert {short_bad} after post-merge verification failure",
+                "--body",
+                f"Automated post-merge verification failed on `{bad_merge_sha}`. Reverting immediately to restore `{base_branch}` health.",
+            ],
+            cwd=wt_rev,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if pr_create.returncode != 0:
+            return False, f"Failed opening emergency revert PR: {pr_create.stderr}"
+
+        pr_url = pr_create.stdout.strip().splitlines()[-1]
+        pr_view = subprocess.run(
+            ["gh", "pr", "view", rev_branch, "--json", "number"],
+            cwd=wt_rev,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        rev_pr_num = int(json.loads(pr_view.stdout)["number"])
+        rev_ci_ok, rev_ci_msg = _wait_for_pr_checks(
+            wt_rev, rev_pr_num, rev_sha, max_wait_sec=300
+        )
+        if not rev_ci_ok:
+            return (
+                False,
+                f"Revert PR #{rev_pr_num} ({pr_url}) failed CI checks: {rev_ci_msg}",
+            )
+
+        merge_res = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "merge",
+                str(rev_pr_num),
+                "--squash",
+                "--match-head-commit",
+                rev_sha,
+            ],
+            cwd=wt_rev,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if merge_res.returncode != 0:
+            return (
+                False,
+                f"Revert PR #{rev_pr_num} created ({pr_url}) but merge failed: {merge_res.stderr}",
+            )
+        _git(wt_rev, "push", "origin", "--delete", rev_branch, check=False)
+        return True, f"Auto-reverted {short_bad} via {pr_url}"
+    finally:
+        _git(repo, "worktree", "remove", "--force", str(wt_rev), check=False)
+        _git(repo, "branch", "-D", rev_branch, check=False)
+
+
+def cmd_ship(args: argparse.Namespace) -> int:
+    repo = args.repo.expanduser().resolve()
+    cfg = _load_verify_config(repo)
+    zone = str(cfg.get("zone", "autonomous"))
+    default_branch = str(cfg.get("default_branch", "main"))
+    base_branch = str(args.base or default_branch)
+    require_blind = bool(cfg.get("require_blind_review", True))
+
+    branch = _git_branch(repo)
+    if branch in (default_branch, "main", "master", "HEAD", "unknown"):
+        print(
+            f"paf ship REFUSED: current branch is '{branch}'. Always ship from a feature branch.",
+            file=sys.stderr,
+        )
+        return 1
+
+    dirty = _git(repo, "status", "--porcelain", check=True).stdout.strip()
+    if dirty:
+        print(
+            f"paf ship REFUSED: working tree has uncommitted changes:\n{dirty}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Step 1: Run full local pre-push verification
+    try:
+        passed, report, _art_json, art_md = execute_verify(repo, mode="pre-push")
+    except Exception as exc:
+        print(f"paf ship BLOCKED: pre-push verification error: {exc}", file=sys.stderr)
+        return 2
+
+    if not passed:
+        print("paf ship BLOCKED: local pre-push verification failed.", file=sys.stderr)
+        for s in report["steps"]:
+            if not s["passed"]:
+                print(f"--- FAILED STAGE: {s['stage']} ---\n{s['output_tail']}", file=sys.stderr)
+        return 2
+
+    head_sha = report["head_sha"]
+    git_common = _git_common_dir(repo)
+    review_file = git_common / "paf-reviews" / f"{head_sha}.json"
+    review = (
+        json.loads(review_file.read_text(encoding="utf-8"))
+        if review_file.is_file()
+        else None
+    )
+
+    is_guarded_main = zone == "guarded" and base_branch == default_branch
+
+    # Require Blind Adversarial Review BEFORE opening PR or pausing for approval
+    if require_blind:
+        if not review or review.get("verdict") != "approve" or review.get("head_sha") != head_sha:
+            print(
+                f"paf ship BLOCKED: missing SHA-pinned Blind Adversarial Review approval for {head_sha[:12]}.\n"
+                "Spawn an independent read-only `research` subagent on `git diff` + test output, then run:\n"
+                f"  paf record-review --repo {repo} --verdict approve --reviewer blind-subagent --summary '...'",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.dry_run:
+        if is_guarded_main and not args.approved_main:
+            print(
+                f"PAUSED_FOR_MAIN_APPROVAL (dry-run): zone=guarded base={base_branch} sha={head_sha}"
+            )
+            return 0
+        print(
+            f"DRY_RUN_AUTONOMOUS_MERGE_READY: zone={zone} base={base_branch} sha={head_sha}"
+        )
+        return 0
+
+    # Enforce `one PR one head` BEFORE pushing to an existing OPEN PR branch
+    existing_pr = subprocess.run(
+        ["gh", "pr", "view", branch, "--json", "number,url,state,headRefOid"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    open_pr_info: dict[str, Any] | None = None
+    if existing_pr.returncode == 0 and existing_pr.stdout.strip().startswith("{"):
+        parsed_pr = json.loads(existing_pr.stdout)
+        if parsed_pr.get("state") == "OPEN":
+            open_pr_info = parsed_pr
+            remote_pr_head = str(parsed_pr.get("headRefOid") or "")
+            if remote_pr_head and remote_pr_head != head_sha and not args.allow_update_pr:
+                print(
+                    f"paf ship REFUSED ('one PR one head'): OPEN PR #{parsed_pr.get('number')} "
+                    f"already exists on '{branch}' at {remote_pr_head[:12]}, while local HEAD is "
+                    f"{head_sha[:12]}. Open a fresh branch from '{base_branch}' or pass "
+                    "--allow-update-pr only if explicitly intended.",
+                    file=sys.stderr,
+                )
+                return 1
+
+    # Step 2: Push branch (pre-push hook recognizes PAF_PRE_PUSH_VERIFIED=<head_sha>)
+    push_env = os.environ.copy()
+    push_env["PAF_PRE_PUSH_VERIFIED"] = head_sha
+    push_proc = subprocess.run(
+        [GIT_BIN, "push", "-u", "origin", branch],
+        cwd=repo,
+        env=push_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if push_proc.returncode != 0:
+        print(f"paf ship push failed:\n{push_proc.stderr}", file=sys.stderr)
+        return 1
+
+    # Step 3: Create or update GitHub PR with Verification Artifact + Blind Review receipt
+    pr_body_sections = []
+    if args.body:
+        pr_body_sections.append(args.body.strip())
+    pr_body_sections.append(art_md.read_text(encoding="utf-8").strip())
+    full_body = "\n\n---\n\n".join(pr_body_sections)
+
+    pr_number: int
+    pr_url: str
+    if open_pr_info is not None:
+        pr_number = int(open_pr_info["number"])
+        pr_url = str(open_pr_info["url"])
+        subprocess.run(
+            ["gh", "pr", "edit", str(pr_number), "--body", full_body],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+    else:
+        last_subject = _git(repo, "log", "-1", "--pretty=%s").stdout.strip()
+        pr_title = args.title or last_subject
+        create_proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--base",
+                base_branch,
+                "--head",
+                branch,
+                "--title",
+                pr_title,
+                "--body",
+                full_body,
+            ],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if create_proc.returncode != 0:
+            print(f"paf ship PR creation failed:\n{create_proc.stderr}", file=sys.stderr)
+            return 1
+        re_view = subprocess.run(
+            ["gh", "pr", "view", branch, "--json", "number,url"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        info2 = json.loads(re_view.stdout)
+        pr_number = int(info2["number"])
+        pr_url = str(info2["url"])
+
+    # Step 4: Guarded zone targeting main pauses for single human `approve`
+    if is_guarded_main and not args.approved_main:
+        print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (head={head_sha[:12]})")
+        print(
+            f"Once Leo replies 'approve', resume autonomous merge+verify+debug loop via:\n"
+            f"  paf ship --repo {repo} --base {base_branch} --approved-main"
+        )
+        return 0
+
+    # Step 5: Autonomous CI gate bound to expected head SHA
+    print(f"Waiting for CI checks on PR #{pr_number} ({pr_url}) ...")
+    ci_ok, ci_msg = _wait_for_pr_checks(
+        repo, pr_number, head_sha, max_wait_sec=args.max_wait_ci
+    )
+    print(ci_msg)
+    if not ci_ok:
+        log_file = _capture_failed_ci_logs(repo, head_sha)
+        if log_file:
+            print(f"CI_FAILED_NEEDS_FIX: failure logs captured at {log_file}", file=sys.stderr)
+        return 3
+
+    # Step 6: Deterministic atomic squash-merge pinned to exact verified SHA
+    # Omit `--delete-branch` here so linked git worktrees never fail trying to checkout base_branch locally
+    merge_proc = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "merge",
+            str(pr_number),
+            "--squash",
+            "--match-head-commit",
+            head_sha,
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if merge_proc.returncode != 0:
+        print(
+            f"paf ship atomic merge failed (head {head_sha[:12]}):\n{merge_proc.stderr}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Delete remote feature branch explicitly now that squash merge succeeded
+    _git(repo, "push", "origin", "--delete", branch, check=False)
+
+    # Step 7: Obtain exact squash merge commit SHA from PR metadata and run post-merge verification + auto-revert loop
+    _git(repo, "fetch", "origin", base_branch, check=True)
+    merged_sha = ""
+    for _ in range(4):
+        mc_proc = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", "mergeCommit"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if mc_proc.returncode == 0 and mc_proc.stdout.strip().startswith("{"):
+            mc = (json.loads(mc_proc.stdout) or {}).get("mergeCommit") or {}
+            if mc.get("oid"):
+                merged_sha = str(mc["oid"])
+                break
+        time.sleep(1.5)
+    if not merged_sha:
+        merged_sha = _git(repo, "rev-parse", f"origin/{base_branch}", check=True).stdout.strip()
+    else:
+        _git(repo, "fetch", "origin", base_branch, check=True)
+
+    is_linked_wt = (repo / ".git").is_file() or _is_branch_checked_out_elsewhere(repo, base_branch)
+    cleanup_wt: Path | None = None
+    if not is_linked_wt:
+        chk = _git(repo, "checkout", base_branch, check=False)
+        if chk.returncode == 0:
+            _git(repo, "pull", "--ff-only", "origin", base_branch, check=True)
+            _git(repo, "branch", "-D", branch, check=False)
+            post_repo = repo
+        else:
+            wt_tmp = git_common / f"wt-post-merge-{merged_sha[:8]}"
+            _git(repo, "worktree", "add", "--detach", str(wt_tmp), merged_sha, check=True)
+            post_repo = wt_tmp
+            cleanup_wt = wt_tmp
+    else:
+        wt_tmp = git_common / f"wt-post-merge-{merged_sha[:8]}"
+        if wt_tmp.exists():
+            _git(repo, "worktree", "remove", "--force", str(wt_tmp), check=False)
+        _git(repo, "worktree", "add", "--detach", str(wt_tmp), merged_sha, check=True)
+        post_repo = wt_tmp
+        cleanup_wt = wt_tmp
+
+    post_json: Path | None = None
+    try:
+        post_ok, _post_report, post_json, _post_md = execute_verify(post_repo, mode="post-merge")
+    except Exception as exc:
+        print(f"POST_MERGE_VERIFICATION_ERROR: {exc}", file=sys.stderr)
+        post_ok = False
+    finally:
+        if cleanup_wt is not None:
+            _git(repo, "worktree", "remove", "--force", str(cleanup_wt), check=False)
+
+    if post_ok:
+        print(f"SHIPPED_AND_VERIFIED: {pr_url} -> {base_branch}@{merged_sha[:12]}")
+        return 0
+
+    print(
+        f"POST_MERGE_VERIFICATION_FAILED on {base_branch}@{merged_sha[:12]}! Artifact: {post_json}",
+        file=sys.stderr,
+    )
+    if not args.no_auto_revert:
+        rev_ok, rev_msg = _auto_revert_merge(repo, base_branch, merged_sha)
+        print(rev_msg, file=sys.stderr)
+        return 4 if rev_ok else 5
+    return 4
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    ws = args.workspace.expanduser().resolve()
+    canonical_ms_hash = _sha256_file(MEMORY_SCORING_PATH)
+    rows: list[dict[str, Any]] = []
+
+    for child in sorted(ws.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if child.name == RESTRICTED_PRIVATE_REPO:
+            # Hard boundary: inspect ONLY `.agent-factory/manifest.json` if present, nothing else.
+            manifest_only = child / ".agent-factory" / "manifest.json"
+            rows.append(
+                {
+                    "name": child.name,
+                    "restricted": True,
+                    "has_manifest": manifest_only.is_file(),
+                    "has_instance_cfg": None,
+                    "has_verify_cfg": None,
+                    "has_ci": None,
+                    "scoring_status": "private-boundary",
+                    "max_index_bytes": None,
+                    "proposals_count": None,
+                }
+            )
+            continue
+
+        has_git = (child / ".git").exists()
+        has_manifest = (child / ".agent-factory" / "manifest.json").is_file()
+        has_instance = (child / ".agent-factory" / "instance.json").is_file()
+        has_verify = (child / ".agent-verify.json").is_file()
+        has_ci = (child / ".github" / "workflows").is_dir() and any(
+            (child / ".github" / "workflows").glob("*.y*ml")
+        )
+
+        if not (has_git or has_manifest or has_verify):
+            continue
+
+        ms_candidate = child / "scripts" / "memory_scoring.py"
+        if child == FACTORY_ROOT:
+            scoring_status = f"canonical({canonical_ms_hash})"
+        elif ms_candidate.is_symlink():
+            scoring_status = "symlink->canonical"
+        elif ms_candidate.is_file():
+            txt = ms_candidate.read_text(encoding="utf-8", errors="ignore")
+            if "project-agent-factory/framework/scripts/memory_scoring.py" in txt:
+                scoring_status = "wrapper->canonical"
+            else:
+                h = _sha256_file(ms_candidate)
+                scoring_status = "canonical" if h == canonical_ms_hash else f"DRIFT({h})"
+        else:
+            scoring_status = "-"
+
+        index_candidates = [
+            child / "short-term-memory" / "_index.md",
+            child / "storage" / "short_term_memory" / "_index.md",
+            child / "long-term-memory" / "_index.md",
+            child / "journal" / "_index.md",
+        ]
+        present_sizes = [p.stat().st_size for p in index_candidates if p.is_file()]
+        max_idx = max(present_sizes) if present_sizes else 0
+
+        prop_dirs = [child / "proposals", child / "framework" / "proposals"]
+        prop_count = sum(
+            len([f for f in pd.glob("*.md") if f.name.lower() != "readme.md"])
+            for pd in prop_dirs
+            if pd.is_dir()
+        )
+
+        rows.append(
+            {
+                "name": child.name,
+                "restricted": False,
+                "has_git": has_git,
+                "has_manifest": has_manifest,
+                "has_instance_cfg": has_instance,
+                "has_verify_cfg": has_verify,
+                "has_ci": has_ci,
+                "scoring_status": scoring_status,
+                "max_index_bytes": max_idx,
+                "proposals_count": prop_count,
+            }
+        )
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    header = (
+        f"{'Repo':<32} {'Git':<4} {'Manif':<6} {'Verif':<6} {'CI':<4} "
+        f"{'Scoring':<20} {'MaxIdx(B)':<10} {'Props':<5}"
+    )
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        if r["restricted"]:
+            print(
+                f"{r['name']:<32} {'-':<4} {str(r['has_manifest']):<6} {'-':<6} {'-':<4} "
+                f"{'private-boundary':<20} {'-':<10} {'-':<5}"
+            )
+            continue
+        print(
+            f"{r['name']:<32} {'Y' if r['has_git'] else 'N':<4} "
+            f"{'Y' if r['has_manifest'] else 'N':<6} "
+            f"{'Y' if r['has_verify_cfg'] else 'N':<6} "
+            f"{'Y' if r['has_ci'] else 'N':<4} "
+            f"{r['scoring_status']:<20} "
+            f"{r['max_index_bytes']:<10} {r['proposals_count']:<5}"
+        )
+    return 0
+
+
+def cmd_garden(args: argparse.Namespace) -> int:
+    repo = args.repo.expanduser().resolve()
+    dl = _load_module("dune_lint", DUNE_LINT_PATH)
+    findings = dl.lint_repo(repo)
+    print(f"[garden] dune_lint findings: {len(findings)}")
+    for f in findings[:15]:
+        print("  " + f.format())
+
+    if (repo / ".git").exists():
+        base_ref = None
+        for candidate in ("origin/main", "origin/master", "main", "master"):
+            if _git(repo, "rev-parse", "-q", "--verify", candidate, check=False).returncode == 0:
+                base_ref = candidate
+                break
+        if base_ref:
+            merged_out = _git(repo, "branch", "--merged", base_ref, check=False).stdout
+            cur = _git_branch(repo)
+            stale = []
+            for line in merged_out.splitlines():
+                b = line.strip().lstrip("* ").strip()
+                if b and b not in ("main", "master", "stage_test", cur) and not b.startswith("("):
+                    stale.append(b)
+            print(f"[garden] local branches already merged into {base_ref}: {len(stale)}")
+            for b in stale:
+                if args.prune_merged_branches:
+                    _git(repo, "branch", "-d", b, check=False)
+                    print(f"  pruned: {b}")
+                else:
+                    print(f"  stale:  {b} (pass --prune-merged-branches to delete)")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="paf", description=__doc__)
+    sub = p.add_subparsers(dest="subcommand", required=True)
+
+    s_score = sub.add_parser("score", help="rebuild memory scores and clamped indexes")
+    s_score.add_argument("--dir", type=Path, default=Path.cwd())
+    s_score.add_argument("--stats", action="store_true")
+    s_score.set_defaults(func=cmd_score)
+
+    s_lint = sub.add_parser("lint-code", help="run Dune Architecture static checks")
+    s_lint.add_argument("--repo", type=Path, default=Path.cwd())
+    s_lint.add_argument("--changed-only", action="store_true")
+    s_lint.add_argument("--json", action="store_true")
+    s_lint.set_defaults(func=cmd_lint_code)
+
+    s_ver = sub.add_parser("verify", help="execute .agent-verify.json gates")
+    s_ver.add_argument("--repo", type=Path, default=Path.cwd())
+    s_ver.add_argument("--mode", choices=("pre-push", "ci", "post-merge"), default="pre-push")
+    s_ver.add_argument("--artifact", type=Path, default=None)
+    s_ver.add_argument("--markdown", type=Path, default=None)
+    s_ver.set_defaults(func=cmd_verify)
+
+    s_rev = sub.add_parser("record-review", help="record SHA-pinned Blind Review receipt")
+    s_rev.add_argument("--repo", type=Path, default=Path.cwd())
+    s_rev.add_argument("--verdict", choices=("approve", "request_changes"), required=True)
+    s_rev.add_argument("--reviewer", required=True)
+    s_rev.add_argument("--summary", required=True)
+    s_rev.add_argument("--findings-json", default=None)
+    s_rev.set_defaults(func=cmd_record_review)
+
+    s_ship = sub.add_parser("ship", help="autonomous PR + CI + Blind Review + merge + post-merge loop")
+    s_ship.add_argument("--repo", type=Path, default=Path.cwd())
+    s_ship.add_argument("--base", default=None)
+    s_ship.add_argument("--title", default=None)
+    s_ship.add_argument("--body", default=None)
+    s_ship.add_argument("--approved-main", action="store_true")
+    s_ship.add_argument("--allow-update-pr", action="store_true")
+    s_ship.add_argument("--max-wait-ci", type=int, default=600)
+    s_ship.add_argument("--no-auto-revert", action="store_true")
+    s_ship.add_argument("--dry-run", action="store_true")
+    s_ship.set_defaults(func=cmd_ship)
+
+    s_aud = sub.add_parser("audit", help="audit agent and product repos across workspace")
+    s_aud.add_argument(
+        "--workspace",
+        type=Path,
+        default=FACTORY_ROOT.parent,
+    )
+    s_aud.add_argument("--json", action="store_true")
+    s_aud.set_defaults(func=cmd_audit)
+
+    s_gar = sub.add_parser("garden", help="scan repo hygiene and stale merged branches")
+    s_gar.add_argument("--repo", type=Path, default=Path.cwd())
+    s_gar.add_argument("--prune-merged-branches", action="store_true")
+    s_gar.set_defaults(func=cmd_garden)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

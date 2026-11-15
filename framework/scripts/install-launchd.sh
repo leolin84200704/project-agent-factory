@@ -15,12 +15,47 @@
 #           don't compete for the same API quota window)
 set -euo pipefail
 
-AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATUS_ONLY=0
+EXPLICIT_AGENT_DIR=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --status)
+            STATUS_ONLY=1
+            shift
+            ;;
+        --agent-dir)
+            EXPLICIT_AGENT_DIR="${2:-}"
+            if [[ -z "$EXPLICIT_AGENT_DIR" ]]; then
+                echo "error: --agent-dir requires a directory path" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            echo "usage: bash install-launchd.sh [--agent-dir /path/to/instance] [--status]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+SCRIPT_PARENT="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ -n "$EXPLICIT_AGENT_DIR" ]]; then
+    AGENT_ROOT="$(cd "$EXPLICIT_AGENT_DIR" && pwd)"
+elif [[ "$(basename "$SCRIPT_PARENT")" == "framework" && -f "$PWD/CLAUDE.md" ]]; then
+    AGENT_ROOT="$PWD"
+else
+    AGENT_ROOT="$SCRIPT_PARENT"
+fi
+if [[ "$(basename "$AGENT_ROOT")" == "framework" ]]; then
+    echo "error: refusing to install launchd jobs for factory 'framework/' directory; pass --agent-dir /path/to/instance" >&2
+    exit 1
+fi
+
 INSTANCE="$(basename "$AGENT_ROOT")"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
 mkdir -p "$LAUNCH_DIR" "$AGENT_ROOT/logs"
 
-if [[ "${1:-}" == "--status" ]]; then
+if [[ "$STATUS_ONLY" -eq 1 ]]; then
     for label in "com.$INSTANCE.dream" "com.$INSTANCE.weekly"; do
         echo "== $label =="
         launchctl list "$label" 2>/dev/null || echo "  not loaded"

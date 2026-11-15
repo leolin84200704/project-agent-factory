@@ -1,0 +1,15 @@
+{
+  "factory": "project-agent-factory",
+  "role": "canonical-factory",
+  "version": "2.0.0",
+  "updated": "2026-11-15",
+  "provides": [
+    "CORE.md",
+    "AGENTS.md",
+    "bin/paf",
+    "framework/scripts/memory_scoring.py",
+    "framework/checks/dune_lint.py",
+    "framework/hooks",
+    "framework/githooks"
+  ]
+}

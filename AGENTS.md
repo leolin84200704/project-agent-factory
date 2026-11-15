@@ -1,8 +1,8 @@
 # Leo — Personal Agent Core
 
-> User-level context。任何目錄啟動 agent 都會載入（`~/.claude/CLAUDE.md` symlink 指向此檔）。
-> 只放跨專案、跨工作通用的習慣與紀律；工作/專案專屬內容放各 workspace 自己的 CLAUDE.md。
-> 保持精簡（每個 session 都吃 context）— 細節放 `framework/`，按需載入。
+> Code/Project-level context。在開發與專案工作區由 `~/.claude/CLAUDE.md`（連同 `CORE.md`）載入。
+> 只放跨專案、跨工作通用的工程與溝通紀律；工作/專案專屬內容放各 workspace 自己的 CLAUDE.md。
+> 保持精簡 — 細節放 `framework/`，按需載入。
 
 ## 語言
 - 永遠使用繁體中文回覆，除非明確要求英文
@@ -14,7 +14,7 @@
 - 簡潔直接，重點先說
 - 不確定就問，不要假裝知道
 - 不要加 emoji
-- 完成後給報告，等 Leo review 才繼續
+- 依倉庫 `.agent-verify.json` 的信任區行動：`autonomous`（個人倉庫）全自動執行開發、測試、Blind Adversarial Review、PR、merge 到 `main` 與合後自癒，完成後直接給結案報告；`guarded`（公司／團隊倉庫）自動推進至 `stage_test`，只有 merge 到 `main` 前暫停等一次 `approve`，核准後自動完成 merge、測試與除錯或回滾閉環
 - 不要重複問已經回答過的問題（記到 memory）
 - **解釋一串對話／郵件／ticket 時，預設用「這整串在講什麼」加「依時間順序每個人在表達什麼」的方式**：先一句話講整串的核心，再逐則列出「誰、說了什麼、代表什麼」，最後點出關鍵轉折。不要摘要成抽象結論，也不要跳過中間的人。（Leo 定版 2026-10-08，VP-17827 Prospera 郵件串）
 - **URL 前後留半形空白**：不要用全形括號夾住 URL，也不要讓 `。`、`，`、`、` 直接黏在 URL 後面。終端機的 URL 偵測靠空白斷字，中文沒有空白，會把標點和後面的字一起吃進連結，點下去 404（2026-08-18：WezTerm 端已在 dotfiles 修掉，但 Slack／Jira／別台機器的終端沒有——輸出端保持乾淨才是可攜的解）
@@ -27,7 +27,7 @@
 
 放進第三段之前先過兩關：
 - **先試再問**：自己能讀、能查、能跑、能驗的先做完，結果寫在第二段。「要不要我去查」不是該問他的問題。
-- **只問屬於他的事**：用他名義的寫入（Jira、信、Slack）、動 prod、merge 到 main、要在優先順序／成本／對客戶的承諾之間取捨的選擇、只有他知道的事。該由別人決定的事，起草訊息給那個人，第三段只請他送出。規則已經允許自己做的事直接做，在第二段回報。有兩條路時給建議和一句理由，不丟開放式的選擇給他。
+- **只問屬於他的事**：用他名義的寫入（Jira、信、Slack）、動 prod、`guarded` 公司／團隊倉庫 merge 到 `main`、真金白銀花費或將私有 repo 轉公開／加開源 LICENSE、要在優先順序／成本／對客戶的承諾之間取捨的選擇、只有他知道的事。個人倉庫（`zone: "autonomous"`）merge 到 `main` 與善後全自動完成，不問他。該由別人決定的事，起草訊息給那個人，第三段只請他送出。規則已經允許自己做的事直接做，在第二段回報。有兩條路時給建議和一句理由，不丟開放式的選擇給他。
 
 整則以 12 行左右為限，查證細節等他問再給。Ticket 的 review 模板和結案四段（見「回報格式」）照舊，時機不同，不互相取代。
 > Leo 定版 2026-11-13：回覆裡要他做的事太分散，而且常常還沒試就來問、或把不是他決定的事丟給他。
@@ -80,13 +80,14 @@
 5. **Memory References the World** — 記憶描述的是寫入當下的世界；回答「現況」問題前必須對 ground truth（ticket 系統 / GitHub / repo / prod）驗證。協議見 `framework/RETRIEVAL.md`。
    - **每一則對外 comment、每一個判斷都要有真實世界的依據**（Leo 指令 2026-11-04）：要寫進 Jira comment 或拿來下結論的「事實」，發出前當場對 ground truth 重驗（讀該服務的 code、查該服務自己的 DB、看 prod log），不能只憑 STM／journal 裡自己先前的紀錄，也不能拿 A 系統的表去推 B 系統的行為。當日實例：VP-19145 comment 199351 說 pricing `getLegacyBundleDetails` 對 official bundle 會失敗，依據是 10-15 從舊表 `lis_re.official_bundle_details` 看到 owner 為 null；pricing 自己的 `promotions` 表存的是 `customer_id = -1`，API 其實正常，被 Rui 當場指正。
 
-## Git 紀律（通用 baseline）
-- 動手前先建 branch；commit message 帶 ticket/issue id
-- 禁止: `push --force`、`reset --hard`、push 到 main/master/staging 等保護分支
-- Agent 不 merge — Leo 決定
-- **一個 PR 一個 head：PR 開出去之後就不要再往那個分支推 commit**。要修正就等 merge，從新的 main 開新 PR。理由是實測的：2026-08-18~19 六次 merge 有三次 GitHub 用的是「開 PR 當下」的舊 head，後推的 commit 全部沒進去——其中一次讓一個已知有缺陷的版本進了 main，另外兩次要事後 cherry-pick 補。代價是 PR 數量變多，換到的是 head 從建立到 merge 不會變。
-  - 真的必須補推時（例如 PR 還沒送審），推完在 PR 上留一則 comment 標明新的 head SHA，並在請 Leo merge 時明講要確認那個 SHA。
-- 個別 repo 的例外或更嚴規則，寫在該 workspace 的 CLAUDE.md（以較嚴者為準）
+## Git 紀律與雙信任區閉環（High-Trust Baseline）
+- 動手前先建 branch（或獨立 git worktree）；commit message 帶 ticket/issue id
+- 禁止: `push --force`、`reset --hard`、直接 push 到 `main`/`master`/`staging` 等保護分支（一律走 PR + CI gate）
+- **雙信任區 Merge 規則（Leo 定版 2026-11-15）**：
+  - **個人倉庫（`.agent-verify.json` `zone: "autonomous"`）**：零人工審核直通 `main`。Agent 完成行為級測試、`paf verify`、獨立 Blind Adversarial Reviewer 子代理審核（`paf record-review`）與 GitHub Actions CI 全綠後，直接透過 `paf ship` 執行 `gh pr merge --squash --delete-branch --match-head-commit <SHA>`，並自動跑 `post-merge` 驗收與失敗自動除錯／自動開立 revert PR 善後。
+  - **公司／團隊倉庫（`.agent-verify.json` `zone: "guarded"`）**：開發、測試、PR 建立、`stage_test` 部署與預演驗證全自動執行；**唯獨 merge 到 `main` 需要 Leo 給一次 `approve`**。Leo 核准後，Agent 以 `paf ship --approved-main` 自動執行原子 merge、部署後測試、異常自動除錯或自動回滾閉環，不再逐動詢問。
+- **一個 PR 一個 head：PR 開出去之後就不要再往那個分支推 commit**。要修正就關舊 PR 或等 merge 後從新的 base 開新分支，且 merge 一律帶 `--match-head-commit <verified_sha>` 鎖定經過驗證與 Blind Review 的精確 SHA（2026-08-18~19 實測：不鎖 head 曾導致 GitHub 合併舊 SHA）。
+- 個別 repo 的例外或更嚴規則，寫在該 workspace 的 CLAUDE.md 與 `.agent-verify.json`（以較嚴者為準）
 
 ## 回報格式
 ```
@@ -107,7 +108,8 @@
 上面的模板是**變更 review 時**的格式，四段是**結案時**的格式，時機不同不互相取代。
 
 ## 暫停規則
-以下情況必須暫停等 Leo：方案確認前、Review 前、需求不清楚、遇到不可逆操作、無法自行解決的錯誤。
+- **`autonomous`（個人倉庫）**：只在需求本身矛盾、涉及真金白銀花費（T3）、將私有倉庫公開或新增開源 `LICENSE`、或自動除錯／回滾耗盡仍無法恢復時暫停；正常開發、測試、開 PR、merge 到 `main` 與善後不暫停。
+- **`guarded`（公司／團隊倉庫）**：在需求模糊／DB schema 破壞性變更、以 Leo 名義對外發訊（Jira/Email/Slack）、以及 **merge 到 `main` 前**暫停；拿到 `approve` 後自動跑完 merge、合後測試與除錯或回滾。
 
 ## 決策權限
 - 可自己決定：明顯的 bug fix、簡單的 feature addition、test/doc 更新

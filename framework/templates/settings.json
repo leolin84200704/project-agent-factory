@@ -8,29 +8,29 @@
           {
             "type": "command",
             "if": "Bash(git push*)",
-            "command": ".claude/hooks/validate-git-push.sh",
+            "command": "{factory_path}/framework/hooks/validate-git-push.sh",
             "timeout": 5
           },
           {
             "type": "command",
             "if": "Bash(git reset*)",
-            "command": ".claude/hooks/validate-git-destructive.sh",
+            "command": "{factory_path}/framework/hooks/validate-git-destructive.sh",
             "timeout": 5
           },
           {
             "type": "command",
             "if": "Bash(git clean*)",
-            "command": ".claude/hooks/validate-git-destructive.sh",
+            "command": "{factory_path}/framework/hooks/validate-git-destructive.sh",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": ".claude/hooks/remind-engineering-lessons.sh",
+            "command": "{factory_path}/framework/hooks/remind-engineering-lessons.sh",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": ".claude/hooks/validate-repo-language.sh",
+            "command": "{factory_path}/framework/hooks/validate-repo-language.sh",
             "timeout": 5
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/protect-verification-assets.sh",
+            "command": "{factory_path}/framework/hooks/protect-verification-assets.sh",
             "timeout": 5
           }
         ]
@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/validate-outbound-placeholders.sh",
+            "command": "{factory_path}/framework/hooks/validate-outbound-placeholders.sh",
             "timeout": 5
           }
         ]
