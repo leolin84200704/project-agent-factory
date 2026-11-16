@@ -571,7 +571,11 @@ def build_review_prompt(
         if c_body and "<!-- paf-claim:" not in c_body:
             prior_comments.append(c_body[:1500])
     prior_blob = "\n---\n".join(prior_comments) if prior_comments else "(none)"
-    clipped_patch = diff_patch[:32000]
+    clipped_patch = (
+        diff_patch[:64000] + "\n[... diff truncated at 64,000 chars; read remaining files in working directory ...]\n"
+        if len(diff_patch) > 64000
+        else diff_patch
+    )
 
     return (
         f"You are an independent read-only adversarial code reviewer for {repo_slug} PR #{pr_num} "
@@ -580,6 +584,7 @@ def build_review_prompt(
         "correctness, edge-case, and test-coverage invariants, and return ONLY the required JSON schema.\n"
         "Rules:\n"
         "- Do NOT attempt to modify files, run git push, or call gh CLI.\n"
+        "- Batch independent Read/Grep calls in parallel so you finish well within the turn budget.\n"
         "- Set verdict='approve' with blocking_count=0 ONLY if the change is safe, tested, and ready to merge.\n"
         "- Set verdict='request_changes' with blocking_count>=1 for concrete defects, security holes, or missing tests.\n"
         "- Set needs_human_decision=true ONLY if a genuine product/UX trade-off or policy ambiguity requires human input.\n"
@@ -729,7 +734,7 @@ def run_claude_review(
         "--strict-mcp-config",
         "--disable-slash-commands",
         "--max-turns",
-        "15",
+        "35",
     ]
     if model:
         cmd.extend(["--model", model])
