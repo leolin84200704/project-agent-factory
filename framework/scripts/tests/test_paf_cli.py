@@ -767,6 +767,101 @@ def main() -> int:
     else:
         print("PASS D3 expands governance-file coverage and pauses when PR file list is truncated")
 
+    # 22. Truncated or missing PR file list: the local `git diff` fallback counts only when local HEAD is the PR head
+    fb_repo = pathlib.Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-b", "main"], cwd=fb_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=fb_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=fb_repo, check=True)
+    (fb_repo / ".agent-verify.json").write_text(
+        json.dumps({"version": 1, "zone": "autonomous", "default_branch": "main"}), encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=fb_repo, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "feature/plain"], cwd=fb_repo, check=True, capture_output=True)
+    for name in ("a.py", "b.py", "c.py"):
+        (fb_repo / name).write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "plain files"], cwd=fb_repo, check=True, capture_output=True)
+    plain_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fb_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+    fb_fix = fb_repo / ".git" / "pr-fallback.json"
+    other_sha = "d" * 40
+
+    def write_fb_fixture(head_oid: str, files: list[str] | None, changed: int | None) -> None:
+        author = '<!-- paf-consensus: ' + json.dumps(
+            {"v": 1, "role": "author", "model_family": "gemini", "verdict": "open", "head_sha": head_oid}
+        ) + ' -->'
+        approve = '<!-- paf-consensus: ' + json.dumps(
+            {
+                "v": 1,
+                "role": "reviewer",
+                "model_family": "claude",
+                "verdict": "approve",
+                "head_sha": head_oid,
+                "round": 1,
+                "blocking_count": 0,
+            }
+        ) + ' -->'
+        data: dict[str, object] = {
+            "number": 116,
+            "url": "https://example.test/pr/116",
+            "state": "OPEN",
+            "headRefName": "feature/remote",
+            "baseRefName": "main",
+            "headRefOid": head_oid,
+            "body": author,
+            "comments": [{"body": approve}],
+            "reviewDecision": "",
+        }
+        if files is not None:
+            data["files"] = [{"path": f} for f in files]
+        if changed is not None:
+            data["changedFiles"] = changed
+        fb_fix.write_text(json.dumps(data), encoding="utf-8")
+
+    def fb_dry_run() -> subprocess.CompletedProcess[str]:
+        return run_paf(
+            ["merge-consensus", "--repo", str(fb_repo), "--pr-fixture", str(fb_fix), "--dry-run"], cwd=fb_repo
+        )
+
+    # local checkout sits on an unrelated branch with enough files to cover the count: must stay truncated
+    write_fb_fixture(other_sha, ["src/app.py"], 3)
+    r_fb_other = fb_dry_run()
+    # no file list at all and the local checkout is not the PR head: must pause, not pass as "no governance files"
+    write_fb_fixture(other_sha, None, None)
+    r_fb_nofiles = fb_dry_run()
+    # local HEAD is the PR head and holds no governance file: the fallback completes the list, no pause
+    write_fb_fixture(plain_sha, ["a.py"], 3)
+    r_fb_same_plain = fb_dry_run()
+    # local HEAD is the PR head and the truncated-away part holds a governance file: pause and name it
+    (fb_repo / "CORE.md").write_text("rule\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "rule file"], cwd=fb_repo, check=True, capture_output=True)
+    gov_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fb_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+    write_fb_fixture(gov_sha, ["a.py"], 4)
+    r_fb_same_gov = fb_dry_run()
+    if (
+        "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_fb_other.stdout
+        or "truncated-pr-files" not in r_fb_other.stdout
+        or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_fb_nofiles.stdout
+        or "unknown-pr-files" not in r_fb_nofiles.stdout
+        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in r_fb_same_plain.stdout
+        or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_fb_same_gov.stdout
+        or "CORE.md" not in r_fb_same_gov.stdout
+        or "truncated-pr-files" in r_fb_same_gov.stdout
+    ):
+        print(
+            "FAIL file-list fallback bound to PR head: "
+            f"other={r_fb_other.stdout.strip()!r} nofiles={r_fb_nofiles.stdout.strip()!r} "
+            f"same_plain={r_fb_same_plain.stdout.strip()!r} same_gov={r_fb_same_gov.stdout.strip()!r}"
+        )
+        failures += 1
+    else:
+        print("PASS truncated or missing PR file list trusts local git diff only when local HEAD is the PR head")
+
     return 1 if failures else 0
 
 
