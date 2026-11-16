@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import hmac
 import json
@@ -127,6 +128,71 @@ def sha_matches(candidate: Any, expected_full: str) -> bool:
     return exp.startswith(cand) or cand.startswith(exp)
 
 
+class ConsensusKeyError(RuntimeError):
+    """Raised when consensus.key exists on disk but is locked, unreadable, or invalid."""
+
+
+CREDENTIAL_LEAK_PATTERNS = (
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{24,}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+    re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"),
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)\boauth_token\s*:\s*['\"]?[A-Za-z0-9_-]{20,}"),
+)
+
+
+def _key_lock_path(target: Path) -> Path:
+    return target.with_name(f".{target.name}.lock")
+
+
+@contextlib.contextmanager
+def _key_file_lock(
+    target: Path,
+    *,
+    exclusive: bool,
+    wait_sec: float | None = 3.0,
+) -> Any:
+    if not target.parent.is_dir():
+        if exclusive:
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        else:
+            yield
+            return
+    lock_path = _key_lock_path(target)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    locked = False
+    try:
+        if wait_sec is None:
+            fcntl.flock(fd, mode)
+            locked = True
+        else:
+            deadline = time.monotonic() + max(0.0, wait_sec)
+            while True:
+                try:
+                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        raise ConsensusKeyError(
+                            f"Consensus key {target} is temporarily locked by an active sandboxed review; retry once the review finishes."
+                        ) from exc
+                    time.sleep(0.05)
+        yield
+    finally:
+        if locked:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
 def resolve_key_file(cli_key_file: Path | None = None) -> Path:
     if cli_key_file is not None:
         return cli_key_file.expanduser().resolve()
@@ -136,7 +202,12 @@ def resolve_key_file(cli_key_file: Path | None = None) -> Path:
     return DEFAULT_KEY_FILE
 
 
-def init_consensus_key(key_file: Path | None = None, *, rotate: bool = False) -> Path:
+def init_consensus_key(
+    key_file: Path | None = None,
+    *,
+    rotate: bool = False,
+    wait_sec: float = 3.0,
+) -> Path:
     target = resolve_key_file(key_file)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -144,38 +215,55 @@ def init_consensus_key(key_file: Path | None = None, *, rotate: bool = False) ->
     except OSError:
         pass
 
-    if target.is_file() and not rotate:
-        existing = target.read_text(encoding="utf-8").strip()
-        if len(existing) >= 32:
-            os.chmod(target, 0o600)
-            return target
+    with _key_file_lock(target, exclusive=True, wait_sec=wait_sec):
+        if os.path.lexists(target) and not rotate:
+            try:
+                existing = target.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ConsensusKeyError(
+                    f"Consensus key {target} exists on disk but could not be read ({exc}); restore 0600 permissions or pass --rotate."
+                ) from exc
+            if len(existing) >= 32:
+                os.chmod(target, 0o600)
+                return target
 
-    secret_hex = secrets.token_hex(32)
-    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, (secret_hex + "\n").encode("utf-8"))
-    finally:
-        os.close(fd)
-    os.chmod(target, 0o600)
-    return target
+        secret_hex = secrets.token_hex(32)
+        if os.path.lexists(target):
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, (secret_hex + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(target, 0o600)
+        return target
 
 
-def load_consensus_secret(key_file: Path | None = None) -> str | None:
+def load_consensus_secret(
+    key_file: Path | None = None,
+    *,
+    wait_sec: float = 2.0,
+) -> str | None:
     target = resolve_key_file(key_file)
-    if not target.is_file():
+    if not os.path.lexists(target):
         return None
-    for attempt in range(5):
+    with _key_file_lock(target, exclusive=False, wait_sec=wait_sec):
+        if not os.path.lexists(target):
+            return None
         try:
             val = target.read_text(encoding="utf-8").strip()
-            return val if val else None
-        except PermissionError:
-            if attempt < 4:
-                time.sleep(0.15)
-                continue
-            return None
-        except OSError:
-            return None
-    return None
+        except OSError as exc:
+            raise ConsensusKeyError(
+                f"Consensus key {target} exists on disk but is unreadable ({exc}); retry after active review completes or check permissions."
+            ) from exc
+        if len(val) < 16:
+            raise ConsensusKeyError(
+                f"Consensus key {target} exists on disk but is empty or truncated; run `paf init-consensus-key --rotate`."
+            )
+        return val
 
 
 def compute_key_id(secret: str) -> str:
@@ -184,27 +272,36 @@ def compute_key_id(secret: str) -> str:
 
 @contextlib.contextmanager
 def _shield_key_file(key_file: Path | None) -> Any:
-    """Temporarily set 0000 permissions on consensus.key while untrusted model CLI runs."""
+    """Acquire exclusive flock and set 0000 on consensus.key while untrusted model CLI runs."""
     target = key_file.expanduser().resolve() if key_file is not None else None
-    shielded = False
-    if target is not None and target.is_file():
-        try:
-            os.chmod(target, 0o000)
-            shielded = True
-        except OSError:
-            shielded = False
-    try:
+    if target is None or not os.path.lexists(target):
         yield
-    finally:
-        if shielded and target is not None and target.exists():
+        return
+    with _key_file_lock(target, exclusive=True, wait_sec=None):
+        shielded = False
+        if os.path.lexists(target):
             try:
-                os.chmod(target, 0o600)
+                os.chmod(target, 0o000)
+                shielded = True
             except OSError:
-                pass
+                shielded = False
+        try:
+            yield
+        finally:
+            if shielded and os.path.lexists(target):
+                try:
+                    os.chmod(target, 0o600)
+                except OSError:
+                    pass
 
 
 def contains_secret_material(text: str, secret: str | None) -> bool:
-    if not secret or not text:
+    if not text:
+        return False
+    for pat in CREDENTIAL_LEAK_PATTERNS:
+        if pat.search(text):
+            return True
+    if not secret:
         return False
     sec = secret.strip()
     if len(sec) < 16:
@@ -293,10 +390,22 @@ def verify_consensus_hmac(secret: str, marker: dict[str, Any]) -> bool:
     return hmac.compare_digest(sig, expected)
 
 
-def sign_marker_in_place(marker: dict[str, Any], secret: str | None) -> dict[str, Any]:
+def sign_marker_in_place(
+    marker: dict[str, Any],
+    secret: str | None,
+    *,
+    key_file: Path | None = None,
+    require_hmac: bool = False,
+) -> dict[str, Any]:
     if secret:
         marker["key_id"] = compute_key_id(secret)
         marker["sig"] = compute_consensus_hmac(secret, marker)
+        return marker
+    resolved = resolve_key_file(key_file) if key_file is not None else None
+    if require_hmac or (resolved is not None and os.path.lexists(resolved)):
+        raise ConsensusKeyError(
+            f"Refusing to emit unsigned consensus marker when HMAC is required or key file exists ({resolved or DEFAULT_KEY_FILE})."
+        )
     return marker
 
 
@@ -540,22 +649,68 @@ def run_claude_review(
     key_file: Path | None = None,
     timeout_sec: int = 600,
 ) -> dict[str, Any]:
-    deny_rules = [
-        "Read(~/.config/paf/**)",
-        "Read(**/*.key)",
-        "Grep(~/.config/paf/**)",
-        "Glob(~/.config/paf/**)",
+    wt_resolved = worktree.expanduser().resolve()
+    wt_str = str(wt_resolved)
+    wt_glob = "//" + wt_str.lstrip("/") + "/**"
+    allow_rules = [
+        f"Read({wt_glob})",
+        f"Grep({wt_glob})",
+        f"Glob({wt_glob})",
     ]
+    deny_rules = [
+        "Read(~/.config/**)",
+        "Grep(~/.config/**)",
+        "Glob(~/.config/**)",
+        "Read(~/.ssh/**)",
+        "Grep(~/.ssh/**)",
+        "Glob(~/.ssh/**)",
+        "Read(~/.aws/**)",
+        "Grep(~/.aws/**)",
+        "Glob(~/.aws/**)",
+        "Read(~/.gnupg/**)",
+        "Grep(~/.gnupg/**)",
+        "Glob(~/.gnupg/**)",
+        "Read(~/.kube/**)",
+        "Grep(~/.kube/**)",
+        "Glob(~/.kube/**)",
+        "Read(~/.netrc)",
+        "Read(~/.git-credentials)",
+        "Read(~/.npmrc)",
+        "Read(~/.pypirc)",
+        "Read(**/.env)",
+        "Read(**/.env.*)",
+        "Grep(**/.env)",
+        "Grep(**/.env.*)",
+        "Read(**/*.key)",
+        "Read(**/*.pem)",
+        "Grep(**/*.key)",
+        "Grep(**/*.pem)",
+    ]
+    for sys_root in ("/Users", "/home", "/etc", "/root"):
+        if not (wt_str == sys_root or wt_str.startswith(sys_root + "/")):
+            r_glob = "//" + sys_root.lstrip("/") + "/**"
+            deny_rules.extend([f"Read({r_glob})", f"Grep({r_glob})", f"Glob({r_glob})"])
     if key_file is not None:
-        key_dir_slash = "//" + str(key_file.expanduser().resolve().parent).lstrip("/") + "/**"
-        deny_rules.extend(
-            [
-                f"Read({key_dir_slash})",
-                f"Grep({key_dir_slash})",
-                f"Glob({key_dir_slash})",
-            ]
-        )
-    settings_json = json.dumps({"permissions": {"deny": deny_rules}}, separators=(",", ":"))
+        key_dir = str(key_file.expanduser().resolve().parent)
+        if not (wt_str == key_dir or wt_str.startswith(key_dir + "/")):
+            key_dir_slash = "//" + key_dir.lstrip("/") + "/**"
+            deny_rules.extend(
+                [
+                    f"Read({key_dir_slash})",
+                    f"Grep({key_dir_slash})",
+                    f"Glob({key_dir_slash})",
+                ]
+            )
+    settings_json = json.dumps(
+        {
+            "permissions": {
+                "defaultMode": "dontAsk",
+                "allow": allow_rules,
+                "deny": deny_rules,
+            }
+        },
+        separators=(",", ":"),
+    )
     cmd = [
         claude_bin,
         "-p",
@@ -563,10 +718,12 @@ def run_claude_review(
         "json",
         "--json-schema",
         REVIEW_JSON_SCHEMA_STR,
+        "--permission-mode",
+        "dontAsk",
         "--tools",
         "Read,Grep,Glob",
         "--allowedTools",
-        "Read,Grep,Glob",
+        ",".join(allow_rules),
         "--settings",
         settings_json,
         "--strict-mcp-config",
@@ -638,6 +795,35 @@ def _prepare_detached_worktree(repo: Path, head_sha: str, head_branch: str) -> t
         shutil.rmtree(wt, ignore_errors=True)
         return None, False
     return wt, True
+
+
+def _prune_stale_worktrees(repo: Path) -> None:
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    subprocess.run(
+        [git_bin, "worktree", "prune"],
+        cwd=repo,
+        env=_clean_git_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+OUTAGE_SIGNAL_RE = re.compile(
+    r"\b(?:429|500|502|503|504|529)\b|quota|rate[-_ ]?limit|overload|capacity|"
+    r"resource[-_ ]?exhausted|unavailable|timed?\s*out|timeout|connection|network|"
+    r"econn|enotfound|enoent|not found",
+    re.IGNORECASE,
+)
+
+
+def is_quota_or_outage_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (subprocess.TimeoutExpired, TimeoutError, FileNotFoundError, ConnectionError),
+    ):
+        return True
+    return bool(OUTAGE_SIGNAL_RE.search(str(exc)))
 
 
 def _remove_worktree(repo: Path, wt: Path | None, created: bool) -> None:
@@ -768,10 +954,18 @@ class GitHubBus:
         if proc.returncode != 0:
             raise RuntimeError(f"gh pr comment #{pr_number} failed: {proc.stderr.strip()}")
 
-    def merge_pr(self, pr_number: int, *, require_hmac: bool = False) -> tuple[bool, str]:
+    def merge_pr(
+        self,
+        pr_number: int,
+        *,
+        require_hmac: bool = False,
+        allow_same_family_fallback: bool = False,
+        key_file: Path | None = None,
+    ) -> tuple[bool, str]:
         env = _clean_git_env()
-        if self.key_file is not None:
-            env["PAF_CONSENSUS_KEY_FILE"] = str(self.key_file)
+        eff_key = key_file if key_file is not None else self.key_file
+        if eff_key is not None:
+            env["PAF_CONSENSUS_KEY_FILE"] = str(eff_key)
         cmd = [
             sys.executable,
             str(self.paf_bin),
@@ -783,6 +977,8 @@ class GitHubBus:
         ]
         if require_hmac:
             cmd.append("--require-hmac")
+        if allow_same_family_fallback:
+            cmd.append("--allow-same-family-fallback")
         proc = subprocess.run(
             cmd,
             cwd=self.repo_path,
@@ -808,12 +1004,14 @@ class InMemoryGitHubBus:
         repo_path: Path,
         prs: dict[int, dict[str, Any]],
         etag: str = 'W/"etag-init"',
+        key_file: Path | None = None,
     ) -> None:
         self.repo_path = repo_path
         self.prs: dict[int, dict[str, Any]] = json.loads(json.dumps(prs))
         # JSON round-trip turns int keys into strings if dumped together; normalize keys back to int
         self.prs = {int(k): v for k, v in self.prs.items()}
         self.etag = etag
+        self.key_file = key_file
         self._seq = 1
         self.detail_calls = 0
         self.comments_posted: list[tuple[int, str]] = []
@@ -851,16 +1049,18 @@ class InMemoryGitHubBus:
     def merge_pr(
         self,
         pr_number: int,
-        key_file: Path | None = None,
         *,
         require_hmac: bool = False,
+        allow_same_family_fallback: bool = False,
+        key_file: Path | None = None,
     ) -> tuple[bool, str]:
         pr = self.prs[int(pr_number)]
         tmp_fix = self.repo_path / ".git" / f"inmem-pr-{pr_number}.json"
         tmp_fix.write_text(json.dumps(pr), encoding="utf-8")
         env = _clean_git_env()
-        if key_file is not None:
-            env["PAF_CONSENSUS_KEY_FILE"] = str(key_file)
+        eff_key = key_file if key_file is not None else self.key_file
+        if eff_key is not None:
+            env["PAF_CONSENSUS_KEY_FILE"] = str(eff_key)
         cmd = [
             sys.executable,
             str(self._paf_bin),
@@ -873,6 +1073,8 @@ class InMemoryGitHubBus:
         ]
         if require_hmac:
             cmd.append("--require-hmac")
+        if allow_same_family_fallback:
+            cmd.append("--allow-same-family-fallback")
         proc = subprocess.run(
             cmd,
             cwd=self.repo_path,
@@ -974,347 +1176,465 @@ def watch_repo_once(
     claim_ttl_sec: int = 1200,
     claim_settle_sec: float = 2.0,
     review_timeout_sec: int = 660,
+    backoff_sec: int = 180,
     author_fix_hook: Callable[[Path, dict[str, Any], dict[str, Any]], bool] | None = None,
 ) -> dict[str, Any]:
+    """Run one ETag-aware consensus watch tick on `repo`.
+
+    Note: `author_fix_hook` is an optional Python callback for daemon integrations;
+    the standalone `paf watch-prs` CLI executes sandboxed reviews, claim locks, and
+    `author_host` `merge-consensus` while leaving code-fix commits to authoring sessions.
+    """
     repo = repo.expanduser().resolve()
     slug = repo_slug or infer_repo_slug(repo)
     resolved_host = resolve_host_id(host_id)
     resolved_state = (state_dir or DEFAULT_STATE_DIR).expanduser().resolve()
-    resolved_key = resolve_key_file(key_file)
-    secret = load_consensus_secret(resolved_key)
-    enabled_families = tuple(dict.fromkeys(normalize_family(f) for f in families if normalize_family(f)))
+    resolved_state.mkdir(parents=True, exist_ok=True)
 
-    paf_mod = _load_paf_module()
-    cfg = paf_mod._load_verify_config(repo)
-    consensus_cfg = cfg.get("consensus") or {}
-    # Unattended `watch-prs` defaults `require_hmac` to True unless explicitly disabled in `.agent-verify.json`
-    require_hmac = bool(consensus_cfg.get("require_hmac", True))
-    allow_fb = (
-        bool(allow_same_family_fallback)
-        if allow_same_family_fallback is not None
-        else bool(consensus_cfg.get("allow_same_family_fallback", False))
-    )
-    max_rounds = paf_mod._resolve_max_rounds(None, consensus_cfg)
+    # Non-blocking per-repo watcher lock prevents manual + launchd ticks from racing
+    repo_lock_hash = hashlib.sha256(f"{slug}:{repo}".encode("utf-8")).hexdigest()[:12]
+    repo_lock_path = resolved_state / f".watch-{repo_lock_hash}.lock"
+    repo_lock_fd = os.open(str(repo_lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(repo_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {
+                "repo": slug,
+                "not_modified": True,
+                "locked": True,
+                "reviewed": [],
+                "merged": [],
+                "fixed": [],
+                "paused": [],
+            }
 
-    resolved_claude = claude_bin or shutil.which("claude") or str(Path.home() / "bin" / "claude")
-    resolved_agy = agy_bin or shutil.which("agy") or str(Path.home() / "bin" / "agy")
+        _prune_stale_worktrees(repo)
+        resolved_key = resolve_key_file(key_file)
+        secret = load_consensus_secret(resolved_key)
+        enabled_families = tuple(dict.fromkeys(normalize_family(f) for f in families if normalize_family(f)))
 
-    active_bus = bus or GitHubBus(repo, Path(__file__).resolve().parents[2] / "bin" / "paf", resolved_key)
-
-    etags_path = resolved_state / "etags.json"
-    ledger_path = resolved_state / "ledger.json"
-    etags = _load_json_state(etags_path)
-    ledger = _load_json_state(ledger_path)
-
-    prev_etag = etags.get(slug)
-    not_modified, new_etag, open_pr_nums = active_bus.poll_open_prs(slug, prev_etag)
-    if not_modified:
-        return {
-            "repo": slug,
-            "not_modified": True,
-            "reviewed": [],
-            "merged": [],
-            "fixed": [],
-            "paused": [],
-        }
-
-    reviewed: list[int] = []
-    merged: list[int] = []
-    fixed: list[int] = []
-    paused: list[int] = []
-    did_mutate = False
-
-    for pr_num in open_pr_nums:
-        pr_data = active_bus.get_pr(pr_num)
-        if str(pr_data.get("state") or "").upper() != "OPEN":
-            continue
-        markers = paf_mod._extract_consensus_markers(pr_data)
-        if not markers:
-            continue
-
-        verdict = paf_mod.evaluate_pr_consensus(
-            pr_data,
-            max_rounds=max_rounds,
-            hmac_secret=secret,
-            require_hmac=require_hmac,
-            allow_same_family_fallback=allow_fb,
+        paf_mod = _load_paf_module()
+        cfg = paf_mod._load_verify_config(repo)
+        consensus_cfg = cfg.get("consensus") or {}
+        # Unattended `watch-prs` defaults `require_hmac` to True unless explicitly disabled in `.agent-verify.json`
+        require_hmac = bool(consensus_cfg.get("require_hmac", True))
+        allow_fb = (
+            bool(allow_same_family_fallback)
+            if allow_same_family_fallback is not None
+            else bool(consensus_cfg.get("allow_same_family_fallback", False))
         )
-        status = verdict["status"]
-        head_sha = str(pr_data.get("headRefOid") or "").strip()
-        author_family = verdict.get("author_family") or ""
-        author_host = str(verdict.get("author_host") or "").strip().lower()
-        next_round = int(verdict.get("max_round") or 0) + 1
+        max_rounds = paf_mod._resolve_max_rounds(None, consensus_cfg)
 
-        # Case 1: Consensus already approved -> ONLY author_host merges (single-writer rule)
-        if status == "approved":
-            owns_pr = (author_host == resolved_host) if author_host else (author_family in enabled_families)
-            if owns_pr:
-                if isinstance(active_bus, InMemoryGitHubBus):
+        resolved_claude = claude_bin or shutil.which("claude") or str(Path.home() / "bin" / "claude")
+        resolved_agy = agy_bin or shutil.which("agy") or str(Path.home() / "bin" / "agy")
+
+        active_bus = bus or GitHubBus(repo, Path(__file__).resolve().parents[2] / "bin" / "paf", resolved_key)
+
+        etags_path = resolved_state / "etags.json"
+        ledger_path = resolved_state / "ledger.json"
+        etags = _load_json_state(etags_path)
+        ledger = _load_json_state(ledger_path)
+
+        has_backoff_for_slug = any(
+            k.startswith(f"{slug}#") and ":backoff:" in k for k in ledger
+        )
+        prev_etag = None if has_backoff_for_slug else etags.get(slug)
+        not_modified, new_etag, open_pr_nums = active_bus.poll_open_prs(slug, prev_etag)
+        if not_modified:
+            return {
+                "repo": slug,
+                "not_modified": True,
+                "reviewed": [],
+                "merged": [],
+                "fixed": [],
+                "paused": [],
+            }
+
+        reviewed: list[int] = []
+        merged: list[int] = []
+        fixed: list[int] = []
+        paused: list[int] = []
+        did_mutate = False
+        has_pending_work = False
+        ledger_dirty = False
+
+        for pr_num in open_pr_nums:
+            pr_data = active_bus.get_pr(pr_num)
+            if str(pr_data.get("state") or "").upper() != "OPEN":
+                continue
+            markers = paf_mod._extract_consensus_markers(pr_data)
+            if not markers:
+                continue
+
+            verdict = paf_mod.evaluate_pr_consensus(
+                pr_data,
+                max_rounds=max_rounds,
+                hmac_secret=secret,
+                require_hmac=require_hmac,
+                allow_same_family_fallback=allow_fb,
+            )
+            status = verdict["status"]
+            head_sha = str(pr_data.get("headRefOid") or "").strip()
+            author_family = verdict.get("author_family") or ""
+            author_host = str(verdict.get("author_host") or "").strip().lower()
+            next_round = int(verdict.get("max_round") or 0) + 1
+
+            # Case 1: Consensus already approved -> ONLY author_host merges (single-writer rule)
+            if status == "approved":
+                owns_pr = (author_host == resolved_host) if author_host else (author_family in enabled_families)
+                if owns_pr:
                     ok, m_reason = active_bus.merge_pr(
-                        pr_num, key_file=resolved_key, require_hmac=require_hmac
+                        pr_num,
+                        require_hmac=require_hmac,
+                        allow_same_family_fallback=allow_fb,
+                        key_file=resolved_key,
                     )
-                else:
-                    ok, m_reason = active_bus.merge_pr(pr_num, require_hmac=require_hmac)
-                if ok:
-                    merged.append(pr_num)
-                    did_mutate = True
-                elif m_reason == "paused":
-                    paused.append(pr_num)
-            continue
+                    if ok:
+                        merged.append(pr_num)
+                        did_mutate = True
+                    elif m_reason == "paused":
+                        paused.append(pr_num)
+                    else:
+                        # Check runs still pending or transient merge block -> do not cache ETag!
+                        has_pending_work = True
+                continue
 
-        # Case 2: Paused for human tiebreak -> record and do not loop
-        if status == "paused_human_tiebreak":
-            paused.append(pr_num)
-            continue
+            # Case 2: Paused for human tiebreak -> record and do not loop
+            if status == "paused_human_tiebreak":
+                paused.append(pr_num)
+                continue
 
-        # Case 3: Reviewer requested changes -> ONLY author_host runs fix hook (once per SHA+round)
-        if status == "changes_requested":
-            fix_key = f"{slug}#{pr_num}:{head_sha}:fix-r{verdict.get('max_round', 1)}"
-            if (
-                author_host
-                and author_host == resolved_host
-                and author_family in enabled_families
-                and author_fix_hook is not None
-                and not ledger.get(fix_key)
-            ):
-                ledger[fix_key] = dt.datetime.now(dt.timezone.utc).isoformat()
-                _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
-                if author_fix_hook(repo, pr_data, verdict):
-                    fixed.append(pr_num)
-                    did_mutate = True
-            continue
+            # Case 3: Reviewer requested changes -> ONLY author_host runs fix hook (once per SHA+round)
+            if status == "changes_requested":
+                fix_key = f"{slug}#{pr_num}:{head_sha}:fix-r{verdict.get('max_round', 1)}"
+                if (
+                    author_host
+                    and author_host == resolved_host
+                    and author_family in enabled_families
+                    and author_fix_hook is not None
+                    and not ledger.get(fix_key)
+                ):
+                    ledger[fix_key] = dt.datetime.now(dt.timezone.utc).isoformat()
+                    _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                    if author_fix_hook(repo, pr_data, verdict):
+                        fixed.append(pr_num)
+                        did_mutate = True
+                continue
 
-        if status == "pending_review" and not author_family:
-            sys.stderr.write(
-                f"[paf watch-prs] skipping {slug}#{pr_num}: {verdict.get('reason')}\n"
-            )
-            continue
-
-        # Case 4: Pending review -> heterogeneous family reviews (or fresh-session fallback on CLI outage)
-        if status == "pending_review" and author_family:
-            if require_hmac and not secret:
+            if status == "pending_review" and not author_family:
                 sys.stderr.write(
-                    f"[paf watch-prs] skipping {slug}#{pr_num}: consensus.key missing at {resolved_key} (run `paf init-consensus-key`).\n"
-                )
-                continue
-            author_sessions = set(verdict.get("author_session_ids") or [])
-            hetero_candidates = [f for f in enabled_families if f != author_family]
-            review_plan: list[tuple[str, bool]] = [(f, False) for f in hetero_candidates]
-            if allow_fb and author_family in enabled_families and author_sessions:
-                review_plan.append((author_family, True))
-            if not review_plan:
-                continue
-
-            primary_fam, primary_is_fb = review_plan[0]
-            rev_ledger_key = f"{slug}#{pr_num}:{head_sha}:rev:{primary_fam}:{resolved_host}"
-            if ledger.get(rev_ledger_key):
-                continue
-            backoff_key = f"{slug}#{pr_num}:{head_sha}:backoff:{resolved_host}"
-            backoff_until = _parse_iso_utc(str(ledger.get(backoff_key) or ""))
-            if backoff_until is not None and backoff_until > dt.datetime.now(dt.timezone.utc):
-                continue
-
-            # Check existing unexpired claim on GitHub before preparing worktree
-            holder = active_claim_holder(pr_data.get("comments") or [], head_sha, primary_fam)
-            if holder and holder != resolved_host:
-                continue
-
-            # Fail closed BEFORE claiming if detached worktree or diff context cannot be built
-            wt, created_wt = _prepare_detached_worktree(
-                repo, head_sha, str(pr_data.get("headRefName") or "")
-            )
-            if not created_wt or wt is None:
-                ledger[backoff_key] = (
-                    dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=180)
-                ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
-                sys.stderr.write(
-                    f"[paf watch-prs] aborted review on {slug}#{pr_num}: failed creating detached worktree for {head_sha}.\n"
+                    f"[paf watch-prs] skipping {slug}#{pr_num}: {verdict.get('reason')}\n"
                 )
                 continue
 
-            review_result: dict[str, Any] | None = None
-            chosen_fam = primary_fam
-            chosen_fb = primary_is_fb
-            try:
-                diff_stat, diff_patch = _collect_diff_context(
-                    wt, str(pr_data.get("baseRefName") or "main"), head_sha
+            # Case 4: Pending review -> heterogeneous family reviews (or fresh-session fallback on CLI outage)
+            if status == "pending_review" and author_family:
+                if require_hmac and not secret:
+                    has_pending_work = True
+                    sys.stderr.write(
+                        f"[paf watch-prs] skipping {slug}#{pr_num}: consensus.key missing at {resolved_key} (run `paf init-consensus-key`).\n"
+                    )
+                    continue
+                author_sessions = set(verdict.get("author_session_ids") or [])
+                hetero_candidates = [f for f in enabled_families if f != author_family]
+                review_plan: list[tuple[str, bool]] = [(f, False) for f in hetero_candidates]
+                if allow_fb and author_family in enabled_families and author_sessions:
+                    review_plan.append((author_family, True))
+                if not review_plan:
+                    continue
+
+                if any(
+                    ledger.get(f"{slug}#{pr_num}:{head_sha}:rev:{cand_f}:{resolved_host}")
+                    for cand_f, _ in review_plan
+                ):
+                    continue
+
+                primary_fam, primary_is_fb = review_plan[0]
+                backoff_key = f"{slug}#{pr_num}:{head_sha}:backoff:{resolved_host}"
+                now_utc = dt.datetime.now(dt.timezone.utc)
+                backoff_until = _parse_iso_utc(str(ledger.get(backoff_key) or ""))
+                if backoff_until is not None:
+                    if backoff_until > now_utc:
+                        has_pending_work = True
+                        continue
+                    ledger.pop(backoff_key, None)
+                    ledger_dirty = True
+
+                # Check existing unexpired claim on GitHub before preparing worktree
+                holder = active_claim_holder(pr_data.get("comments") or [], head_sha, primary_fam)
+                if holder and holder != resolved_host:
+                    has_pending_work = True
+                    continue
+
+                # Fail closed BEFORE claiming if detached worktree or diff context cannot be built
+                wt, created_wt = _prepare_detached_worktree(
+                    repo, head_sha, str(pr_data.get("headRefName") or "")
                 )
-                if not diff_patch.strip():
+                if not created_wt or wt is None:
+                    has_pending_work = True
                     ledger[backoff_key] = (
-                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=180)
+                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=backoff_sec)
                     ).strftime("%Y-%m-%dT%H:%M:%SZ")
                     _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
                     sys.stderr.write(
-                        f"[paf watch-prs] aborted review on {slug}#{pr_num}: empty diff patch for {head_sha}.\n"
+                        f"[paf watch-prs] aborted review on {slug}#{pr_num}: failed creating detached worktree for {head_sha}.\n"
                     )
                     continue
 
-                if not holder:
-                    exp_iso = (
-                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=claim_ttl_sec)
-                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                    claim_body = (
-                        f"Claiming `{primary_fam}` consensus review on `{head_sha[:12]}` (host `{resolved_host}`).\n\n"
-                        + format_claim_marker(
-                            head_sha=head_sha,
-                            model_family=primary_fam,
-                            host=resolved_host,
-                            expires_at=exp_iso,
-                        )
+                review_result: dict[str, Any] | None = None
+                chosen_fam = primary_fam
+                chosen_fb = primary_is_fb
+                try:
+                    diff_stat, diff_patch = _collect_diff_context(
+                        wt, str(pr_data.get("baseRefName") or "main"), head_sha
                     )
-                    active_bus.post_comment(pr_num, claim_body)
-                    did_mutate = True
-                    if claim_settle_sec > 0:
-                        time.sleep(claim_settle_sec)
-                    refreshed_pr = active_bus.get_pr(pr_num)
-                    if str(refreshed_pr.get("headRefOid") or "").strip() != head_sha:
+                    if not diff_patch.strip():
+                        has_pending_work = True
+                        ledger[backoff_key] = (
+                            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=backoff_sec)
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                        sys.stderr.write(
+                            f"[paf watch-prs] aborted review on {slug}#{pr_num}: empty diff patch for {head_sha}.\n"
+                        )
                         continue
-                    winner = active_claim_holder(refreshed_pr.get("comments") or [], head_sha, primary_fam)
-                    if winner and winner != resolved_host:
-                        continue
-                    pr_data = refreshed_pr
 
-                prompt = build_review_prompt(
-                    repo_slug=slug,
-                    pr_data=pr_data,
-                    diff_stat=diff_stat,
-                    diff_patch=diff_patch,
-                    round_num=max(1, next_round),
-                )
-                last_err: Exception | None = None
-                with _shield_key_file(resolved_key):
-                    for cand_fam, is_fb in review_plan:
-                        try:
-                            if cand_fam == "gemini":
-                                review_result = run_agy_review(
-                                    agy_bin=resolved_agy,
-                                    worktree=wt,
-                                    prompt=prompt,
-                                    model=agy_model,
-                                    timeout_sec=review_timeout_sec,
-                                )
-                            elif cand_fam == "claude":
-                                review_result = run_claude_review(
-                                    claude_bin=resolved_claude,
-                                    worktree=wt,
-                                    prompt=prompt,
-                                    model=claude_model,
-                                    key_file=resolved_key,
-                                    timeout_sec=review_timeout_sec,
-                                )
-                            else:
-                                continue
-                            if is_fb and (
-                                not review_result.get("session_id")
-                                or review_result["session_id"] in author_sessions
-                            ):
-                                review_result = None
-                                raise RuntimeError(
-                                    "Fallback session returned missing or colliding session_id"
-                                )
-                            chosen_fam = cand_fam
-                            chosen_fb = is_fb
-                            break
-                        except Exception as exc:
-                            last_err = exc
+                    if not holder:
+                        exp_iso = (
+                            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=claim_ttl_sec)
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        claim_body = (
+                            f"Claiming `{primary_fam}` consensus review on `{head_sha[:12]}` (host `{resolved_host}`).\n\n"
+                            + format_claim_marker(
+                                head_sha=head_sha,
+                                model_family=primary_fam,
+                                host=resolved_host,
+                                expires_at=exp_iso,
+                            )
+                        )
+                        active_bus.post_comment(pr_num, claim_body)
+                        did_mutate = True
+                        if claim_settle_sec > 0:
+                            time.sleep(claim_settle_sec)
+                        refreshed_pr = active_bus.get_pr(pr_num)
+                        if str(refreshed_pr.get("headRefOid") or "").strip() != head_sha:
+                            has_pending_work = True
                             continue
-                if review_result is None and last_err is not None:
+                        winner = active_claim_holder(refreshed_pr.get("comments") or [], head_sha, primary_fam)
+                        if winner and winner != resolved_host:
+                            has_pending_work = True
+                            continue
+                        pr_data = refreshed_pr
+
+                    prompt = build_review_prompt(
+                        repo_slug=slug,
+                        pr_data=pr_data,
+                        diff_stat=diff_stat,
+                        diff_patch=diff_patch,
+                        round_num=max(1, next_round),
+                    )
+                    last_err: Exception | None = None
+                    claimed_fams = {primary_fam}
+                    with _shield_key_file(resolved_key):
+                        for cand_fam, is_fb in review_plan:
+                            if is_fb and cand_fam not in claimed_fams:
+                                fb_holder = active_claim_holder(
+                                    pr_data.get("comments") or [], head_sha, cand_fam
+                                )
+                                if fb_holder and fb_holder != resolved_host:
+                                    has_pending_work = True
+                                    continue
+                                if not fb_holder:
+                                    fb_exp = (
+                                        dt.datetime.now(dt.timezone.utc)
+                                        + dt.timedelta(seconds=claim_ttl_sec)
+                                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                    fb_claim = (
+                                        f"Claiming `{cand_fam}` outage-fallback review on `{head_sha[:12]}` (host `{resolved_host}`).\n\n"
+                                        + format_claim_marker(
+                                            head_sha=head_sha,
+                                            model_family=cand_fam,
+                                            host=resolved_host,
+                                            expires_at=fb_exp,
+                                        )
+                                    )
+                                    active_bus.post_comment(pr_num, fb_claim)
+                                    did_mutate = True
+                                    if claim_settle_sec > 0:
+                                        time.sleep(claim_settle_sec)
+                                    refreshed_fb = active_bus.get_pr(pr_num)
+                                    if str(refreshed_fb.get("headRefOid") or "").strip() != head_sha:
+                                        has_pending_work = True
+                                        break
+                                    fb_winner = active_claim_holder(
+                                        refreshed_fb.get("comments") or [], head_sha, cand_fam
+                                    )
+                                    if fb_winner and fb_winner != resolved_host:
+                                        has_pending_work = True
+                                        continue
+                                    pr_data = refreshed_fb
+                                claimed_fams.add(cand_fam)
+                            try:
+                                if cand_fam == "gemini":
+                                    review_result = run_agy_review(
+                                        agy_bin=resolved_agy,
+                                        worktree=wt,
+                                        prompt=prompt,
+                                        model=agy_model,
+                                        timeout_sec=review_timeout_sec,
+                                    )
+                                elif cand_fam == "claude":
+                                    review_result = run_claude_review(
+                                        claude_bin=resolved_claude,
+                                        worktree=wt,
+                                        prompt=prompt,
+                                        model=claude_model,
+                                        key_file=resolved_key,
+                                        timeout_sec=review_timeout_sec,
+                                    )
+                                else:
+                                    continue
+                                if is_fb and (
+                                    not review_result.get("session_id")
+                                    or review_result["session_id"] in author_sessions
+                                ):
+                                    review_result = None
+                                    raise RuntimeError(
+                                        "Fallback session returned missing or colliding session_id"
+                                    )
+                                chosen_fam = cand_fam
+                                chosen_fb = is_fb
+                                break
+                            except Exception as exc:
+                                last_err = exc
+                                if not is_fb and not is_quota_or_outage_error(exc):
+                                    # Non-outage failure (e.g., bad CLI flag or invalid JSON): do not silently degrade heterogeneity
+                                    break
+                                continue
+                    if review_result is None and last_err is not None:
+                        has_pending_work = True
+                        ledger[backoff_key] = (
+                            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=backoff_sec)
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                        sys.stderr.write(f"[paf watch-prs] review runner failed on {slug}#{pr_num}: {last_err}\n")
+                        continue
+                finally:
+                    _remove_worktree(repo, wt, created_wt)
+
+                if review_result is None:
+                    has_pending_work = True
+                    continue
+
+                if contains_secret_material(review_result["prose"], secret):
+                    has_pending_work = True
                     ledger[backoff_key] = (
-                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=180)
+                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=max(600, backoff_sec))
                     ).strftime("%Y-%m-%dT%H:%M:%SZ")
                     _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
-                    sys.stderr.write(f"[paf watch-prs] review runner failed on {slug}#{pr_num}: {last_err}\n")
+                    sys.stderr.write(
+                        f"[paf watch-prs] SECURITY BLOCK on {slug}#{pr_num}: reviewer prose contained secret or credential material; refusing to post.\n"
+                    )
                     continue
-            finally:
-                _remove_worktree(repo, wt, created_wt)
 
-            if review_result is None:
-                continue
+                # Re-verify PR headRefOid did not move while headless model was thinking
+                latest_pr = active_bus.get_pr(pr_num)
+                if str(latest_pr.get("headRefOid") or "").strip() != head_sha:
+                    has_pending_work = True
+                    continue
 
-            if contains_secret_material(review_result["prose"], secret):
-                ledger[backoff_key] = (
-                    dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=600)
-                ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
-                sys.stderr.write(
-                    f"[paf watch-prs] SECURITY BLOCK on {slug}#{pr_num}: reviewer prose contained consensus key material; refusing to post.\n"
+                base_branch_name = str(latest_pr.get("baseRefName") or pr_data.get("baseRefName") or "main").strip()
+                marker: dict[str, Any] = {
+                    "v": 1,
+                    "role": "reviewer",
+                    "model_family": chosen_fam,
+                    "verdict": review_result["verdict"],
+                    "head_sha": head_sha.lower(),
+                    "round": max(1, next_round),
+                    "blocking_count": review_result["blocking_count"],
+                    "needs_human_decision": review_result["needs_human_decision"],
+                    "session_id": review_result["session_id"],
+                    "host": resolved_host,
+                    "base_branch": base_branch_name,
+                    "pr_number": int(pr_num),
+                }
+                if chosen_fb:
+                    marker["fallback_same_family"] = True
+                sign_marker_in_place(
+                    marker,
+                    secret,
+                    key_file=resolved_key,
+                    require_hmac=require_hmac,
                 )
-                continue
 
-            # Re-verify PR headRefOid did not move while headless model was thinking
-            latest_pr = active_bus.get_pr(pr_num)
-            if str(latest_pr.get("headRefOid") or "").strip() != head_sha:
-                continue
+                comment_body = (
+                    review_result["prose"].strip()
+                    + "\n\n"
+                    + f"<!-- paf-consensus: {json.dumps(marker, separators=(',', ':'))} -->"
+                )
+                active_bus.post_comment(pr_num, comment_body)
+                reviewed.append(pr_num)
+                did_mutate = True
+                rev_ledger_key = f"{slug}#{pr_num}:{head_sha}:rev:{chosen_fam}:{resolved_host}"
+                ledger[rev_ledger_key] = dt.datetime.now(dt.timezone.utc).isoformat()
+                ledger.pop(backoff_key, None)
+                _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                ledger_dirty = False
 
-            base_branch_name = str(latest_pr.get("baseRefName") or pr_data.get("baseRefName") or "main").strip()
-            marker: dict[str, Any] = {
-                "v": 1,
-                "role": "reviewer",
-                "model_family": chosen_fam,
-                "verdict": review_result["verdict"],
-                "head_sha": head_sha.lower(),
-                "round": max(1, next_round),
-                "blocking_count": review_result["blocking_count"],
-                "needs_human_decision": review_result["needs_human_decision"],
-                "session_id": review_result["session_id"],
-                "host": resolved_host,
-                "base_branch": base_branch_name,
-                "pr_number": int(pr_num),
-            }
-            if chosen_fb:
-                marker["fallback_same_family"] = True
-            sign_marker_in_place(marker, secret)
+                # Immediate single-tick convergence: if this machine ALSO owns the PR (`author_host == resolved_host`)
+                # and review approved, merge right away without waiting 45s for the next poll tick!
+                owns_pr = (author_host == resolved_host) if author_host else False
+                if (
+                    owns_pr
+                    and review_result["verdict"] == "approve"
+                    and review_result["blocking_count"] == 0
+                    and not review_result["needs_human_decision"]
+                ):
+                    ok, m_reason = active_bus.merge_pr(
+                        pr_num,
+                        require_hmac=require_hmac,
+                        allow_same_family_fallback=allow_fb,
+                        key_file=resolved_key,
+                    )
+                    if ok:
+                        merged.append(pr_num)
+                    elif m_reason == "paused":
+                        paused.append(pr_num)
+                    else:
+                        has_pending_work = True
 
-            comment_body = (
-                review_result["prose"].strip()
-                + "\n\n"
-                + f"<!-- paf-consensus: {json.dumps(marker, separators=(',', ':'))} -->"
-            )
-            active_bus.post_comment(pr_num, comment_body)
-            reviewed.append(pr_num)
-            did_mutate = True
-            ledger[rev_ledger_key] = dt.datetime.now(dt.timezone.utc).isoformat()
+        if ledger_dirty:
             _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
 
-            # Immediate single-tick convergence: if this machine ALSO owns the PR (`author_host == resolved_host`)
-            # and review approved, merge right away without waiting 45s for the next poll tick!
-            owns_pr = (author_host == resolved_host) if author_host else False
-            if (
-                owns_pr
-                and review_result["verdict"] == "approve"
-                and review_result["blocking_count"] == 0
-                and not review_result["needs_human_decision"]
-            ):
-                if isinstance(active_bus, InMemoryGitHubBus):
-                    ok, m_reason = active_bus.merge_pr(
-                        pr_num, key_file=resolved_key, require_hmac=require_hmac
-                    )
-                else:
-                    ok, m_reason = active_bus.merge_pr(pr_num, require_hmac=require_hmac)
-                if ok:
-                    merged.append(pr_num)
-                elif m_reason == "paused":
-                    paused.append(pr_num)
+        # Persist ETag ONLY when no PR was left in a non-terminal pending/backoff/CI-waiting state
+        if has_pending_work:
+            if slug in etags:
+                etags.pop(slug, None)
+                _save_json_state(etags_path, etags)
+        else:
+            if did_mutate:
+                _, refreshed_etag, _ = active_bus.poll_open_prs(slug, None)
+                if refreshed_etag:
+                    new_etag = refreshed_etag
+            if new_etag:
+                etags[slug] = new_etag
+                _save_json_state(etags_path, etags)
 
-    # Refresh ETag after self-mutations so the very next idle tick receives HTTP 304 Not Modified
-    if did_mutate:
-        _, refreshed_etag, _ = active_bus.poll_open_prs(slug, None)
-        if refreshed_etag:
-            new_etag = refreshed_etag
-
-    if new_etag:
-        etags[slug] = new_etag
-        _save_json_state(etags_path, etags)
-
-    return {
-        "repo": slug,
-        "not_modified": False,
-        "reviewed": reviewed,
-        "merged": merged,
-        "fixed": fixed,
-        "paused": paused,
-    }
+        return {
+            "repo": slug,
+            "not_modified": False,
+            "reviewed": reviewed,
+            "merged": merged,
+            "fixed": fixed,
+            "paused": paused,
+        }
+    finally:
+        try:
+            fcntl.flock(repo_lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(repo_lock_fd)
 
 
 def discover_watched_repos(workspace: Path, explicit_repos: list[Path] | None) -> list[Path]:

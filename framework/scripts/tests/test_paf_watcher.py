@@ -892,6 +892,185 @@ def main() -> int:
     else:
         print("PASS 9 blocks worktree/diff fail-open, enforces default watch HMAC, shields key 0000, and scrubs secret leaks")
 
+    # 10. Round 2 security & liveness regressions:
+    #     (a) Claude `--allowedTools` is scoped to `Read(//<wt>/**)` with `--permission-mode dontAsk`,
+    #         and generic credentials (`ghp_...`) in reviewer prose are blocked from posting
+    #     (b) Failed review tick does NOT advance/freeze ETag; subsequent tick after backoff expiry retries cleanly
+    #     (c) Unreadable `0000` key file raises `ConsensusKeyError` (never emits unsigned markers or raw tracebacks)
+    #     (d) Non-outage CLI bug does NOT silently trigger same-family fallback; `paf ship` enforces `author_host`
+    allowed_idx = claude_seen_args.index("--allowedTools") if "--allowedTools" in claude_seen_args else -1
+    allowed_val = claude_seen_args[allowed_idx + 1] if 0 <= allowed_idx + 1 < len(claude_seen_args) else ""
+    claude_scoped_ok = (
+        "dontAsk" in claude_seen_args
+        and allowed_val.startswith("Read(//")
+        and allowed_val != "Read,Grep,Glob"
+    )
+
+    fake_gh_tok = "gh" + "p_" + ("A" * 36)
+    gh_leaky_agy = mock_bin / "agy_gh_leak"
+    gh_leaky_agy.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        f"resp = {{'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'Token {fake_gh_tok} here'}}\n"
+        "print(json.dumps({'conversation_id': 'agy-gh-leak', 'status': 'DONE', 'response': json.dumps(resp)}))\n",
+        encoding="utf-8",
+    )
+    gh_leaky_agy.chmod(0o755)
+    bus_gh_leak = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo1,
+        prs={42: make_pr_json(sha1, author_comment, [])},
+        etag='W/"etag-gh-leak"',
+        key_file=key_file,
+    )
+    act_gh_leak = paf_watcher.watch_repo_once(
+        repo=repo1,
+        repo_slug="leolin84200704/demo",
+        host_id="personal-mac",
+        families=("gemini",),
+        state_dir=_mkdtemp("paf-watch-ghleak-"),
+        key_file=key_file,
+        bus=bus_gh_leak,
+        claude_bin=str(fake_claude),
+        agy_bin=str(gh_leaky_agy),
+        claim_settle_sec=0.0,
+    )
+    gh_leaked_posted = any(fake_gh_tok in body for _, body in bus_gh_leak.comments_posted)
+
+    # Backoff retry without ETag bump: Tick 1 fails with `broken_agy` (backoff_sec=0), Tick 2 retries on unchanged ETag!
+    retry_state = _mkdtemp("paf-watch-retry-")
+    bus_retry = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo1,
+        prs={42: make_pr_json(sha1, author_comment, [])},
+        etag='W/"etag-sticky"',
+        key_file=key_file,
+    )
+    act_retry_1 = paf_watcher.watch_repo_once(
+        repo=repo1,
+        repo_slug="leolin84200704/demo",
+        host_id="personal-mac",
+        families=("gemini",),
+        state_dir=retry_state,
+        key_file=key_file,
+        bus=bus_retry,
+        claude_bin=str(fake_claude),
+        agy_bin=str(broken_agy),
+        claim_settle_sec=0.0,
+        backoff_sec=0,
+    )
+    # Force bus.etag back to exact sticky value (even after claim comment) to prove ETag wasn't cached across failure
+    bus_retry.etag = 'W/"etag-sticky"'
+    act_retry_2 = paf_watcher.watch_repo_once(
+        repo=repo1,
+        repo_slug="leolin84200704/demo",
+        host_id="personal-mac",
+        families=("gemini",),
+        state_dir=retry_state,
+        key_file=key_file,
+        bus=bus_retry,
+        claude_bin=str(fake_claude),
+        agy_bin=str(fake_agy),
+        claim_settle_sec=0.0,
+        backoff_sec=0,
+    )
+
+    # Unreadable 0000 key file fails closed loudly (never emits unsigned marker or raw traceback)
+    unreadable_dir = _mkdtemp("paf-unreadable-key-")
+    unreadable_key = unreadable_dir / "consensus.key"
+    unreadable_key.write_text("f" * 64 + "\n", encoding="utf-8")
+    unreadable_key.chmod(0o000)
+    raised_key_err = False
+    try:
+        paf_watcher.load_consensus_secret(unreadable_key, wait_sec=0.05)
+    except paf_watcher.ConsensusKeyError:
+        raised_key_err = True
+    r_post_unreadable = run_paf(
+        [
+            "post-consensus",
+            "--repo",
+            str(repo1_opt),
+            "--pr",
+            "42",
+            "--pr-fixture",
+            str(fix1_opt),
+            "--role",
+            "reviewer",
+            "--family",
+            "gemini",
+            "--verdict",
+            "approve",
+            "--head-sha",
+            sha1,
+        ],
+        cwd=repo1_opt,
+        extra_env={"PAF_CONSENSUS_KEY_FILE": str(unreadable_key)},
+    )
+    r_init_unreadable = run_paf(
+        ["init-consensus-key", "--key-file", str(unreadable_key)],
+        cwd=repo1_opt,
+    )
+    unreadable_key.chmod(0o600)
+
+    # Non-outage CLI bug (`unknown flag`) MUST NOT silently degrade heterogeneity to same-family fallback
+    buggy_agy = mock_bin / "agy_buggy_flag"
+    buggy_agy.write_text("#!/bin/sh\necho 'error: unknown option --bad-flag' >&2\nexit 2\n", encoding="utf-8")
+    buggy_agy.chmod(0o755)
+    bus_no_degrade = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo_fb_live,
+        prs={77: make_pr_json(sha_fb_live, author_fb_comment, [], number=77)},
+        etag='W/"etag-nodegrade"',
+        key_file=key_file,
+    )
+    act_no_degrade = paf_watcher.watch_repo_once(
+        repo=repo_fb_live,
+        repo_slug="leolin84200704/demo",
+        host_id="work-mac",
+        families=("claude", "gemini"),
+        state_dir=_mkdtemp("paf-watch-nodegrade-"),
+        key_file=key_file,
+        bus=bus_no_degrade,
+        claude_bin=str(fake_claude),
+        agy_bin=str(buggy_agy),
+        allow_same_family_fallback=True,
+        claim_settle_sec=0.0,
+    )
+
+    # `paf ship` enforces `author_host` single-writer affinity on existing open PRs
+    fix_ship_host = repo1 / ".git" / "pr_ship_host.json"
+    fix_ship_host.write_text(json.dumps(make_pr_json(sha1, author_comment, [])), encoding="utf-8")
+    r_ship_wrong_host = run_paf(
+        ["ship", "--repo", str(repo1), "--pr-fixture", str(fix_ship_host), "--dry-run"],
+        cwd=repo1,
+        extra_env={"PAF_CONSENSUS_KEY_FILE": str(key_file), "PAF_HOST_ID": "personal-mac"},
+    )
+
+    if (
+        not claude_scoped_ok
+        or act_gh_leak.get("reviewed") != []
+        or gh_leaked_posted
+        or act_retry_1.get("reviewed") != []
+        or act_retry_2.get("not_modified") is True
+        or act_retry_2.get("reviewed") != [42]
+        or not raised_key_err
+        or r_post_unreadable.returncode == 0
+        or "<!-- paf-consensus:" in r_post_unreadable.stdout
+        or r_init_unreadable.returncode == 0
+        or "Traceback" in r_init_unreadable.stderr
+        or act_no_degrade.get("reviewed") != []
+        or r_ship_wrong_host.returncode == 0
+        or "author_host affinity" not in r_ship_wrong_host.stderr
+    ):
+        print(
+            f"FAIL 10 Round-2 regressions:\n"
+            f"  claude_scoped={claude_scoped_ok} allowed_val={allowed_val!r}\n"
+            f"  gh_leak={act_gh_leak} posted={gh_leaked_posted}\n"
+            f"  retry1={act_retry_1} retry2={act_retry_2}\n"
+            f"  raised_key_err={raised_key_err} post_unr_rc={r_post_unreadable.returncode} init_unr={r_init_unreadable.returncode}\n"
+            f"  no_degrade={act_no_degrade} ship_host_rc={r_ship_wrong_host.returncode} ({r_ship_wrong_host.stderr.strip()})"
+        )
+        failures += 1
+    else:
+        print("PASS 10 enforces worktree-only Claude tools, ghp_ leak filter, ETag retry after backoff, loud key-lock errors, and outage-only fallback")
+
     return 1 if failures else 0
 
 

@@ -1284,7 +1284,11 @@ def cmd_check_consensus(args: argparse.Namespace) -> int:
     consensus_cfg = cfg.get("consensus") or {}
     max_rounds = _resolve_max_rounds(args.max_rounds, consensus_cfg)
     pw = _watcher_mod()
-    hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    try:
+        hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    except pw.ConsensusKeyError as exc:
+        print(f"paf check-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
     require_hmac = bool(getattr(args, "require_hmac", False) or consensus_cfg.get("require_hmac", False))
     allow_fb = bool(
         getattr(args, "allow_same_family_fallback", False)
@@ -1334,7 +1338,11 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
     consensus_cfg = cfg.get("consensus") or {}
     max_rounds = _resolve_max_rounds(args.max_rounds, consensus_cfg)
     pw = _watcher_mod()
-    hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    try:
+        hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    except pw.ConsensusKeyError as exc:
+        print(f"paf merge-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
     require_hmac = bool(getattr(args, "require_hmac", False) or consensus_cfg.get("require_hmac", False))
     allow_fb = bool(
         getattr(args, "allow_same_family_fallback", False)
@@ -1455,8 +1463,20 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
         )
         return 2
 
+    consensus_cfg: dict[str, Any] = {}
+    if (repo / ".agent-verify.json").is_file():
+        try:
+            consensus_cfg = (_load_verify_config(repo).get("consensus") or {})
+        except Exception:
+            consensus_cfg = {}
+    require_hmac = bool(getattr(args, "require_hmac", False) or consensus_cfg.get("require_hmac", False))
+
     pw = _watcher_mod()
-    hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    try:
+        hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    except pw.ConsensusKeyError as exc:
+        print(f"paf post-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
     host_id = pw.resolve_host_id(getattr(args, "host", None))
     session_id = _resolve_session_id(getattr(args, "session_id", None))
 
@@ -1465,6 +1485,7 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
         _inf_af, _seen_af, _ah, author_sessions, _bad, _mm = _extract_author_metadata(
             existing_markers,
             hmac_secret=hmac_secret,
+            require_hmac=require_hmac,
             expected_base=str(pr_data.get("baseRefName") or "").strip(),
             expected_pr_num=int(pr_data["number"]) if pr_data.get("number") is not None else 0,
         )
@@ -1496,7 +1517,16 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
         marker["session_id"] = session_id
     if getattr(args, "fallback_same_family", False):
         marker["fallback_same_family"] = True
-    pw.sign_marker_in_place(marker, hmac_secret)
+    try:
+        pw.sign_marker_in_place(
+            marker,
+            hmac_secret,
+            key_file=getattr(args, "key_file", None),
+            require_hmac=(require_hmac and args.verdict in ("open", "approve")),
+        )
+    except pw.ConsensusKeyError as exc:
+        print(f"paf post-consensus REFUSED: {exc}", file=sys.stderr)
+        return 2
 
     prose = ""
     if args.body_file is not None:
@@ -1556,7 +1586,11 @@ def cmd_ship(args: argparse.Namespace) -> int:
     consensus_cfg = cfg.get("consensus") or {}
     max_rounds = _resolve_max_rounds(None, consensus_cfg)
     pw = _watcher_mod()
-    hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    try:
+        hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    except pw.ConsensusKeyError as exc:
+        print(f"paf ship ERROR: {exc}", file=sys.stderr)
+        return 1
     require_hmac = bool(consensus_cfg.get("require_hmac", False))
     allow_fb = bool(consensus_cfg.get("allow_same_family_fallback", False))
     host_id = pw.resolve_host_id(getattr(args, "host", None))
@@ -1642,6 +1676,17 @@ def cmd_ship(args: argparse.Namespace) -> int:
             expected_pr_num=int(parsed_pr["number"]) if parsed_pr.get("number") is not None else 0,
         )
         existing_author_host = inferred_host
+        if (
+            existing_author_host
+            and existing_author_host != host_id
+            and not getattr(args, "allow_cross_host", False)
+        ):
+            print(
+                f"paf ship REFUSED (author_host affinity): PR #{parsed_pr.get('number')} is owned by host '{existing_author_host}' "
+                f"(current host='{host_id}'). Ship/merge from '{existing_author_host}' or pass --allow-cross-host.",
+                file=sys.stderr,
+            )
+            return 2
         if not author_fam and len(seen_af) == 1:
             author_fam = inferred_af
         remote_pr_head = str(parsed_pr.get("headRefOid") or "")
@@ -1668,6 +1713,13 @@ def cmd_ship(args: argparse.Namespace) -> int:
         if not author_fam:
             print(
                 "paf ship BLOCKED: --open-for-consensus requires --author-family (claude, gemini, or openai).",
+                file=sys.stderr,
+            )
+            return 2
+        if require_hmac and not hmac_secret and not args.dry_run:
+            print(
+                "paf ship REFUSED: consensus.require_hmac=true requires a valid consensus.key before opening/updating a PR. "
+                "Run `paf init-consensus-key` first.",
                 file=sys.stderr,
             )
             return 2
@@ -1767,7 +1819,16 @@ def cmd_ship(args: argparse.Namespace) -> int:
             author_marker["pr_number"] = int(open_pr_info["number"])
         if session_id:
             author_marker["session_id"] = session_id
-        pw.sign_marker_in_place(author_marker, hmac_secret)
+        try:
+            pw.sign_marker_in_place(
+                author_marker,
+                hmac_secret,
+                key_file=getattr(args, "key_file", None),
+                require_hmac=require_hmac,
+            )
+        except pw.ConsensusKeyError as exc:
+            print(f"paf ship ERROR: {exc}", file=sys.stderr)
+            return 1
         pr_body_sections.append(f"<!-- paf-consensus: {json.dumps(author_marker, separators=(',', ':'))} -->")
     full_body = "\n\n---\n\n".join(pr_body_sections)
 
@@ -2003,7 +2064,11 @@ def cmd_garden(args: argparse.Namespace) -> int:
 
 def cmd_init_consensus_key(args: argparse.Namespace) -> int:
     pw = _watcher_mod()
-    out_path = pw.init_consensus_key(args.key_file, rotate=args.rotate)
+    try:
+        out_path = pw.init_consensus_key(args.key_file, rotate=args.rotate)
+    except pw.ConsensusKeyError as exc:
+        print(f"paf init-consensus-key ERROR: {exc}", file=sys.stderr)
+        return 1
     print(f"CONSENSUS_KEY_READY: {out_path} (mode 0600)")
     return 0
 
@@ -2201,6 +2266,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_ship.add_argument("--approved-main", action="store_true")
     s_ship.add_argument("--approved-governance", action="store_true")
     s_ship.add_argument("--allow-update-pr", action="store_true")
+    s_ship.add_argument("--allow-cross-host", action="store_true")
     s_ship.add_argument("--max-wait-ci", type=int, default=600)
     s_ship.add_argument("--no-auto-revert", action="store_true")
     s_ship.add_argument("--dry-run", action="store_true")
