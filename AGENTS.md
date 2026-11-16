@@ -83,10 +83,12 @@
 ## Git 紀律與雙信任區閉環（High-Trust Baseline）
 - 動手前先建 branch（或獨立 git worktree）；commit message 帶 ticket/issue id
 - 禁止: `push --force`、`reset --hard`、直接 push 到 `main`/`master`/`staging` 等保護分支（一律走 PR + CI gate）
-- **雙信任區 Merge 規則（Leo 定版 2026-11-15）**：
-  - **個人倉庫（`.agent-verify.json` `zone: "autonomous"`）**：零人工審核直通 `main`。Agent 完成行為級測試、`paf verify`、獨立 Blind Adversarial Reviewer 子代理審核（`paf record-review`）與 GitHub Actions CI 全綠後，直接透過 `paf ship` 執行 `gh pr merge --squash --delete-branch --match-head-commit <SHA>`，並自動跑 `post-merge` 驗收與失敗自動除錯／自動開立 revert PR 善後。
-  - **公司／團隊倉庫（`.agent-verify.json` `zone: "guarded"`）**：開發、測試、PR 建立、`stage_test` 部署與預演驗證全自動執行；**唯獨 merge 到 `main` 需要 Leo 給一次 `approve`**。Leo 核准後，Agent 以 `paf ship --approved-main` 自動執行原子 merge、部署後測試、異常自動除錯或自動回滾閉環，不再逐動詢問。
-- **一個 PR 一個 head：PR 開出去之後就不要再往那個分支推 commit**。要修正就關舊 PR 或等 merge 後從新的 base 開新分支，且 merge 一律帶 `--match-head-commit <verified_sha>` 鎖定經過驗證與 Blind Review 的精確 SHA（2026-08-18~19 實測：不鎖 head 曾導致 GitHub 合併舊 SHA）。
+- **雙信任區與雙異質模型 PR 共識自動 Merge 通則（Leo 定版 2026-11-15）**：
+  - **雙異質模型 PR 共識（Cross-Model Consensus）**：PR 由兩個異質模型家族（如 `claude` 與 `gemini`）直接在 GitHub PR 上獨立審查、攻防討論，直到對最新 `headRefOid` 留下 SHA-pinned `approve` 共識簽章（`<!-- paf-consensus: {...} -->`，由 `paf post-consensus` / `paf check-consensus` 讀寫與驗簽）。只有在超過 3 輪死鎖或涉及消費者 UX／產品偏好決策（`needs_human_decision: true`）時才詢問 Leo。
+  - **達成共識後自己 Merge（零多餘詢問）**：
+    - **個人倉庫（`.agent-verify.json` `zone: "autonomous"`）**：零人工審核直通 `main`。一旦雙異質模型對最新 SHA 達成共識且 GitHub Actions CI 全綠，完成簽核或監看的 Agent **必須立即自己執行原子合併**（`paf merge-consensus` 或 `paf post-consensus --auto-merge` -> `gh pr merge --squash --match-head-commit <SHA>`）、刪除遠端分支、執行 `post-merge` 驗收與失敗自動開立 revert PR 善後。若前一筆剛合入 `main` 的 PR 造成相鄰行衝突，直接從新 `main` 重建分支、跑過測試與 CI 後自己合併，**絕不在達成共識後再請 Leo 按 merge**。
+    - **公司／團隊倉庫（`.agent-verify.json` `zone: "guarded"`）**：對 `staging` / `stage_test` 等預演分支同樣在達成共識與測試全綠後由 Agent 自己合併並驗證；**唯獨 merge 到公司 `main` 需要先完成雙模型共識與 CI，再等 Leo 給一次 `approve`**。Leo 核准後，Agent 以 `paf merge-consensus --approved-main`（或 `paf ship --approved-main`）自動執行原子 merge、部署後測試、異常自動除錯或自動回滾閉環，不再逐動詢問。
+- **PR 分支更新與鎖定 SHA**：日常單輪交付維持一個 PR 一個 head；進入雙模型 PR 共識討論時，允許在同一支未合併 PR 上推共識修正 commit（`paf ship --open-for-consensus`），但任何舊 SHA 的簽章立即失效，最終 merge 一律帶 `--match-head-commit <verified_sha>` 鎖定雙方共識簽核且 CI 全綠的精確 SHA（2026-08-18~19 實測：不鎖 head 曾導致 GitHub 合併舊 SHA）。
 - 個別 repo 的例外或更嚴規則，寫在該 workspace 的 CLAUDE.md 與 `.agent-verify.json`（以較嚴者為準）
 
 ## 回報格式

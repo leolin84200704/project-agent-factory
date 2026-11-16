@@ -1,37 +1,41 @@
 ---
 name: ship
-description: Ship a verified feature branch through the Two-Zone High-Trust loop (`paf ship`): push, open PR with Verification Artifact, pass GitHub Actions CI, squash-merge with `--match-head-commit`, verify post-merge health, and auto-revert on regression.
+description: Ship a verified feature branch through Cross-Model PR Consensus and the Two-Zone High-Trust loop (`paf ship` / `paf post-consensus` / `paf merge-consensus`): open PR, converge to heterogeneous model consensus, auto-merge with `--match-head-commit` upon consensus + green CI, verify post-merge health, and auto-revert on regression.
 ---
 
-# High-Trust Ship & Post-Merge Loop (`paf ship`)
+# High-Trust Ship & Cross-Model Consensus Loop (`paf`)
 
 Use this skill after committing changes on a feature branch (never on `main`/`master`) with a clean working tree.
 
-## Trust Zones (`.agent-verify.json`)
+## Standing General Rule: Auto-Merge Upon Dual-Model Consensus
 
-1. **`zone: "autonomous"` (Personal Repositories)**
-   - **Zero human calls required for merging to `main`.**
-   - Prerequisites:
-     1. Clean working tree (`git status --porcelain` empty; stage files by explicit path, never `git add -A`).
-     2. Passing `paf verify --repo . --mode pre-push`.
-     3. Passing Blind Adversarial Review receipt (`paf record-review --verdict approve`) pinned to `HEAD`.
-   - Command:
-     ```bash
-     paf ship --repo . --title "[scope] Concise English summary" --body "Context and test evidence"
-     ```
-   - Lifecycle executed automatically:
-     1. Pushes feature branch (honoring `pre-push` hook without duplicate test execution on the already-verified SHA).
-     2. Creates or updates the PR with the SHA-pinned Verification Artifact and Blind Review receipt.
-     3. Waits for GitHub Actions CI checks to turn green; on CI failure, captures `gh run view --log-failed` into `<git-common-dir>/paf-ci-failure-<sha>.log` so you can debug, open a clean commit/PR, and re-verify.
-     4. Executes atomic `gh pr merge --squash --delete-branch --match-head-commit <HEAD_SHA>`.
-     5. Syncs `main` and runs `paf verify --mode post-merge`.
-     6. If `post-merge` fails, automatically creates and merges a `revert/auto-<sha>` PR to restore `main` health immediately.
+1. Every PR goes through **heterogeneous dual-model review** (`claude` <-> `gemini`) directly via SHA-pinned GitHub PR comments (`<!-- paf-consensus: {...} -->`).
+2. **Once heterogeneous consensus (`verdict: "approve"` on the latest `headRefOid`) and GitHub Actions CI pass, merge immediately yourself — NEVER ask Leo to press merge** in `zone: "autonomous"` repos or on `zone: "guarded"` staging-class branches (`staging`, `stage_test`). If another PR landed on `main` first and created an adjacent conflict, rebuild cleanly onto `main`, re-verify tests + CI, and merge automatically.
+3. Escalate to Leo ONLY when:
+   - Consensus exceeds `max_rounds` (default `3`) without approval (`PAUSED_FOR_CONSENSUS_TIEBREAK`),
+   - A product/UX preference trade-off requires his call (`--needs-human-decision`), or
+   - `zone: "guarded"` targets company `main` (`PAUSED_FOR_MAIN_APPROVAL` — single `approve`, after which `--approved-main` completes the merge, verification, and self-heal/revert loop autonomously).
 
-2. **`zone: "guarded"` (Company / Team Repositories)**
-   - Staging/test branches ship autonomously.
-   - Targeting `main` runs Steps 1–2 above and pauses cleanly with `PAUSED_FOR_MAIN_APPROVAL`, returning the PR URL and verified SHA for Leo's single `approve`.
-   - Once Leo replies `approve`, immediately resume without further prompts:
-     ```bash
-     paf ship --repo . --base main --approved-main
-     ```
-   - `paf ship --approved-main` completes CI check verification, atomic `--match-head-commit` squash-merge, post-deploy verification, and automatic debug/fix or auto-revert to closure.
+## Commands
+
+1. **Author Model — Verify & Open/Update PR for Cross-Model Consensus**:
+   ```bash
+   paf ship --repo . --open-for-consensus --author-family <claude|gemini> \
+     --title "[scope] Concise English summary" --body "Context and test evidence"
+   ```
+2. **Reviewer Model (Heterogeneous Family) — Post Verdict & Auto-Merge on Approve**:
+   ```bash
+   # Request changes during round 1..3:
+   paf post-consensus --repo . --pr <num> --role reviewer --family <gemini|claude> \
+     --verdict request_changes --round 1 --body-file review.md
+
+   # Approve and immediately run CI wait + atomic --match-head-commit merge + post-merge verify:
+   paf post-consensus --repo . --pr <num> --role reviewer --family <gemini|claude> \
+     --verdict approve --round 2 --body-file approve.md --auto-merge
+   ```
+3. **Check or Resume Merge on an Already-Approved Consensus PR**:
+   ```bash
+   paf check-consensus --repo . --pr <num>
+   paf merge-consensus --repo . --pr <num>                  # autonomous or guarded staging
+   paf merge-consensus --repo . --pr <num> --approved-main  # guarded main after Leo's approve
+   ```

@@ -4,13 +4,16 @@
 Shared operational engine for `project-agent-factory` and `personal-agent-factory`.
 
 Commands:
-  paf score          Rebuild memory scores, links, and clamped L2 `_index.md` + `journal/_index.md`
-  paf lint-code      Run Dune Architecture deterministic static checks (`dune_lint.py`)
-  paf verify         Execute `.agent-verify.json` deterministic gates and emit Verification Artifact
-  paf record-review  Record SHA-pinned Blind Adversarial Reviewer receipt in `<git-common-dir>/paf-reviews/`
-  paf ship           Autonomous PR -> CI -> Blind Review -> atomic merge -> post-merge verify -> auto-revert
-  paf audit          Audit agent/product repos for manifest, `.agent-verify.json`, script drift, and index bloat
-  paf garden         Run codebase hygiene checks (dune_lint, stale merged branches, unmerged proposals)
+  paf score            Rebuild memory scores, links, and clamped L2 `_index.md` + `journal/_index.md`
+  paf lint-code        Run Dune Architecture deterministic static checks (`dune_lint.py`)
+  paf verify           Execute `.agent-verify.json` deterministic gates and emit Verification Artifact
+  paf record-review    Record SHA-pinned Blind Adversarial Reviewer receipt in `<git-common-dir>/paf-reviews/`
+  paf check-consensus  Verify SHA-pinned heterogeneous dual-model consensus (`<!-- paf-consensus: ... -->`) on a PR
+  paf post-consensus   Post a SHA-pinned consensus marker comment on a PR (and optionally auto-merge on approve)
+  paf merge-consensus  Atomically merge a PR once heterogeneous dual-model consensus + CI pass, then verify post-merge
+  paf ship             Autonomous PR -> CI -> Consensus / Blind Review -> atomic merge -> post-merge verify -> auto-revert
+  paf audit            Audit agent/product repos for manifest, `.agent-verify.json`, script drift, and index bloat
+  paf garden           Run codebase hygiene checks (dune_lint, stale merged branches, unmerged proposals)
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -596,6 +600,449 @@ def _auto_revert_merge(repo: Path, base_branch: str, bad_merge_sha: str) -> tupl
         _git(repo, "branch", "-D", rev_branch, check=False)
 
 
+CONSENSUS_RE = re.compile(r"<!--\s*paf-consensus:\s*(\{.*?\})\s*-->", re.DOTALL)
+
+
+def _normalize_family(raw: Any) -> str:
+    val = str(raw or "").strip().lower()
+    if not val:
+        return ""
+    if any(k in val for k in ("claude", "opus", "sonnet", "haiku", "anthropic", "fable")):
+        return "claude"
+    if any(k in val for k in ("gemini", "antigravity", "google")):
+        return "gemini"
+    if any(k in val for k in ("gpt", "o1", "o3", "codex", "openai")):
+        return "openai"
+    return val
+
+
+def _sha_matches(candidate: Any, expected_full: str) -> bool:
+    cand = str(candidate or "").strip().lower()
+    exp = expected_full.strip().lower()
+    if len(cand) < 7 or len(exp) < 7:
+        return False
+    return exp.startswith(cand) or cand.startswith(exp)
+
+
+def _extract_consensus_markers(pr_data: dict[str, Any]) -> list[dict[str, Any]]:
+    texts: list[str] = []
+    if pr_data.get("body"):
+        texts.append(str(pr_data["body"]))
+    for comment in pr_data.get("comments") or []:
+        if isinstance(comment, dict) and comment.get("body"):
+            texts.append(str(comment["body"]))
+    markers: list[dict[str, Any]] = []
+    for text in texts:
+        for match in CONSENSUS_RE.finditer(text):
+            try:
+                parsed = json.loads(match.group(1))
+                if isinstance(parsed, dict):
+                    markers.append(parsed)
+            except json.JSONDecodeError:
+                continue
+    return markers
+
+
+def evaluate_pr_consensus(
+    pr_data: dict[str, Any],
+    *,
+    author_family_override: str | None = None,
+    max_rounds: int = 3,
+) -> dict[str, Any]:
+    head_sha = str(pr_data.get("headRefOid") or "").strip()
+    markers = _extract_consensus_markers(pr_data)
+    author_family = _normalize_family(author_family_override)
+    if not author_family:
+        for m in markers:
+            if m.get("role") == "author" or m.get("verdict") == "open":
+                fam = _normalize_family(m.get("model_family") or m.get("author") or m.get("reviewer"))
+                if fam:
+                    author_family = fam
+                    break
+
+    max_round_seen = 0
+    needs_human = False
+    same_family_rejected = False
+    matching_reviews: list[dict[str, Any]] = []
+
+    for m in markers:
+        role = str(m.get("role") or "").strip().lower()
+        verdict = str(m.get("verdict") or "").strip().lower()
+        if role == "author" or verdict == "open":
+            continue
+        if verdict not in ("approve", "request_changes"):
+            continue
+        rnd = int(m.get("round") or 1)
+        if rnd > max_round_seen:
+            max_round_seen = rnd
+        rev_fam = _normalize_family(m.get("model_family") or m.get("reviewer"))
+        if not _sha_matches(m.get("head_sha"), head_sha):
+            continue
+        if bool(m.get("needs_human_decision")):
+            needs_human = True
+        if author_family and rev_fam and rev_fam == author_family:
+            same_family_rejected = True
+            continue
+        if author_family and not rev_fam:
+            continue
+        matching_reviews.append({**m, "normalized_family": rev_fam, "verdict": verdict, "round": rnd})
+
+    if needs_human:
+        return {
+            "status": "paused_human_tiebreak",
+            "reason": "Reviewer flagged needs_human_decision=true on current HEAD.",
+            "head_sha": head_sha,
+            "author_family": author_family or None,
+            "max_round": max_round_seen,
+        }
+
+    if matching_reviews:
+        latest = matching_reviews[-1]
+        blocking = int(latest.get("blocking_count") or 0)
+        if latest["verdict"] == "approve" and blocking == 0:
+            return {
+                "status": "approved",
+                "reason": f"Heterogeneous consensus approved by '{latest['normalized_family']}' on {head_sha[:12]}.",
+                "head_sha": head_sha,
+                "author_family": author_family or None,
+                "reviewer_family": latest["normalized_family"],
+                "round": latest["round"],
+                "max_round": max_round_seen,
+            }
+        if max_round_seen > max_rounds:
+            return {
+                "status": "paused_human_tiebreak",
+                "reason": f"Consensus exceeded max_rounds={max_rounds} (saw round {max_round_seen}) without approval.",
+                "head_sha": head_sha,
+                "author_family": author_family or None,
+                "max_round": max_round_seen,
+            }
+        return {
+            "status": "changes_requested",
+            "reason": f"Latest review on {head_sha[:12]} by '{latest['normalized_family']}' requested changes.",
+            "head_sha": head_sha,
+            "author_family": author_family or None,
+            "reviewer_family": latest["normalized_family"],
+            "max_round": max_round_seen,
+        }
+
+    if max_round_seen > max_rounds:
+        return {
+            "status": "paused_human_tiebreak",
+            "reason": f"Consensus exceeded max_rounds={max_rounds} (saw round {max_round_seen}) without approval.",
+            "head_sha": head_sha,
+            "author_family": author_family or None,
+            "max_round": max_round_seen,
+        }
+
+    if same_family_rejected:
+        reason = (
+            f"Rejected same-family review ('{author_family}'); awaiting heterogeneous reviewer on {head_sha[:12]}."
+        )
+    else:
+        reason = f"No SHA-pinned heterogeneous consensus marker found yet for {head_sha[:12]}."
+    return {
+        "status": "pending_review",
+        "reason": reason,
+        "head_sha": head_sha,
+        "author_family": author_family or None,
+        "max_round": max_round_seen,
+    }
+
+
+def _load_pr_data(repo: Path, pr_ref: str | None, pr_fixture: Path | None = None) -> dict[str, Any]:
+    if pr_fixture is not None:
+        return json.loads(pr_fixture.expanduser().resolve().read_text(encoding="utf-8"))
+    target = pr_ref or _git_branch(repo)
+    proc = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(target),
+            "--json",
+            "number,url,state,headRefName,baseRefName,headRefOid,body,comments",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip().startswith("{"):
+        raise RuntimeError(f"Unable to load PR '{target}': {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def _merge_and_verify_pr(
+    repo: Path,
+    *,
+    pr_number: int,
+    pr_url: str,
+    head_sha: str,
+    branch: str,
+    base_branch: str,
+    max_wait_ci: int,
+    no_auto_revert: bool,
+) -> int:
+    print(f"Waiting for CI checks on PR #{pr_number} ({pr_url}) ...")
+    ci_ok, ci_msg = _wait_for_pr_checks(repo, pr_number, head_sha, max_wait_sec=max_wait_ci)
+    print(ci_msg)
+    if not ci_ok:
+        log_file = _capture_failed_ci_logs(repo, head_sha)
+        if log_file:
+            print(f"CI_FAILED_NEEDS_FIX: failure logs captured at {log_file}", file=sys.stderr)
+        return 3
+
+    # Omit `--delete-branch` here so linked git worktrees never fail trying to checkout base_branch locally
+    merge_proc = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "merge",
+            str(pr_number),
+            "--squash",
+            "--match-head-commit",
+            head_sha,
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if merge_proc.returncode != 0:
+        print(
+            f"paf atomic merge failed (head {head_sha[:12]}):\n{merge_proc.stderr}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if branch and branch not in (base_branch, "main", "master"):
+        _git(repo, "push", "origin", "--delete", branch, check=False)
+
+    _git(repo, "fetch", "origin", base_branch, check=True)
+    merged_sha = ""
+    for _ in range(4):
+        mc_proc = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", "mergeCommit"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if mc_proc.returncode == 0 and mc_proc.stdout.strip().startswith("{"):
+            mc = (json.loads(mc_proc.stdout) or {}).get("mergeCommit") or {}
+            if mc.get("oid"):
+                merged_sha = str(mc["oid"])
+                break
+        time.sleep(1.5)
+    if not merged_sha:
+        merged_sha = _git(repo, "rev-parse", f"origin/{base_branch}", check=True).stdout.strip()
+    else:
+        _git(repo, "fetch", "origin", base_branch, check=True)
+
+    is_linked_wt = (repo / ".git").is_file() or _is_branch_checked_out_elsewhere(repo, base_branch)
+    cleanup_wt: Path | None = None
+    if not is_linked_wt:
+        chk = _git(repo, "checkout", base_branch, check=False)
+        if chk.returncode == 0:
+            _git(repo, "pull", "--ff-only", "origin", base_branch, check=True)
+            if branch and branch not in (base_branch, "main", "master"):
+                _git(repo, "branch", "-D", branch, check=False)
+            post_repo = repo
+        else:
+            wt_tmp = Path(tempfile.mkdtemp(prefix=f"paf-wt-post-merge-{merged_sha[:8]}-"))
+            _git(repo, "worktree", "add", "--detach", str(wt_tmp), merged_sha, check=True)
+            post_repo = wt_tmp
+            cleanup_wt = wt_tmp
+    else:
+        wt_tmp = Path(tempfile.mkdtemp(prefix=f"paf-wt-post-merge-{merged_sha[:8]}-"))
+        _git(repo, "worktree", "add", "--detach", str(wt_tmp), merged_sha, check=True)
+        post_repo = wt_tmp
+        cleanup_wt = wt_tmp
+
+    post_json: Path | None = None
+    try:
+        post_ok, _post_report, post_json, _post_md = execute_verify(post_repo, mode="post-merge")
+    except Exception as exc:
+        print(f"POST_MERGE_VERIFICATION_ERROR: {exc}", file=sys.stderr)
+        post_ok = False
+    finally:
+        if cleanup_wt is not None:
+            _git(repo, "worktree", "remove", "--force", str(cleanup_wt), check=False)
+            shutil.rmtree(cleanup_wt, ignore_errors=True)
+
+    if post_ok:
+        print(f"SHIPPED_AND_VERIFIED: {pr_url} -> {base_branch}@{merged_sha[:12]}")
+        return 0
+
+    print(
+        f"POST_MERGE_VERIFICATION_FAILED on {base_branch}@{merged_sha[:12]}! Artifact: {post_json}",
+        file=sys.stderr,
+    )
+    if not no_auto_revert:
+        rev_ok, rev_msg = _auto_revert_merge(repo, base_branch, merged_sha)
+        print(rev_msg, file=sys.stderr)
+        return 4 if rev_ok else 5
+    return 4
+
+
+def cmd_check_consensus(args: argparse.Namespace) -> int:
+    repo = args.repo.expanduser().resolve()
+    cfg = _load_verify_config(repo)
+    consensus_cfg = cfg.get("consensus") or {}
+    max_rounds = int(args.max_rounds or consensus_cfg.get("max_rounds") or 3)
+    try:
+        pr_data = _load_pr_data(repo, args.pr, args.pr_fixture)
+    except Exception as exc:
+        print(f"paf check-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    verdict = evaluate_pr_consensus(
+        pr_data,
+        author_family_override=args.author_family,
+        max_rounds=max_rounds,
+    )
+    if args.json:
+        print(json.dumps(verdict, indent=2))
+    else:
+        prefix = (
+            "PAUSED_FOR_CONSENSUS_TIEBREAK"
+            if verdict["status"] == "paused_human_tiebreak"
+            else verdict["status"].upper()
+        )
+        print(f"{prefix}: {verdict['reason']}")
+
+    if verdict["status"] == "approved":
+        return 0
+    if verdict["status"] == "paused_human_tiebreak":
+        return 4
+    return 2
+
+
+def cmd_merge_consensus(args: argparse.Namespace) -> int:
+    repo = args.repo.expanduser().resolve()
+    cfg = _load_verify_config(repo)
+    zone = str(cfg.get("zone", "autonomous"))
+    default_branch = str(cfg.get("default_branch", "main"))
+    consensus_cfg = cfg.get("consensus") or {}
+    max_rounds = int(args.max_rounds or consensus_cfg.get("max_rounds") or 3)
+
+    try:
+        pr_data = _load_pr_data(repo, args.pr, args.pr_fixture)
+    except Exception as exc:
+        print(f"paf merge-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if str(pr_data.get("state") or "").upper() != "OPEN":
+        print(f"paf merge-consensus REFUSED: PR #{pr_data.get('number')} state is {pr_data.get('state')}.", file=sys.stderr)
+        return 1
+
+    verdict = evaluate_pr_consensus(
+        pr_data,
+        author_family_override=args.author_family,
+        max_rounds=max_rounds,
+    )
+    if verdict["status"] == "paused_human_tiebreak":
+        print(f"PAUSED_FOR_CONSENSUS_TIEBREAK: {verdict['reason']}", file=sys.stderr)
+        return 4
+    if verdict["status"] != "approved":
+        print(f"paf merge-consensus BLOCKED ({verdict['status']}): {verdict['reason']}", file=sys.stderr)
+        return 2
+
+    head_sha = str(pr_data["headRefOid"])
+    base_branch = str(pr_data.get("baseRefName") or default_branch)
+    branch = str(pr_data.get("headRefName") or "")
+    pr_number = int(pr_data["number"])
+    pr_url = str(pr_data.get("url") or f"PR#{pr_number}")
+    is_guarded_main = zone == "guarded" and base_branch == default_branch
+
+    if is_guarded_main and not args.approved_main:
+        print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (head={head_sha[:12]})")
+        print(
+            f"Dual-model consensus is complete. Once Leo replies 'approve', resume autonomous merge+verify+revert via:\n"
+            f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-main"
+        )
+        return 0
+
+    if args.dry_run:
+        print(f"CONSENSUS_AUTONOMOUS_MERGE_READY: zone={zone} base={base_branch} sha={head_sha}")
+        return 0
+
+    return _merge_and_verify_pr(
+        repo,
+        pr_number=pr_number,
+        pr_url=pr_url,
+        head_sha=head_sha,
+        branch=branch,
+        base_branch=base_branch,
+        max_wait_ci=args.max_wait_ci,
+        no_auto_revert=args.no_auto_revert,
+    )
+
+
+def cmd_post_consensus(args: argparse.Namespace) -> int:
+    repo = args.repo.expanduser().resolve()
+    try:
+        pr_data = _load_pr_data(repo, args.pr)
+    except Exception as exc:
+        print(f"paf post-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    live_head = str(pr_data.get("headRefOid") or "").strip()
+    if args.head_sha and not _sha_matches(args.head_sha, live_head):
+        print(
+            f"paf post-consensus REFUSED: PR #{pr_data.get('number')} moved to {live_head[:12]} "
+            f"(expected {args.head_sha[:12]}).",
+            file=sys.stderr,
+        )
+        return 2
+
+    family = _normalize_family(args.family)
+    marker = {
+        "v": 1,
+        "role": args.role,
+        "model_family": family,
+        "verdict": args.verdict,
+        "head_sha": live_head,
+        "round": args.round,
+        "blocking_count": args.blocking_count,
+        "needs_human_decision": bool(args.needs_human_decision),
+    }
+    prose = ""
+    if args.body_file is not None:
+        prose = args.body_file.expanduser().resolve().read_text(encoding="utf-8").strip()
+    elif args.body:
+        prose = args.body.strip()
+    comment_body = (prose + "\n\n" if prose else "") + f"<!-- paf-consensus: {json.dumps(marker, separators=(',', ':'))} -->"
+
+    post_proc = subprocess.run(
+        ["gh", "pr", "comment", str(pr_data["number"]), "--body", comment_body],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if post_proc.returncode != 0:
+        print(f"paf post-consensus comment failed:\n{post_proc.stderr}", file=sys.stderr)
+        return 1
+    print(post_proc.stdout.strip())
+
+    if args.auto_merge and args.verdict == "approve" and not args.needs_human_decision and args.blocking_count == 0:
+        merge_ns = argparse.Namespace(
+            repo=repo,
+            pr=str(pr_data["number"]),
+            pr_fixture=None,
+            author_family=args.author_family,
+            max_rounds=args.max_rounds,
+            approved_main=args.approved_main,
+            max_wait_ci=args.max_wait_ci,
+            no_auto_revert=args.no_auto_revert,
+            dry_run=False,
+        )
+        return cmd_merge_consensus(merge_ns)
+    return 0
+
+
 def cmd_ship(args: argparse.Namespace) -> int:
     repo = args.repo.expanduser().resolve()
     cfg = _load_verify_config(repo)
@@ -644,17 +1091,59 @@ def cmd_ship(args: argparse.Namespace) -> int:
     )
 
     is_guarded_main = zone == "guarded" and base_branch == default_branch
+    author_fam = _normalize_family(args.author_family)
 
-    # Require Blind Adversarial Review BEFORE opening PR or pausing for approval
-    if require_blind:
-        if not review or review.get("verdict") != "approve" or review.get("head_sha") != head_sha:
-            print(
-                f"paf ship BLOCKED: missing SHA-pinned Blind Adversarial Review approval for {head_sha[:12]}.\n"
-                "Spawn an independent read-only `research` subagent on `git diff` + test output, then run:\n"
-                f"  paf record-review --repo {repo} --verdict approve --reviewer blind-subagent --summary '...'",
-                file=sys.stderr,
-            )
+    if args.open_for_consensus:
+        if not author_fam:
+            print("paf ship BLOCKED: --open-for-consensus requires --author-family (e.g. claude or gemini).", file=sys.stderr)
             return 2
+        if args.dry_run:
+            print(f"DRY_RUN_OPEN_FOR_CONSENSUS_READY: zone={zone} base={base_branch} author={author_fam} sha={head_sha}")
+            return 0
+
+    existing_pr = (
+        subprocess.run(
+            ["gh", "pr", "view", branch, "--json", "number,url,state,headRefOid,body,comments"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if not args.dry_run
+        else None
+    )
+    open_pr_info: dict[str, Any] | None = None
+    pr_consensus_ok = False
+    if existing_pr is not None and existing_pr.returncode == 0 and existing_pr.stdout.strip().startswith("{"):
+        parsed_pr = json.loads(existing_pr.stdout)
+        if parsed_pr.get("state") == "OPEN":
+            open_pr_info = parsed_pr
+            remote_pr_head = str(parsed_pr.get("headRefOid") or "")
+            if remote_pr_head == head_sha:
+                pr_consensus_ok = (
+                    evaluate_pr_consensus(parsed_pr, author_family_override=author_fam or None).get("status")
+                    == "approved"
+                )
+            elif remote_pr_head and not (args.allow_update_pr or args.open_for_consensus):
+                print(
+                    f"paf ship REFUSED ('one PR one head'): OPEN PR #{parsed_pr.get('number')} "
+                    f"already exists on '{branch}' at {remote_pr_head[:12]}, while local HEAD is "
+                    f"{head_sha[:12]}. Open a fresh branch from '{base_branch}' or pass "
+                    "--open-for-consensus / --allow-update-pr for multi-round PR consensus.",
+                    file=sys.stderr,
+                )
+                return 1
+
+    # Require Blind Adversarial Review OR heterogeneous PR consensus BEFORE merging (unless --open-for-consensus)
+    local_review_ok = bool(review and review.get("verdict") == "approve" and review.get("head_sha") == head_sha)
+    if require_blind and not args.open_for_consensus and not (local_review_ok or pr_consensus_ok):
+        print(
+            f"paf ship BLOCKED: missing SHA-pinned approval for {head_sha[:12]}.\n"
+            "Either open for cross-model PR consensus (`paf ship --open-for-consensus --author-family <claude|gemini>`)\n"
+            "or record a blind review receipt (`paf record-review --verdict approve ...`).",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.dry_run:
         if is_guarded_main and not args.approved_main:
@@ -666,30 +1155,6 @@ def cmd_ship(args: argparse.Namespace) -> int:
             f"DRY_RUN_AUTONOMOUS_MERGE_READY: zone={zone} base={base_branch} sha={head_sha}"
         )
         return 0
-
-    # Enforce `one PR one head` BEFORE pushing to an existing OPEN PR branch
-    existing_pr = subprocess.run(
-        ["gh", "pr", "view", branch, "--json", "number,url,state,headRefOid"],
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    open_pr_info: dict[str, Any] | None = None
-    if existing_pr.returncode == 0 and existing_pr.stdout.strip().startswith("{"):
-        parsed_pr = json.loads(existing_pr.stdout)
-        if parsed_pr.get("state") == "OPEN":
-            open_pr_info = parsed_pr
-            remote_pr_head = str(parsed_pr.get("headRefOid") or "")
-            if remote_pr_head and remote_pr_head != head_sha and not args.allow_update_pr:
-                print(
-                    f"paf ship REFUSED ('one PR one head'): OPEN PR #{parsed_pr.get('number')} "
-                    f"already exists on '{branch}' at {remote_pr_head[:12]}, while local HEAD is "
-                    f"{head_sha[:12]}. Open a fresh branch from '{base_branch}' or pass "
-                    "--allow-update-pr only if explicitly intended.",
-                    file=sys.stderr,
-                )
-                return 1
 
     # Step 2: Push branch (pre-push hook recognizes PAF_PRE_PUSH_VERIFIED=<head_sha>)
     push_env = _clean_git_env()
@@ -706,11 +1171,20 @@ def cmd_ship(args: argparse.Namespace) -> int:
         print(f"paf ship push failed:\n{push_proc.stderr}", file=sys.stderr)
         return 1
 
-    # Step 3: Create or update GitHub PR with Verification Artifact + Blind Review receipt
+    # Step 3: Create or update GitHub PR with Verification Artifact (+ Author Consensus Tag when applicable)
     pr_body_sections = []
     if args.body:
         pr_body_sections.append(args.body.strip())
     pr_body_sections.append(art_md.read_text(encoding="utf-8").strip())
+    if author_fam:
+        author_marker = {
+            "v": 1,
+            "role": "author",
+            "model_family": author_fam,
+            "verdict": "open",
+            "head_sha": head_sha,
+        }
+        pr_body_sections.append(f"<!-- paf-consensus: {json.dumps(author_marker, separators=(',', ':'))} -->")
     full_body = "\n\n---\n\n".join(pr_body_sections)
 
     pr_number: int
@@ -760,6 +1234,10 @@ def cmd_ship(args: argparse.Namespace) -> int:
         pr_number = int(info2["number"])
         pr_url = str(info2["url"])
 
+    if args.open_for_consensus:
+        print(f"OPENED_FOR_CONSENSUS: {pr_url} (pr=#{pr_number} head={head_sha[:12]} author={author_fam})")
+        return 0
+
     # Step 4: Guarded zone targeting main pauses for single human `approve`
     if is_guarded_main and not args.approved_main:
         print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (head={head_sha[:12]})")
@@ -769,110 +1247,16 @@ def cmd_ship(args: argparse.Namespace) -> int:
         )
         return 0
 
-    # Step 5: Autonomous CI gate bound to expected head SHA
-    print(f"Waiting for CI checks on PR #{pr_number} ({pr_url}) ...")
-    ci_ok, ci_msg = _wait_for_pr_checks(
-        repo, pr_number, head_sha, max_wait_sec=args.max_wait_ci
+    return _merge_and_verify_pr(
+        repo,
+        pr_number=pr_number,
+        pr_url=pr_url,
+        head_sha=head_sha,
+        branch=branch,
+        base_branch=base_branch,
+        max_wait_ci=args.max_wait_ci,
+        no_auto_revert=args.no_auto_revert,
     )
-    print(ci_msg)
-    if not ci_ok:
-        log_file = _capture_failed_ci_logs(repo, head_sha)
-        if log_file:
-            print(f"CI_FAILED_NEEDS_FIX: failure logs captured at {log_file}", file=sys.stderr)
-        return 3
-
-    # Step 6: Deterministic atomic squash-merge pinned to exact verified SHA
-    # Omit `--delete-branch` here so linked git worktrees never fail trying to checkout base_branch locally
-    merge_proc = subprocess.run(
-        [
-            "gh",
-            "pr",
-            "merge",
-            str(pr_number),
-            "--squash",
-            "--match-head-commit",
-            head_sha,
-        ],
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if merge_proc.returncode != 0:
-        print(
-            f"paf ship atomic merge failed (head {head_sha[:12]}):\n{merge_proc.stderr}",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Delete remote feature branch explicitly now that squash merge succeeded
-    _git(repo, "push", "origin", "--delete", branch, check=False)
-
-    # Step 7: Obtain exact squash merge commit SHA from PR metadata and run post-merge verification + auto-revert loop
-    _git(repo, "fetch", "origin", base_branch, check=True)
-    merged_sha = ""
-    for _ in range(4):
-        mc_proc = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--json", "mergeCommit"],
-            cwd=repo,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if mc_proc.returncode == 0 and mc_proc.stdout.strip().startswith("{"):
-            mc = (json.loads(mc_proc.stdout) or {}).get("mergeCommit") or {}
-            if mc.get("oid"):
-                merged_sha = str(mc["oid"])
-                break
-        time.sleep(1.5)
-    if not merged_sha:
-        merged_sha = _git(repo, "rev-parse", f"origin/{base_branch}", check=True).stdout.strip()
-    else:
-        _git(repo, "fetch", "origin", base_branch, check=True)
-
-    is_linked_wt = (repo / ".git").is_file() or _is_branch_checked_out_elsewhere(repo, base_branch)
-    cleanup_wt: Path | None = None
-    if not is_linked_wt:
-        chk = _git(repo, "checkout", base_branch, check=False)
-        if chk.returncode == 0:
-            _git(repo, "pull", "--ff-only", "origin", base_branch, check=True)
-            _git(repo, "branch", "-D", branch, check=False)
-            post_repo = repo
-        else:
-            wt_tmp = Path(tempfile.mkdtemp(prefix=f"paf-wt-post-merge-{merged_sha[:8]}-"))
-            _git(repo, "worktree", "add", "--detach", str(wt_tmp), merged_sha, check=True)
-            post_repo = wt_tmp
-            cleanup_wt = wt_tmp
-    else:
-        wt_tmp = Path(tempfile.mkdtemp(prefix=f"paf-wt-post-merge-{merged_sha[:8]}-"))
-        _git(repo, "worktree", "add", "--detach", str(wt_tmp), merged_sha, check=True)
-        post_repo = wt_tmp
-        cleanup_wt = wt_tmp
-
-    post_json: Path | None = None
-    try:
-        post_ok, _post_report, post_json, _post_md = execute_verify(post_repo, mode="post-merge")
-    except Exception as exc:
-        print(f"POST_MERGE_VERIFICATION_ERROR: {exc}", file=sys.stderr)
-        post_ok = False
-    finally:
-        if cleanup_wt is not None:
-            _git(repo, "worktree", "remove", "--force", str(cleanup_wt), check=False)
-            shutil.rmtree(cleanup_wt, ignore_errors=True)
-
-    if post_ok:
-        print(f"SHIPPED_AND_VERIFIED: {pr_url} -> {base_branch}@{merged_sha[:12]}")
-        return 0
-
-    print(
-        f"POST_MERGE_VERIFICATION_FAILED on {base_branch}@{merged_sha[:12]}! Artifact: {post_json}",
-        file=sys.stderr,
-    )
-    if not args.no_auto_revert:
-        rev_ok, rev_msg = _auto_revert_merge(repo, base_branch, merged_sha)
-        print(rev_msg, file=sys.stderr)
-        return 4 if rev_ok else 5
-    return 4
 
 
 def _sha256_file(path: Path) -> str:
@@ -1052,11 +1436,54 @@ def build_parser() -> argparse.ArgumentParser:
     s_rev.add_argument("--findings-json", default=None)
     s_rev.set_defaults(func=cmd_record_review)
 
-    s_ship = sub.add_parser("ship", help="autonomous PR + CI + Blind Review + merge + post-merge loop")
+    s_chk_c = sub.add_parser("check-consensus", help="check SHA-pinned heterogeneous dual-model PR consensus")
+    s_chk_c.add_argument("--repo", type=Path, default=Path.cwd())
+    s_chk_c.add_argument("--pr", default=None)
+    s_chk_c.add_argument("--pr-fixture", type=Path, default=None)
+    s_chk_c.add_argument("--author-family", default=None)
+    s_chk_c.add_argument("--max-rounds", type=int, default=None)
+    s_chk_c.add_argument("--json", action="store_true")
+    s_chk_c.set_defaults(func=cmd_check_consensus)
+
+    s_pst_c = sub.add_parser("post-consensus", help="post SHA-pinned consensus marker comment on a PR")
+    s_pst_c.add_argument("--repo", type=Path, default=Path.cwd())
+    s_pst_c.add_argument("--pr", required=True)
+    s_pst_c.add_argument("--role", choices=("author", "reviewer"), default="reviewer")
+    s_pst_c.add_argument("--family", required=True)
+    s_pst_c.add_argument("--verdict", choices=("open", "approve", "request_changes"), required=True)
+    s_pst_c.add_argument("--head-sha", default=None)
+    s_pst_c.add_argument("--round", type=int, default=1)
+    s_pst_c.add_argument("--blocking-count", type=int, default=0)
+    s_pst_c.add_argument("--needs-human-decision", action="store_true")
+    s_pst_c.add_argument("--body", default=None)
+    s_pst_c.add_argument("--body-file", type=Path, default=None)
+    s_pst_c.add_argument("--auto-merge", action="store_true")
+    s_pst_c.add_argument("--author-family", default=None)
+    s_pst_c.add_argument("--max-rounds", type=int, default=None)
+    s_pst_c.add_argument("--approved-main", action="store_true")
+    s_pst_c.add_argument("--max-wait-ci", type=int, default=600)
+    s_pst_c.add_argument("--no-auto-revert", action="store_true")
+    s_pst_c.set_defaults(func=cmd_post_consensus)
+
+    s_mrg_c = sub.add_parser("merge-consensus", help="merge PR atomically once heterogeneous consensus + CI pass")
+    s_mrg_c.add_argument("--repo", type=Path, default=Path.cwd())
+    s_mrg_c.add_argument("--pr", default=None)
+    s_mrg_c.add_argument("--pr-fixture", type=Path, default=None)
+    s_mrg_c.add_argument("--author-family", default=None)
+    s_mrg_c.add_argument("--max-rounds", type=int, default=None)
+    s_mrg_c.add_argument("--approved-main", action="store_true")
+    s_mrg_c.add_argument("--max-wait-ci", type=int, default=600)
+    s_mrg_c.add_argument("--no-auto-revert", action="store_true")
+    s_mrg_c.add_argument("--dry-run", action="store_true")
+    s_mrg_c.set_defaults(func=cmd_merge_consensus)
+
+    s_ship = sub.add_parser("ship", help="autonomous PR + CI + Consensus / Blind Review + merge + post-merge loop")
     s_ship.add_argument("--repo", type=Path, default=Path.cwd())
     s_ship.add_argument("--base", default=None)
     s_ship.add_argument("--title", default=None)
     s_ship.add_argument("--body", default=None)
+    s_ship.add_argument("--open-for-consensus", action="store_true")
+    s_ship.add_argument("--author-family", default=None)
     s_ship.add_argument("--approved-main", action="store_true")
     s_ship.add_argument("--allow-update-pr", action="store_true")
     s_ship.add_argument("--max-wait-ci", type=int, default=600)
