@@ -132,6 +132,10 @@ class ConsensusKeyError(RuntimeError):
     """Raised when consensus.key exists on disk but is locked, unreadable, or invalid."""
 
 
+class ReviewerOutageError(RuntimeError):
+    """Raised strictly on subprocess timeout or recognized API quota/5xx error on stderr."""
+
+
 CREDENTIAL_LEAK_PATTERNS = (
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
@@ -180,9 +184,19 @@ def _key_file_lock(
                 except BlockingIOError as exc:
                     if time.monotonic() >= deadline:
                         raise ConsensusKeyError(
-                            f"Consensus key {target} is temporarily locked by an active sandboxed review; retry once the review finishes."
+                            f"Consensus key {target} is temporarily shielded by an active `paf watch-prs` sandboxed review; wait for the review to finish and retry."
                         ) from exc
                     time.sleep(0.05)
+        # Self-heal if a prior `_shield_key_file` holder died via SIGKILL leaving `shielding` marker behind
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            marker_bytes = os.read(fd, 32)
+            if marker_bytes.startswith(b"shielding") and os.path.lexists(target):
+                os.chmod(target, 0o600)
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+        except OSError:
+            pass
         yield
     finally:
         if locked:
@@ -277,10 +291,12 @@ def _shield_key_file(key_file: Path | None) -> Any:
     if target is None or not os.path.lexists(target):
         yield
         return
+    lock_path = _key_lock_path(target)
     with _key_file_lock(target, exclusive=True, wait_sec=None):
         shielded = False
         if os.path.lexists(target):
             try:
+                lock_path.write_bytes(b"shielding\n")
                 os.chmod(target, 0o000)
                 shielded = True
             except OSError:
@@ -293,6 +309,11 @@ def _shield_key_file(key_file: Path | None) -> Any:
                     os.chmod(target, 0o600)
                 except OSError:
                     pass
+            try:
+                if lock_path.is_file():
+                    lock_path.write_bytes(b"")
+            except OSError:
+                pass
 
 
 def contains_secret_material(text: str, secret: str | None) -> bool:
@@ -596,6 +617,35 @@ def build_review_prompt(
     )
 
 
+STDERR_OUTAGE_RE = re.compile(
+    r"\b(?:429|500|502|503|504|529)\b|"
+    r"quota(?:\s+exhausted|\s+exceeded)?|"
+    r"rate[-_ ]?limit(?:ed|\s+exceeded)?|"
+    r"overloaded_error|resource[-_ ]?exhausted|service\s+unavailable",
+    re.IGNORECASE,
+)
+
+
+def _ensure_executable_binary(bin_path: str, label: str) -> str:
+    resolved = shutil.which(bin_path)
+    if resolved:
+        return resolved
+    if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
+        return bin_path
+    raise RuntimeError(f"{label} reviewer binary missing or not executable: {bin_path}")
+
+
+def _raise_for_reviewer_exit(label: str, proc: subprocess.CompletedProcess[str]) -> None:
+    stderr_text = (proc.stderr or "").strip()
+    stdout_tail = (proc.stdout or "").strip()[:300]
+    if proc.returncode != 2 and stderr_text and STDERR_OUTAGE_RE.search(stderr_text):
+        raise ReviewerOutageError(
+            f"{label} API quota/outage (rc={proc.returncode}): {stderr_text[:300]}"
+        )
+    detail = stderr_text[:300] or stdout_tail
+    raise RuntimeError(f"{label} exited with code {proc.returncode}: {detail}")
+
+
 def run_agy_review(
     *,
     agy_bin: str,
@@ -604,8 +654,9 @@ def run_agy_review(
     model: str | None = None,
     timeout_sec: int = 660,
 ) -> dict[str, Any]:
+    exec_agy = _ensure_executable_binary(agy_bin, "agy")
     cmd = [
-        agy_bin,
+        exec_agy,
         "--output-format",
         "json",
         "--json-schema",
@@ -617,19 +668,20 @@ def run_agy_review(
         cmd.extend(["--model", model])
     cmd.append(f"-p={prompt}")
 
-    proc = subprocess.run(
-        cmd,
-        cwd=worktree,
-        env=_scrubbed_reviewer_env("gemini"),
-        text=True,
-        capture_output=True,
-        timeout=timeout_sec,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"agy exited with code {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[:400]}"
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=worktree,
+            env=_scrubbed_reviewer_env("gemini"),
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewerOutageError(f"agy timed out after {timeout_sec}s") from exc
+    if proc.returncode != 0:
+        _raise_for_reviewer_exit("agy", proc)
     envelope = _parse_last_json_dict(proc.stdout)
     status = str(envelope.get("status") or "").strip().upper()
     if status in ("ERROR", "FAILED", "CANCELLED") or envelope.get("is_error") is True:
@@ -716,8 +768,9 @@ def run_claude_review(
         },
         separators=(",", ":"),
     )
+    exec_claude = _ensure_executable_binary(claude_bin, "claude")
     cmd = [
-        claude_bin,
+        exec_claude,
         "-p",
         "--output-format",
         "json",
@@ -725,6 +778,8 @@ def run_claude_review(
         REVIEW_JSON_SCHEMA_STR,
         "--permission-mode",
         "dontAsk",
+        "--setting-sources",
+        "user",
         "--tools",
         "Read,Grep,Glob",
         "--allowedTools",
@@ -739,20 +794,21 @@ def run_claude_review(
     if model:
         cmd.extend(["--model", model])
 
-    proc = subprocess.run(
-        cmd,
-        cwd=worktree,
-        env=_scrubbed_reviewer_env("claude"),
-        input=prompt,
-        text=True,
-        capture_output=True,
-        timeout=timeout_sec,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"claude exited with code {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[:400]}"
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=worktree,
+            env=_scrubbed_reviewer_env("claude"),
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewerOutageError(f"claude timed out after {timeout_sec}s") from exc
+    if proc.returncode != 0:
+        _raise_for_reviewer_exit("claude", proc)
     envelope = _parse_last_json_dict(proc.stdout)
     if envelope.get("is_error") is True:
         raise RuntimeError(f"claude reported is_error=true: {envelope.get('result')}")
@@ -814,21 +870,8 @@ def _prune_stale_worktrees(repo: Path) -> None:
     )
 
 
-OUTAGE_SIGNAL_RE = re.compile(
-    r"\b(?:429|500|502|503|504|529)\b|quota|rate[-_ ]?limit|overload|capacity|"
-    r"resource[-_ ]?exhausted|unavailable|timed?\s*out|timeout|connection|network|"
-    r"econn|enotfound|enoent|not found",
-    re.IGNORECASE,
-)
-
-
 def is_quota_or_outage_error(exc: BaseException) -> bool:
-    if isinstance(
-        exc,
-        (subprocess.TimeoutExpired, TimeoutError, FileNotFoundError, ConnectionError),
-    ):
-        return True
-    return bool(OUTAGE_SIGNAL_RE.search(str(exc)))
+    return isinstance(exc, ReviewerOutageError)
 
 
 def _remove_worktree(repo: Path, wt: Path | None, created: bool) -> None:
@@ -849,7 +892,15 @@ def _remove_worktree(repo: Path, wt: Path | None, created: bool) -> None:
 def _collect_diff_context(worktree: Path, base_branch: str, head_sha: str) -> tuple[str, str]:
     git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
     env = _clean_git_env()
-    for base_ref in (f"origin/{base_branch}", base_branch, f"{head_sha}~1"):
+    subprocess.run(
+        [git_bin, "fetch", "origin", base_branch],
+        cwd=worktree,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for base_ref in (f"origin/{base_branch}", base_branch):
         stat_p = subprocess.run(
             [git_bin, "diff", "--stat", f"{base_ref}...{head_sha}"],
             cwd=worktree,
@@ -867,16 +918,9 @@ def _collect_diff_context(worktree: Path, base_branch: str, head_sha: str) -> tu
                 capture_output=True,
                 check=False,
             )
-            return stat_p.stdout.strip(), patch_p.stdout
-    show_p = subprocess.run(
-        [git_bin, "show", "--stat", "--patch", head_sha],
-        cwd=worktree,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    return "", show_p.stdout
+            if patch_p.returncode == 0:
+                return stat_p.stdout.strip(), patch_p.stdout
+    return "", ""
 
 
 class GitHubBus:
@@ -1283,7 +1327,15 @@ def watch_repo_once(
             head_sha = str(pr_data.get("headRefOid") or "").strip()
             author_family = verdict.get("author_family") or ""
             author_host = str(verdict.get("author_host") or "").strip().lower()
-            next_round = int(verdict.get("max_round") or 0) + 1
+            prior_reviewed_shas = {
+                str(m.get("head_sha") or "").strip().lower()[:12]
+                for m in markers
+                if str(m.get("role") or "").strip().lower() != "author"
+                and str(m.get("verdict") or "").strip().lower() in ("approve", "request_changes")
+                and HEX_SHA_RE.match(str(m.get("head_sha") or "").strip().lower())
+                and not sha_matches(m.get("head_sha"), head_sha)
+            }
+            next_round = max(int(verdict.get("max_round") or 0) + 1, len(prior_reviewed_shas) + 1)
 
             # Case 1: Consensus already approved -> ONLY author_host merges (single-writer rule)
             if status == "approved":
@@ -1327,6 +1379,13 @@ def watch_repo_once(
                         did_mutate = True
                 continue
 
+            if status == "pending_review" and require_hmac and not secret:
+                has_pending_work = True
+                sys.stderr.write(
+                    f"[paf watch-prs] skipping {slug}#{pr_num}: consensus.key missing at {resolved_key} (run `paf init-consensus-key`).\n"
+                )
+                continue
+
             if status == "pending_review" and not author_family:
                 sys.stderr.write(
                     f"[paf watch-prs] skipping {slug}#{pr_num}: {verdict.get('reason')}\n"
@@ -1335,12 +1394,6 @@ def watch_repo_once(
 
             # Case 4: Pending review -> heterogeneous family reviews (or fresh-session fallback on CLI outage)
             if status == "pending_review" and author_family:
-                if require_hmac and not secret:
-                    has_pending_work = True
-                    sys.stderr.write(
-                        f"[paf watch-prs] skipping {slug}#{pr_num}: consensus.key missing at {resolved_key} (run `paf init-consensus-key`).\n"
-                    )
-                    continue
                 author_sessions = set(verdict.get("author_session_ids") or [])
                 hetero_candidates = [f for f in enabled_families if f != author_family]
                 review_plan: list[tuple[str, bool]] = [(f, False) for f in hetero_candidates]
@@ -1443,6 +1496,11 @@ def watch_repo_once(
                     claimed_fams = {primary_fam}
                     with _shield_key_file(resolved_key):
                         for cand_fam, is_fb in review_plan:
+                            if is_fb and last_err is not None:
+                                sys.stderr.write(
+                                    f"[paf watch-prs] WARNING on {slug}#{pr_num}: heterogeneous reviewer '{primary_fam}' "
+                                    f"hit API quota/outage ({last_err}); invoking fresh blank '{cand_fam}' fallback session.\n"
+                                )
                             if is_fb and cand_fam not in claimed_fams:
                                 fb_holder = active_claim_holder(
                                     pr_data.get("comments") or [], head_sha, cand_fam
@@ -1573,8 +1631,15 @@ def watch_repo_once(
                     require_hmac=require_hmac,
                 )
 
+                fallback_banner = (
+                    "> **[Outage Fallback Review]**: Primary heterogeneous reviewer encountered an API quota/outage error; "
+                    "reviewed by an independent fresh blank session.\n\n"
+                    if chosen_fb
+                    else ""
+                )
                 comment_body = (
-                    review_result["prose"].strip()
+                    fallback_banner
+                    + review_result["prose"].strip()
                     + "\n\n"
                     + f"<!-- paf-consensus: {json.dumps(marker, separators=(',', ':'))} -->"
                 )

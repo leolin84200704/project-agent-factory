@@ -1010,10 +1010,16 @@ def main() -> int:
     )
     unreadable_key.chmod(0o600)
 
-    # Non-outage CLI bug (`unknown flag`) MUST NOT silently degrade heterogeneity to same-family fallback
+    # Non-outage failures (`unknown flag`, nonexistent binary, or `429 quota` printed on stdout)
+    # MUST NOT silently degrade heterogeneity to same-family fallback!
     buggy_agy = mock_bin / "agy_buggy_flag"
     buggy_agy.write_text("#!/bin/sh\necho 'error: unknown option --bad-flag' >&2\nexit 2\n", encoding="utf-8")
     buggy_agy.chmod(0o755)
+    stdout_spoof_agy = mock_bin / "agy_stdout_spoof"
+    stdout_spoof_agy.write_text("#!/bin/sh\necho '429 quota exhausted'\nexit 1\n", encoding="utf-8")
+    stdout_spoof_agy.chmod(0o755)
+    missing_agy_path = str(mock_bin / "nonexistent_agy_binary")
+
     bus_no_degrade = paf_watcher.InMemoryGitHubBus(
         repo_path=repo_fb_live,
         prs={77: make_pr_json(sha_fb_live, author_fb_comment, [], number=77)},
@@ -1033,6 +1039,54 @@ def main() -> int:
         allow_same_family_fallback=True,
         claim_settle_sec=0.0,
     )
+    bus_missing_bin = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo_fb_live,
+        prs={77: make_pr_json(sha_fb_live, author_fb_comment, [], number=77)},
+        etag='W/"etag-missingbin"',
+        key_file=key_file,
+    )
+    act_missing_bin = paf_watcher.watch_repo_once(
+        repo=repo_fb_live,
+        repo_slug="leolin84200704/demo",
+        host_id="work-mac",
+        families=("claude", "gemini"),
+        state_dir=_mkdtemp("paf-watch-missingbin-"),
+        key_file=key_file,
+        bus=bus_missing_bin,
+        claude_bin=str(fake_claude),
+        agy_bin=missing_agy_path,
+        allow_same_family_fallback=True,
+        claim_settle_sec=0.0,
+    )
+    bus_stdout_spoof = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo_fb_live,
+        prs={77: make_pr_json(sha_fb_live, author_fb_comment, [], number=77)},
+        etag='W/"etag-stdoutspoof"',
+        key_file=key_file,
+    )
+    act_stdout_spoof = paf_watcher.watch_repo_once(
+        repo=repo_fb_live,
+        repo_slug="leolin84200704/demo",
+        host_id="work-mac",
+        families=("claude", "gemini"),
+        state_dir=_mkdtemp("paf-watch-stdoutspoof-"),
+        key_file=key_file,
+        bus=bus_stdout_spoof,
+        claude_bin=str(fake_claude),
+        agy_bin=str(stdout_spoof_agy),
+        allow_same_family_fallback=True,
+        claim_settle_sec=0.0,
+    )
+
+    # Orphaned SIGKILL shield (`0000` key file + `shielding` marker in unlocked `.consensus.key.lock`) self-heals to `0600`
+    heal_dir = _mkdtemp("paf-heal-key-")
+    heal_key = heal_dir / "consensus.key"
+    heal_secret_expected = "a" * 64
+    heal_key.write_text(heal_secret_expected + "\n", encoding="utf-8")
+    heal_key.chmod(0o000)
+    (heal_dir / ".consensus.key.lock").write_bytes(b"shielding\n")
+    healed_secret = paf_watcher.load_consensus_secret(heal_key, wait_sec=0.2)
+    healed_mode = oct(stat.S_IMODE(heal_key.stat().st_mode))
 
     # `paf ship` enforces `author_host` single-writer affinity on existing open PRs
     fix_ship_host = repo1 / ".git" / "pr_ship_host.json"
@@ -1045,6 +1099,7 @@ def main() -> int:
 
     if (
         not claude_scoped_ok
+        or "--setting-sources" not in claude_seen_args
         or act_gh_leak.get("reviewed") != []
         or gh_leaked_posted
         or act_retry_1.get("reviewed") != []
@@ -1056,20 +1111,25 @@ def main() -> int:
         or r_init_unreadable.returncode == 0
         or "Traceback" in r_init_unreadable.stderr
         or act_no_degrade.get("reviewed") != []
+        or act_missing_bin.get("reviewed") != []
+        or act_stdout_spoof.get("reviewed") != []
+        or healed_secret != heal_secret_expected
+        or healed_mode != "0o600"
         or r_ship_wrong_host.returncode == 0
         or "author_host affinity" not in r_ship_wrong_host.stderr
     ):
         print(
-            f"FAIL 10 Round-2 regressions:\n"
-            f"  claude_scoped={claude_scoped_ok} allowed_val={allowed_val!r}\n"
+            f"FAIL 10 Round-2/3 regressions:\n"
+            f"  claude_scoped={claude_scoped_ok} setting_src={'--setting-sources' in claude_seen_args} allowed_val={allowed_val!r}\n"
             f"  gh_leak={act_gh_leak} posted={gh_leaked_posted}\n"
             f"  retry1={act_retry_1} retry2={act_retry_2}\n"
             f"  raised_key_err={raised_key_err} post_unr_rc={r_post_unreadable.returncode} init_unr={r_init_unreadable.returncode}\n"
-            f"  no_degrade={act_no_degrade} ship_host_rc={r_ship_wrong_host.returncode} ({r_ship_wrong_host.stderr.strip()})"
+            f"  no_degrade={act_no_degrade} missing_bin={act_missing_bin} stdout_spoof={act_stdout_spoof}\n"
+            f"  healed={healed_secret == heal_secret_expected} ({healed_mode}) ship_host_rc={r_ship_wrong_host.returncode}"
         )
         failures += 1
     else:
-        print("PASS 10 enforces worktree-only Claude tools, ghp_ leak filter, ETag retry after backoff, loud key-lock errors, and outage-only fallback")
+        print("PASS 10 enforces worktree-only Claude tools, setting-sources=user, ghp_ filter, ETag retry, SIGKILL key self-heal, and strict stderr-only outage fallback")
 
     return 1 if failures else 0
 
