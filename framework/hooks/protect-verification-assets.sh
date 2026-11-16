@@ -20,7 +20,7 @@ SESSION=$(echo "$INPUT" | jq -r '.session_id // "nosession"')
 BASE_DIR="${CWD:-$PWD}"
 ABS_FILE=$(python3 -c 'import os, sys; base, p = sys.argv[1], sys.argv[2]; print(os.path.abspath(p if os.path.isabs(p) else os.path.join(base, p)))' "$BASE_DIR" "$FILE")
 
-PROTECTED_RE='(/eval-tasks/[^/]+\.md$|/hooks/[^/]+\.sh$|/githooks/(pre-commit|pre-push|install\.sh|lib/[^/]+\.sh)$|/run-regression\.py$|/\.agent-verify\.json$|/\.github/workflows/[^/]+\.ya?ml$|/bin/paf$|/dune_lint\.py$)'
+PROTECTED_RE='(/eval-tasks/[^/]+\.md$|/hooks/[^/]+\.sh$|/githooks/(pre-commit|pre-push|install\.sh|lib/[^/]+\.sh)$|/run-regression\.py$|/\.agent-verify\.json$|/\.github/workflows/[^/]+\.ya?ml$|/bin/paf$|/dune_lint\.py$|/paf_watcher\.py$|/\.config/paf/consensus\.key$)'
 echo "$ABS_FILE" | grep -qE "$PROTECTED_RE" || exit 0
 
 # New file -> allowed. What needs protection is mutation of existing assertions.

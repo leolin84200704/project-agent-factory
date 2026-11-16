@@ -11,6 +11,9 @@ Commands:
   paf check-consensus  Verify SHA-pinned heterogeneous dual-model consensus (`<!-- paf-consensus: ... -->`) on a PR
   paf post-consensus   Post a SHA-pinned consensus marker comment on a PR (and optionally auto-merge on approve)
   paf merge-consensus  Atomically merge a PR once heterogeneous dual-model consensus + CI pass, then verify post-merge
+  paf init-consensus-key  Provision or rotate the 0600 local HMAC-SHA256 shared key (`~/.config/paf/consensus.key`)
+  paf watch-prs        ETag/state-driven cross-model PR consensus reviewer, claim coordinator, and auto-merger
+  paf install-watcher  Generate (and optionally load) macOS launchd StartInterval plist for `paf watch-prs`
   paf ship             Autonomous PR -> CI -> Consensus / Blind Review -> atomic merge -> post-merge verify -> auto-revert
   paf audit            Audit agent/product repos for manifest, `.agent-verify.json`, script drift, and index bloat
   paf garden           Run codebase hygiene checks (dune_lint, stale merged branches, unmerged proposals)
@@ -35,6 +38,7 @@ from typing import Any
 
 FACTORY_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_SCORING_PATH = FACTORY_ROOT / "framework" / "scripts" / "memory_scoring.py"
+PAF_WATCHER_PATH = FACTORY_ROOT / "framework" / "scripts" / "paf_watcher.py"
 DUNE_LINT_PATH = FACTORY_ROOT / "framework" / "checks" / "dune_lint.py"
 GIT_BIN = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
 RESTRICTED_PRIVATE_REPO = "mind" + "-" + "state"
@@ -57,6 +61,8 @@ def _clean_git_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def _load_module(name: str, path: Path) -> Any:
+    if name in sys.modules:
+        return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load module {name} from {path}")
@@ -64,6 +70,20 @@ def _load_module(name: str, path: Path) -> Any:
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _watcher_mod() -> Any:
+    return _load_module("paf_watcher", PAF_WATCHER_PATH)
+
+
+def _resolve_session_id(cli_session_id: str | None = None) -> str:
+    if cli_session_id and cli_session_id.strip():
+        return cli_session_id.strip()
+    for env_key in ("PAF_SESSION_ID", "CLAUDE_SESSION_ID", "AGY_CONVERSATION_ID"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return val
+    return ""
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -139,7 +159,7 @@ def _resolve_staging_branches(cfg: dict[str, Any]) -> set[str]:
 
 GOVERNANCE_FILE_RE = re.compile(
     r"(^|/)(CORE\.md|AGENTS\.md|CLAUDE\.md|GEMINI\.md|WORK-LOOP\.md|PERMISSIONS\.md|FEEDBACK\.md|"
-    r"\.agent-verify\.json|run-regression\.py|dune_lint\.py)$|"
+    r"\.agent-verify\.json|run-regression\.py|dune_lint\.py|paf_watcher\.py)$|"
     r"^bin/paf$|"
     r"(^|/)(\.claude/settings[^/]*\.json|\.gemini/settings[^/]*\.json|\.gemini/config/|"
     r"\.github/workflows/[^/]+\.ya?ml|eval-tasks/[^/]+\.md|"
@@ -749,18 +769,73 @@ def _extract_consensus_markers(pr_data: dict[str, Any]) -> list[dict[str, Any]]:
     return markers
 
 
-def _infer_author_family_from_markers(markers: list[dict[str, Any]]) -> tuple[str, list[str]]:
+def _extract_author_metadata(
+    markers: list[dict[str, Any]],
+    *,
+    hmac_secret: str | None = None,
+    require_hmac: bool = False,
+    expected_base: str = "",
+    expected_pr_num: int = 0,
+) -> tuple[str, list[str], str, set[str], bool, str]:
+    pw = _watcher_mod()
     seen: list[str] = []
+    author_host = ""
+    verified_author_sessions: set[str] = set()
+    bad_author_sig = False
+    mismatch_detail = ""
+    local_kid = pw.compute_key_id(hmac_secret) if hmac_secret else ""
+
     for m in markers:
         role = str(m.get("role") or "").strip().lower()
         verdict = str(m.get("verdict") or "").strip().lower()
-        if role == "author" or verdict == "open":
-            fam = _normalize_family(m.get("model_family") or m.get("author"))
-            if fam and fam not in seen:
-                seen.append(fam)
-    if len(seen) == 1:
-        return seen[0], seen
-    return "", seen
+        if role != "author" and verdict != "open":
+            continue
+
+        has_sig = bool(str(m.get("sig") or "").strip())
+        m_kid = str(m.get("key_id") or "").strip()
+        if has_sig and hmac_secret and not pw.verify_consensus_hmac(hmac_secret, m):
+            bad_author_sig = True
+            if m_kid and local_kid and m_kid != local_kid:
+                mismatch_detail = f"key_id mismatch (marker={m_kid}, local={local_kid}); sync ~/.config/paf/consensus.key across machines"
+            continue
+        if require_hmac:
+            if not hmac_secret or not has_sig or not pw.verify_consensus_hmac(hmac_secret, m):
+                bad_author_sig = True
+                if m_kid and local_kid and m_kid != local_kid:
+                    mismatch_detail = f"key_id mismatch (marker={m_kid}, local={local_kid}); sync ~/.config/paf/consensus.key across machines"
+                continue
+
+        m_base = str(m.get("base_branch") or "").strip()
+        if m_base and expected_base and m_base != expected_base:
+            bad_author_sig = True
+            continue
+        try:
+            m_pr_num = int(m["pr_number"]) if m.get("pr_number") is not None else 0
+        except (TypeError, ValueError):
+            m_pr_num = 0
+        if m_pr_num > 0 and expected_pr_num > 0 and m_pr_num != expected_pr_num:
+            bad_author_sig = True
+            continue
+
+        # Only harvest session_ids AFTER signature/context verification so an unsigned comment cannot DoS a reviewer
+        raw_sess = str(m.get("session_id") or "").strip()
+        if raw_sess:
+            verified_author_sessions.add(raw_sess)
+
+        fam = _normalize_family(m.get("model_family") or m.get("author"))
+        if fam and fam not in seen:
+            seen.append(fam)
+        host_cand = str(m.get("host") or "").strip().lower()
+        if host_cand and not author_host:
+            author_host = host_cand
+
+    inferred = seen[0] if len(seen) == 1 else ""
+    return inferred, seen, author_host, verified_author_sessions, bad_author_sig, mismatch_detail
+
+
+def _infer_author_family_from_markers(markers: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    inferred, seen, _host, _sessions, _bad, _mm = _extract_author_metadata(markers)
+    return inferred, seen
 
 
 def evaluate_pr_consensus(
@@ -768,7 +843,11 @@ def evaluate_pr_consensus(
     *,
     author_family_override: str | None = None,
     max_rounds: int = 3,
+    hmac_secret: str | None = None,
+    require_hmac: bool = False,
+    allow_same_family_fallback: bool = False,
 ) -> dict[str, Any]:
+    pw = _watcher_mod()
     head_sha = str(pr_data.get("headRefOid") or "").strip()
     if not HEX_SHA_RE.match(head_sha.lower()):
         return {
@@ -776,13 +855,44 @@ def evaluate_pr_consensus(
             "reason": "PR headRefOid is missing or invalid.",
             "head_sha": head_sha,
             "author_family": None,
+            "author_host": "",
+            "author_session_ids": [],
             "max_round": 0,
         }
 
+    if require_hmac and not hmac_secret:
+        return {
+            "status": "pending_review",
+            "reason": (
+                f"Consensus HMAC key is required (require_hmac=true) on {head_sha}, "
+                "but no consensus.key was found. Run `paf init-consensus-key`."
+            ),
+            "head_sha": head_sha,
+            "author_family": None,
+            "author_host": "",
+            "author_session_ids": [],
+            "max_round": 0,
+        }
+
+    expected_base = str(pr_data.get("baseRefName") or "").strip()
+    try:
+        expected_pr_num = int(pr_data["number"]) if pr_data.get("number") is not None else 0
+    except (TypeError, ValueError):
+        expected_pr_num = 0
+    local_kid = pw.compute_key_id(hmac_secret) if hmac_secret else ""
+
     markers = _extract_consensus_markers(pr_data)
+    inferred_af, seen_authors, author_host, author_session_ids, bad_author_sig, key_mismatch = (
+        _extract_author_metadata(
+            markers,
+            hmac_secret=hmac_secret,
+            require_hmac=require_hmac,
+            expected_base=expected_base,
+            expected_pr_num=expected_pr_num,
+        )
+    )
     author_family = _normalize_family(author_family_override)
     if not author_family:
-        inferred, seen_authors = _infer_author_family_from_markers(markers)
         if len(seen_authors) > 1:
             return {
                 "status": "pending_review",
@@ -792,25 +902,37 @@ def evaluate_pr_consensus(
                 ),
                 "head_sha": head_sha,
                 "author_family": None,
+                "author_host": author_host,
+                "author_session_ids": sorted(author_session_ids),
                 "max_round": 0,
             }
-        author_family = inferred
+        author_family = inferred_af
 
     if not author_family:
+        extra_hint = ""
+        if key_mismatch:
+            extra_hint = f" ({key_mismatch})"
+        elif bad_author_sig:
+            extra_hint = " (unsigned, replayed, or tampered author marker ignored)"
         return {
             "status": "pending_review",
             "reason": (
-                f"Cannot verify heterogeneity on {head_sha}: author model_family is unknown "
-                "(no recognized author marker on PR and no --author-family provided)."
+                f"Cannot verify heterogeneity on {head_sha}: author model_family is unknown"
+                f"{extra_hint} (no recognized author marker on PR and no --author-family provided)."
             ),
             "head_sha": head_sha,
             "author_family": None,
+            "author_host": author_host,
+            "author_session_ids": sorted(author_session_ids),
             "max_round": 0,
         }
 
     max_round_seen = 0
     needs_human = False
     same_family_rejected = False
+    same_session_rejected = False
+    hmac_rejected = False
+    replay_rejected = False
     unknown_reviewer_rejected = False
     latest_by_family: dict[str, dict[str, Any]] = {}
     unlabeled_objections: list[dict[str, Any]] = []
@@ -833,15 +955,73 @@ def evaluate_pr_consensus(
         if rnd < 1 or blocking < 0:
             continue
         rev_fam = _normalize_family(m.get("model_family") or m.get("reviewer"))
+        rev_sess = str(m.get("session_id") or "").strip()
         is_objection = (verdict != "approve") or (blocking > 0) or flag_nh
+        valid_fallback = False
+
         if not is_objection:
+            has_sig = bool(str(m.get("sig") or "").strip())
+            m_kid = str(m.get("key_id") or "").strip()
+            if has_sig and hmac_secret and not pw.verify_consensus_hmac(hmac_secret, m):
+                hmac_rejected = True
+                if m_kid and local_kid and m_kid != local_kid:
+                    key_mismatch = f"key_id mismatch (marker={m_kid}, local={local_kid}); sync ~/.config/paf/consensus.key across machines"
+                continue
+            if require_hmac:
+                raw_m_sha = str(m.get("head_sha") or "").strip().lower()
+                if (
+                    not hmac_secret
+                    or not has_sig
+                    or raw_m_sha != head_sha.lower()
+                    or not pw.verify_consensus_hmac(hmac_secret, m)
+                ):
+                    hmac_rejected = True
+                    if m_kid and local_kid and m_kid != local_kid:
+                        key_mismatch = f"key_id mismatch (marker={m_kid}, local={local_kid}); sync ~/.config/paf/consensus.key across machines"
+                    continue
+            m_base = str(m.get("base_branch") or "").strip()
+            try:
+                m_pr_num = int(m["pr_number"]) if m.get("pr_number") is not None else 0
+            except (TypeError, ValueError):
+                m_pr_num = 0
+            if m_base and expected_base and m_base != expected_base:
+                replay_rejected = True
+                continue
+            if m_pr_num > 0 and expected_pr_num > 0 and m_pr_num != expected_pr_num:
+                replay_rejected = True
+                continue
+            if require_hmac and (
+                (expected_base and m_base != expected_base)
+                or (expected_pr_num > 0 and m_pr_num != expected_pr_num)
+            ):
+                replay_rejected = True
+                continue
             if not rev_fam:
                 unknown_reviewer_rejected = True
                 continue
+            if rev_sess and rev_sess in author_session_ids:
+                same_session_rejected = True
+                continue
             if rev_fam == author_family:
-                same_family_rejected = True
-                if author_family not in latest_by_family:
+                if (
+                    allow_same_family_fallback
+                    and bool(m.get("fallback_same_family"))
+                    and bool(author_session_ids)
+                    and bool(rev_sess)
+                    and rev_sess not in author_session_ids
+                ):
+                    valid_fallback = True
+                elif (
+                    author_family in latest_by_family
+                    and bool(author_session_ids)
+                    and bool(rev_sess)
+                    and rev_sess not in author_session_ids
+                ):
+                    same_family_rejected = True
+                else:
+                    same_family_rejected = True
                     continue
+
         if rnd > max_round_seen:
             max_round_seen = rnd
         if flag_nh:
@@ -852,6 +1032,7 @@ def evaluate_pr_consensus(
             "verdict": "request_changes" if is_objection else "approve",
             "round": rnd,
             "blocking_count": blocking,
+            "is_valid_fallback": valid_fallback,
         }
         if rev_fam:
             latest_by_family[rev_fam] = entry
@@ -864,6 +1045,8 @@ def evaluate_pr_consensus(
             "reason": f"Reviewer flagged needs_human_decision=true on {head_sha}.",
             "head_sha": head_sha,
             "author_family": author_family,
+            "author_host": author_host,
+            "author_session_ids": sorted(author_session_ids),
             "max_round": max_round_seen,
         }
 
@@ -877,6 +1060,8 @@ def evaluate_pr_consensus(
                 "reason": f"Consensus exceeded max_rounds={max_rounds} (saw round {max_round_seen}) without approval on {head_sha}.",
                 "head_sha": head_sha,
                 "author_family": author_family,
+                "author_host": author_host,
+                "author_session_ids": sorted(author_session_ids),
                 "max_round": max_round_seen,
             }
         last_obj = open_objections[-1]
@@ -885,6 +1070,8 @@ def evaluate_pr_consensus(
             "reason": f"Open objection on {head_sha} by '{last_obj['normalized_family']}' requested changes.",
             "head_sha": head_sha,
             "author_family": author_family,
+            "author_host": author_host,
+            "author_session_ids": sorted(author_session_ids),
             "reviewer_family": last_obj["normalized_family"],
             "max_round": max_round_seen,
         }
@@ -901,12 +1088,52 @@ def evaluate_pr_consensus(
             "reason": f"Heterogeneous consensus approved by '{latest['normalized_family']}' on {head_sha}.",
             "head_sha": head_sha,
             "author_family": author_family,
+            "author_host": author_host,
+            "author_session_ids": sorted(author_session_ids),
             "reviewer_family": latest["normalized_family"],
+            "fallback_used": False,
             "round": latest["round"],
             "max_round": max_round_seen,
         }
 
-    if same_family_rejected:
+    fb_entry = latest_by_family.get(author_family)
+    if (
+        allow_same_family_fallback
+        and fb_entry is not None
+        and fb_entry["verdict"] == "approve"
+        and fb_entry["blocking_count"] == 0
+        and fb_entry.get("is_valid_fallback") is True
+    ):
+        return {
+            "status": "approved",
+            "reason": (
+                f"Same-family fresh-session fallback approved by '{author_family}' "
+                f"(session {fb_entry.get('session_id')}) on {head_sha}."
+            ),
+            "head_sha": head_sha,
+            "author_family": author_family,
+            "author_host": author_host,
+            "author_session_ids": sorted(author_session_ids),
+            "reviewer_family": author_family,
+            "fallback_used": True,
+            "round": fb_entry["round"],
+            "max_round": max_round_seen,
+        }
+
+    if replay_rejected:
+        reason = (
+            f"Rejected replayed consensus marker (PR number or base_branch mismatch) on --head-sha {head_sha}."
+        )
+    elif hmac_rejected:
+        detail = f" ({key_mismatch})" if key_mismatch else ""
+        reason = (
+            f"Rejected unsigned or tampered consensus signature{detail}; awaiting valid HMAC-signed approval on --head-sha {head_sha}."
+        )
+    elif same_session_rejected:
+        reason = (
+            f"Rejected self-review from authoring session; awaiting independent session/family on --head-sha {head_sha}."
+        )
+    elif same_family_rejected:
         reason = (
             f"Rejected same-family review ('{author_family}'); awaiting heterogeneous reviewer on --head-sha {head_sha}."
         )
@@ -921,6 +1148,8 @@ def evaluate_pr_consensus(
         "reason": reason,
         "head_sha": head_sha,
         "author_family": author_family,
+        "author_host": author_host,
+        "author_session_ids": sorted(author_session_ids),
         "max_round": max_round_seen,
     }
 
@@ -1070,6 +1299,17 @@ def cmd_check_consensus(args: argparse.Namespace) -> int:
         return 1
     consensus_cfg = cfg.get("consensus") or {}
     max_rounds = _resolve_max_rounds(args.max_rounds, consensus_cfg)
+    pw = _watcher_mod()
+    try:
+        hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    except pw.ConsensusKeyError as exc:
+        print(f"paf check-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
+    require_hmac = bool(getattr(args, "require_hmac", False) or consensus_cfg.get("require_hmac", False))
+    allow_fb = bool(
+        getattr(args, "allow_same_family_fallback", False)
+        or consensus_cfg.get("allow_same_family_fallback", False)
+    )
     try:
         pr_data = _load_pr_data(repo, args.pr, args.pr_fixture)
     except Exception as exc:
@@ -1080,6 +1320,9 @@ def cmd_check_consensus(args: argparse.Namespace) -> int:
         pr_data,
         author_family_override=args.author_family,
         max_rounds=max_rounds,
+        hmac_secret=hmac_secret,
+        require_hmac=require_hmac,
+        allow_same_family_fallback=allow_fb,
     )
     if args.json:
         print(json.dumps(verdict, indent=2))
@@ -1110,6 +1353,17 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
     staging_branches = _resolve_staging_branches(cfg)
     consensus_cfg = cfg.get("consensus") or {}
     max_rounds = _resolve_max_rounds(args.max_rounds, consensus_cfg)
+    pw = _watcher_mod()
+    try:
+        hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    except pw.ConsensusKeyError as exc:
+        print(f"paf merge-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
+    require_hmac = bool(getattr(args, "require_hmac", False) or consensus_cfg.get("require_hmac", False))
+    allow_fb = bool(
+        getattr(args, "allow_same_family_fallback", False)
+        or consensus_cfg.get("allow_same_family_fallback", False)
+    )
 
     try:
         pr_data = _load_pr_data(repo, args.pr, args.pr_fixture)
@@ -1134,6 +1388,9 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
         pr_data,
         author_family_override=args.author_family,
         max_rounds=max_rounds,
+        hmac_secret=hmac_secret,
+        require_hmac=require_hmac,
+        allow_same_family_fallback=allow_fb,
     )
     if verdict["status"] == "paused_human_tiebreak":
         print(f"PAUSED_FOR_CONSENSUS_TIEBREAK: {verdict['reason']}", file=sys.stderr)
@@ -1222,16 +1479,71 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
         )
         return 2
 
-    marker = {
+    consensus_cfg: dict[str, Any] = {}
+    if (repo / ".agent-verify.json").is_file():
+        try:
+            consensus_cfg = (_load_verify_config(repo).get("consensus") or {})
+        except Exception:
+            consensus_cfg = {}
+    require_hmac = bool(getattr(args, "require_hmac", False) or consensus_cfg.get("require_hmac", False))
+
+    pw = _watcher_mod()
+    try:
+        hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    except pw.ConsensusKeyError as exc:
+        print(f"paf post-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
+    host_id = pw.resolve_host_id(getattr(args, "host", None))
+    session_id = _resolve_session_id(getattr(args, "session_id", None))
+
+    if args.role == "reviewer" and session_id:
+        existing_markers = _extract_consensus_markers(pr_data)
+        _inf_af, _seen_af, _ah, author_sessions, _bad, _mm = _extract_author_metadata(
+            existing_markers,
+            hmac_secret=hmac_secret,
+            require_hmac=require_hmac,
+            expected_base=str(pr_data.get("baseRefName") or "").strip(),
+            expected_pr_num=int(pr_data["number"]) if pr_data.get("number") is not None else 0,
+        )
+        if session_id in author_sessions and args.verdict == "approve":
+            print(
+                f"paf post-consensus REFUSED: authoring session '{session_id}' cannot post an approve review on its own PR.",
+                file=sys.stderr,
+            )
+            return 2
+
+    pr_base = str(pr_data.get("baseRefName") or "").strip()
+    pr_num_int = int(pr_data["number"]) if pr_data.get("number") is not None else 0
+    marker: dict[str, Any] = {
         "v": 1,
         "role": args.role,
         "model_family": family,
         "verdict": args.verdict,
-        "head_sha": live_head,
+        "head_sha": live_head.lower(),
         "round": args.round,
         "blocking_count": args.blocking_count,
         "needs_human_decision": bool(args.needs_human_decision),
+        "host": host_id,
     }
+    if pr_base:
+        marker["base_branch"] = pr_base
+    if pr_num_int > 0:
+        marker["pr_number"] = pr_num_int
+    if session_id:
+        marker["session_id"] = session_id
+    if getattr(args, "fallback_same_family", False):
+        marker["fallback_same_family"] = True
+    try:
+        pw.sign_marker_in_place(
+            marker,
+            hmac_secret,
+            key_file=getattr(args, "key_file", None),
+            require_hmac=(require_hmac and args.verdict in ("open", "approve")),
+        )
+    except pw.ConsensusKeyError as exc:
+        print(f"paf post-consensus REFUSED: {exc}", file=sys.stderr)
+        return 2
+
     prose = ""
     if args.body_file is not None:
         prose = args.body_file.expanduser().resolve().read_text(encoding="utf-8").strip()
@@ -1262,6 +1574,9 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
             pr_fixture=None,
             author_family=args.author_family,
             max_rounds=args.max_rounds,
+            key_file=getattr(args, "key_file", None),
+            require_hmac=getattr(args, "require_hmac", False),
+            allow_same_family_fallback=getattr(args, "allow_same_family_fallback", False),
             approved_main=args.approved_main,
             approved_governance=args.approved_governance,
             max_wait_ci=args.max_wait_ci,
@@ -1286,6 +1601,16 @@ def cmd_ship(args: argparse.Namespace) -> int:
     require_blind = bool(cfg.get("require_blind_review", True))
     consensus_cfg = cfg.get("consensus") or {}
     max_rounds = _resolve_max_rounds(None, consensus_cfg)
+    pw = _watcher_mod()
+    try:
+        hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
+    except pw.ConsensusKeyError as exc:
+        print(f"paf ship ERROR: {exc}", file=sys.stderr)
+        return 1
+    require_hmac = bool(consensus_cfg.get("require_hmac", False))
+    allow_fb = bool(consensus_cfg.get("allow_same_family_fallback", False))
+    host_id = pw.resolve_host_id(getattr(args, "host", None))
+    session_id = _resolve_session_id(getattr(args, "session_id", None))
 
     branch = _git_branch(repo)
     if branch in (default_branch, "main", "master", "HEAD", "unknown"):
@@ -1340,7 +1665,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
                 "view",
                 branch,
                 "--json",
-                "number,url,state,headRefOid,body,comments,files,changedFiles,reviewDecision",
+                "number,url,state,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
             ],
             cwd=repo,
             text=True,
@@ -1354,20 +1679,41 @@ def cmd_ship(args: argparse.Namespace) -> int:
     has_consensus_markers = False
     cons_verdict: dict[str, Any] | None = None
     remote_pr_head = ""
+    existing_author_host = ""
     if parsed_pr is not None and parsed_pr.get("state") == "OPEN":
         open_pr_info = parsed_pr
         pr_markers = _extract_consensus_markers(parsed_pr)
         has_consensus_markers = bool(pr_markers)
-        if not author_fam:
-            inferred_af, seen_af = _infer_author_family_from_markers(pr_markers)
-            if len(seen_af) == 1:
-                author_fam = inferred_af
+        inferred_af, seen_af, inferred_host, _a_sess, _bad_sig, _mm = _extract_author_metadata(
+            pr_markers,
+            hmac_secret=hmac_secret,
+            require_hmac=require_hmac,
+            expected_base=str(parsed_pr.get("baseRefName") or base_branch).strip(),
+            expected_pr_num=int(parsed_pr["number"]) if parsed_pr.get("number") is not None else 0,
+        )
+        existing_author_host = inferred_host
+        if (
+            existing_author_host
+            and existing_author_host != host_id
+            and not getattr(args, "allow_cross_host", False)
+        ):
+            print(
+                f"paf ship REFUSED (author_host affinity): PR #{parsed_pr.get('number')} is owned by host '{existing_author_host}' "
+                f"(current host='{host_id}'). Ship/merge from '{existing_author_host}' or pass --allow-cross-host.",
+                file=sys.stderr,
+            )
+            return 2
+        if not author_fam and len(seen_af) == 1:
+            author_fam = inferred_af
         remote_pr_head = str(parsed_pr.get("headRefOid") or "")
         if remote_pr_head == head_sha:
             cons_verdict = evaluate_pr_consensus(
                 parsed_pr,
                 author_family_override=author_fam or None,
                 max_rounds=max_rounds,
+                hmac_secret=hmac_secret,
+                require_hmac=require_hmac,
+                allow_same_family_fallback=allow_fb,
             )
         elif remote_pr_head and not (args.allow_update_pr or args.open_for_consensus):
             print(
@@ -1383,6 +1729,13 @@ def cmd_ship(args: argparse.Namespace) -> int:
         if not author_fam:
             print(
                 "paf ship BLOCKED: --open-for-consensus requires --author-family (claude, gemini, or openai).",
+                file=sys.stderr,
+            )
+            return 2
+        if require_hmac and not hmac_secret and not args.dry_run:
+            print(
+                "paf ship REFUSED: consensus.require_hmac=true requires a valid consensus.key before opening/updating a PR. "
+                "Run `paf init-consensus-key` first.",
                 file=sys.stderr,
             )
             return 2
@@ -1469,13 +1822,29 @@ def cmd_ship(args: argparse.Namespace) -> int:
         pr_body_sections.append(args.body.strip())
     pr_body_sections.append(art_md.read_text(encoding="utf-8").strip())
     if author_fam:
-        author_marker = {
+        author_marker: dict[str, Any] = {
             "v": 1,
             "role": "author",
             "model_family": author_fam,
             "verdict": "open",
-            "head_sha": head_sha,
+            "head_sha": head_sha.lower(),
+            "host": existing_author_host or host_id,
+            "base_branch": base_branch,
         }
+        if open_pr_info is not None and open_pr_info.get("number") is not None:
+            author_marker["pr_number"] = int(open_pr_info["number"])
+        if session_id:
+            author_marker["session_id"] = session_id
+        try:
+            pw.sign_marker_in_place(
+                author_marker,
+                hmac_secret,
+                key_file=getattr(args, "key_file", None),
+                require_hmac=require_hmac,
+            )
+        except pw.ConsensusKeyError as exc:
+            print(f"paf ship ERROR: {exc}", file=sys.stderr)
+            return 1
         pr_body_sections.append(f"<!-- paf-consensus: {json.dumps(author_marker, separators=(',', ':'))} -->")
     full_body = "\n\n---\n\n".join(pr_body_sections)
 
@@ -1709,6 +2078,110 @@ def cmd_garden(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_init_consensus_key(args: argparse.Namespace) -> int:
+    pw = _watcher_mod()
+    try:
+        out_path = pw.init_consensus_key(args.key_file, rotate=args.rotate)
+    except pw.ConsensusKeyError as exc:
+        print(f"paf init-consensus-key ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"CONSENSUS_KEY_READY: {out_path} (mode 0600)")
+    return 0
+
+
+def cmd_watch_prs(args: argparse.Namespace) -> int:
+    pw = _watcher_mod()
+    repos = pw.discover_watched_repos(args.workspace, args.repo_dir)
+    if not repos:
+        print("paf watch-prs: zero High-Trust repos discovered.", file=sys.stderr)
+        return 1
+    fams = tuple(s.strip() for s in str(args.families).split(",") if s.strip())
+    allow_fb: bool | None = True if args.allow_same_family_fallback else None
+
+    while True:
+        summaries = []
+        for repo in repos:
+            try:
+                res = pw.watch_repo_once(
+                    repo=repo,
+                    host_id=args.host,
+                    families=fams,
+                    state_dir=args.state_dir,
+                    key_file=args.key_file,
+                    claude_model=args.claude_model,
+                    agy_model=args.agy_model,
+                    allow_same_family_fallback=allow_fb,
+                    review_timeout_sec=args.review_timeout,
+                )
+                summaries.append(res)
+            except Exception as exc:
+                print(f"[paf watch-prs] error on {repo.name}: {exc}", file=sys.stderr)
+        if args.json:
+            print(json.dumps(summaries, indent=2))
+        else:
+            for s in summaries:
+                if not s.get("not_modified"):
+                    print(
+                        f"[watch-prs] {s['repo']}: reviewed={s['reviewed']} "
+                        f"merged={s['merged']} fixed={s['fixed']} paused={s['paused']}"
+                    )
+        if args.once:
+            return 0
+        time.sleep(max(10, int(args.interval)))
+
+
+def cmd_install_watcher(args: argparse.Namespace) -> int:
+    pw = _watcher_mod()
+    repos = pw.discover_watched_repos(args.workspace, args.repo_dir)
+    if not repos:
+        print("paf install-watcher ERROR: no High-Trust repos matched.", file=sys.stderr)
+        return 1
+    host_id = pw.resolve_host_id(args.host)
+    paf_bin = Path(__file__).resolve()
+    plist_bytes = pw.build_launchd_plist(
+        paf_bin=paf_bin,
+        repo_dirs=repos,
+        host_id=host_id,
+        interval=args.interval,
+        families=args.families,
+        label=args.label,
+        state_dir=args.state_dir,
+        key_file=args.key_file,
+    )
+    out_path = (
+        args.plist_out.expanduser().resolve()
+        if args.plist_out is not None
+        else (Path.home() / "Library" / "LaunchAgents" / f"{args.label}.plist")
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(plist_bytes)
+
+    if args.dry_run:
+        print(f"DRY_RUN_WATCHER_PLIST_WRITTEN: {out_path} (host={host_id}, repos={len(repos)})")
+        return 0
+
+    st_dir = (args.state_dir or pw.DEFAULT_STATE_DIR).expanduser().resolve()
+    (st_dir / "logs").mkdir(parents=True, exist_ok=True)
+    uid = os.getuid()
+    subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}/{args.label}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    boot = subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{uid}", str(out_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if boot.returncode != 0:
+        print(f"paf install-watcher launchctl bootstrap failed:\n{boot.stderr}", file=sys.stderr)
+        return 1
+    print(f"INSTALLED_AND_LOADED_WATCHER: {out_path} (gui/{uid}/{args.label})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="paf", description=__doc__)
     sub = p.add_subparsers(dest="subcommand", required=True)
@@ -1745,6 +2218,9 @@ def build_parser() -> argparse.ArgumentParser:
     s_chk_c.add_argument("--pr-fixture", type=Path, default=None)
     s_chk_c.add_argument("--author-family", default=None)
     s_chk_c.add_argument("--max-rounds", type=int, default=None)
+    s_chk_c.add_argument("--key-file", type=Path, default=None)
+    s_chk_c.add_argument("--require-hmac", action="store_true")
+    s_chk_c.add_argument("--allow-same-family-fallback", action="store_true")
     s_chk_c.add_argument("--json", action="store_true")
     s_chk_c.set_defaults(func=cmd_check_consensus)
 
@@ -1759,6 +2235,12 @@ def build_parser() -> argparse.ArgumentParser:
     s_pst_c.add_argument("--round", type=int, default=1)
     s_pst_c.add_argument("--blocking-count", type=int, default=0)
     s_pst_c.add_argument("--needs-human-decision", action="store_true")
+    s_pst_c.add_argument("--session-id", default=None)
+    s_pst_c.add_argument("--host", default=None)
+    s_pst_c.add_argument("--key-file", type=Path, default=None)
+    s_pst_c.add_argument("--fallback-same-family", action="store_true")
+    s_pst_c.add_argument("--require-hmac", action="store_true")
+    s_pst_c.add_argument("--allow-same-family-fallback", action="store_true")
     s_pst_c.add_argument("--body", default=None)
     s_pst_c.add_argument("--body-file", type=Path, default=None)
     s_pst_c.add_argument("--auto-merge", action="store_true")
@@ -1776,6 +2258,9 @@ def build_parser() -> argparse.ArgumentParser:
     s_mrg_c.add_argument("--pr-fixture", type=Path, default=None)
     s_mrg_c.add_argument("--author-family", default=None)
     s_mrg_c.add_argument("--max-rounds", type=int, default=None)
+    s_mrg_c.add_argument("--key-file", type=Path, default=None)
+    s_mrg_c.add_argument("--require-hmac", action="store_true")
+    s_mrg_c.add_argument("--allow-same-family-fallback", action="store_true")
     s_mrg_c.add_argument("--approved-main", action="store_true")
     s_mrg_c.add_argument("--approved-governance", action="store_true")
     s_mrg_c.add_argument("--max-wait-ci", type=int, default=600)
@@ -1791,13 +2276,51 @@ def build_parser() -> argparse.ArgumentParser:
     s_ship.add_argument("--pr-fixture", type=Path, default=None)
     s_ship.add_argument("--open-for-consensus", action="store_true")
     s_ship.add_argument("--author-family", default=None)
+    s_ship.add_argument("--session-id", default=None)
+    s_ship.add_argument("--host", default=None)
+    s_ship.add_argument("--key-file", type=Path, default=None)
     s_ship.add_argument("--approved-main", action="store_true")
     s_ship.add_argument("--approved-governance", action="store_true")
     s_ship.add_argument("--allow-update-pr", action="store_true")
+    s_ship.add_argument("--allow-cross-host", action="store_true")
     s_ship.add_argument("--max-wait-ci", type=int, default=600)
     s_ship.add_argument("--no-auto-revert", action="store_true")
     s_ship.add_argument("--dry-run", action="store_true")
     s_ship.set_defaults(func=cmd_ship)
+
+    s_key = sub.add_parser("init-consensus-key", help="generate or rotate 0600 HMAC-SHA256 consensus key")
+    s_key.add_argument("--key-file", type=Path, default=None)
+    s_key.add_argument("--rotate", action="store_true")
+    s_key.set_defaults(func=cmd_init_consensus_key)
+
+    s_watch = sub.add_parser("watch-prs", help="ETag/state-driven dual-model PR consensus watcher")
+    s_watch.add_argument("--workspace", type=Path, default=FACTORY_ROOT.parent)
+    s_watch.add_argument("--repo-dir", type=Path, action="append", default=None)
+    s_watch.add_argument("--host", default=None)
+    s_watch.add_argument("--families", default="claude,gemini")
+    s_watch.add_argument("--state-dir", type=Path, default=None)
+    s_watch.add_argument("--key-file", type=Path, default=None)
+    s_watch.add_argument("--claude-model", default=None)
+    s_watch.add_argument("--agy-model", default=None)
+    s_watch.add_argument("--allow-same-family-fallback", action="store_true")
+    s_watch.add_argument("--review-timeout", type=int, default=660)
+    s_watch.add_argument("--interval", type=int, default=45)
+    s_watch.add_argument("--once", action="store_true")
+    s_watch.add_argument("--json", action="store_true")
+    s_watch.set_defaults(func=cmd_watch_prs)
+
+    s_inst = sub.add_parser("install-watcher", help="generate or install launchd plist for paf watch-prs")
+    s_inst.add_argument("--workspace", type=Path, default=FACTORY_ROOT.parent)
+    s_inst.add_argument("--repo-dir", type=Path, action="append", default=None)
+    s_inst.add_argument("--host", default=None)
+    s_inst.add_argument("--families", default="claude,gemini")
+    s_inst.add_argument("--interval", type=int, default=45)
+    s_inst.add_argument("--label", default="com.leo.paf-watcher")
+    s_inst.add_argument("--state-dir", type=Path, default=None)
+    s_inst.add_argument("--key-file", type=Path, default=None)
+    s_inst.add_argument("--plist-out", type=Path, default=None)
+    s_inst.add_argument("--dry-run", action="store_true")
+    s_inst.set_defaults(func=cmd_install_watcher)
 
     s_aud = sub.add_parser("audit", help="audit agent and product repos across workspace")
     s_aud.add_argument(

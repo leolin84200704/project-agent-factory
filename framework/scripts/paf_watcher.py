@@ -1,0 +1,1781 @@
+#!/usr/bin/env python3
+"""paf_watcher — Cryptographic HMAC consensus signing, cross-machine claim locks,
+and ETag/state-driven dual-model PR consensus watcher (`claude` <-> `gemini`).
+
+Design invariants:
+  1. Unforgeable wrapper-stamped signatures: In automated reviews, headless model CLIs
+     (`claude` and `agy`) run in read-only sandboxes with `PAF_CONSENSUS_KEY*` scrubbed
+     from their environment. They emit structured JSON only; the outer Python runner
+     stamps `model_family`, `session_id`, `host`, `head_sha`, and `sig` (HMAC-SHA256).
+  2. Fail-closed verification with live objections: Under `require_hmac: true` (the default
+     for `watch-prs` and `project-agent-factory`), unsigned (`sig` missing/stripped) and
+     tampered `author`/`approve` markers fail closed. When a repo explicitly sets
+     `require_hmac: false` for migration, unsigned markers are accepted while any present
+     `sig` that fails HMAC still fails closed. Objections (`request_changes`,
+     `blocking_count > 0`, `needs_human_decision: true`) remain blocking even when unsigned.
+  3. Single-writer host affinity + TTL claim locks: Only `author_host` executes
+     `request_changes` fixes or `merge-consensus` on a PR, eliminating cross-Mac git push
+     and merge races. Reviewers coordinate via `<!-- paf-claim: ... -->` comments with TTL.
+  4. Outage resilience: Primary consensus requires heterogeneous families (`claude` <-> `gemini`).
+     When `allow_same_family_fallback: true` and the heterogeneous CLI fails (quota/outage),
+     the watcher spawns a brand-new blank read-only session of the same family (never `--resume`)
+     whose distinct `session_id` is cryptographically verified against the authoring session.
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import plistlib
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+DEFAULT_CONFIG_DIR = Path.home() / ".config" / "paf"
+DEFAULT_KEY_FILE = DEFAULT_CONFIG_DIR / "consensus.key"
+DEFAULT_CONFIG_FILE = DEFAULT_CONFIG_DIR / "config.json"
+DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "paf"
+
+CLAIM_RE = re.compile(r"<!--\s*paf-claim:\s*(\{.*?\})\s*-->", re.DOTALL)
+HEX_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+GIT_LOCAL_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
+
+FAMILY_ALIASES: dict[str, str] = {
+    "claude": "claude",
+    "anthropic": "claude",
+    "opus": "claude",
+    "sonnet": "claude",
+    "haiku": "claude",
+    "fable": "claude",
+    "claude-code": "claude",
+    "claude-opus": "claude",
+    "claude-sonnet": "claude",
+    "claude-haiku": "claude",
+    "gemini": "gemini",
+    "google": "gemini",
+    "antigravity": "gemini",
+    "gemini-pro": "gemini",
+    "gemini-flash": "gemini",
+    "openai": "openai",
+    "gpt": "openai",
+    "codex": "openai",
+    "o1": "openai",
+    "o3": "openai",
+    "o4": "openai",
+    "o4-mini": "openai",
+    "gpt-4": "openai",
+    "gpt-4o": "openai",
+    "gpt-5": "openai",
+}
+
+REVIEW_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {
+            "type": "string",
+            "enum": ["approve", "request_changes"],
+        },
+        "blocking_count": {
+            "type": "integer",
+            "minimum": 0,
+        },
+        "needs_human_decision": {
+            "type": "boolean",
+        },
+        "prose": {
+            "type": "string",
+            "minLength": 1,
+        },
+    },
+    "required": ["verdict", "blocking_count", "needs_human_decision", "prose"],
+    "additionalProperties": False,
+}
+REVIEW_JSON_SCHEMA_STR = json.dumps(REVIEW_JSON_SCHEMA, separators=(",", ":"))
+
+
+def normalize_family(raw: Any) -> str:
+    val = re.sub(r"[\s_]+", "-", str(raw or "").strip().lower())
+    return FAMILY_ALIASES.get(val, "")
+
+
+def sha_matches(candidate: Any, expected_full: str) -> bool:
+    cand = str(candidate or "").strip().lower()
+    exp = expected_full.strip().lower()
+    if not (HEX_SHA_RE.match(cand) and HEX_SHA_RE.match(exp)):
+        return False
+    return exp.startswith(cand) or cand.startswith(exp)
+
+
+class ConsensusKeyError(RuntimeError):
+    """Raised when consensus.key exists on disk but is locked, unreadable, or invalid."""
+
+
+class ReviewerOutageError(RuntimeError):
+    """Raised strictly on subprocess timeout or recognized API quota/5xx error on stderr."""
+
+
+CREDENTIAL_LEAK_PATTERNS = (
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{24,}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+    re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"),
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)\boauth_token\s*:\s*['\"]?[A-Za-z0-9_-]{20,}"),
+)
+
+
+def _key_lock_path(target: Path) -> Path:
+    return target.with_name(f".{target.name}.lock")
+
+
+@contextlib.contextmanager
+def _key_file_lock(
+    target: Path,
+    *,
+    exclusive: bool,
+    wait_sec: float | None = 3.0,
+) -> Any:
+    if not target.parent.is_dir():
+        if exclusive:
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        else:
+            yield
+            return
+    lock_path = _key_lock_path(target)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    locked = False
+    try:
+        if wait_sec is None:
+            fcntl.flock(fd, mode)
+            locked = True
+        else:
+            deadline = time.monotonic() + max(0.0, wait_sec)
+            while True:
+                try:
+                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        raise ConsensusKeyError(
+                            f"Consensus key {target} is temporarily shielded by an active `paf watch-prs` sandboxed review; wait for the review to finish and retry."
+                        ) from exc
+                    time.sleep(0.05)
+        # Self-heal if a prior `_shield_key_file` holder died via SIGKILL leaving `shielding` marker behind
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            marker_bytes = os.read(fd, 32)
+            if marker_bytes.startswith(b"shielding") and os.path.lexists(target):
+                os.chmod(target, 0o600)
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+        except OSError:
+            pass
+        yield
+    finally:
+        if locked:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
+def resolve_key_file(cli_key_file: Path | None = None) -> Path:
+    if cli_key_file is not None:
+        return cli_key_file.expanduser().resolve()
+    env_val = os.environ.get("PAF_CONSENSUS_KEY_FILE", "").strip()
+    if env_val:
+        return Path(env_val).expanduser().resolve()
+    return DEFAULT_KEY_FILE
+
+
+def init_consensus_key(
+    key_file: Path | None = None,
+    *,
+    rotate: bool = False,
+    wait_sec: float = 3.0,
+) -> Path:
+    target = resolve_key_file(key_file)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(target.parent, 0o700)
+    except OSError:
+        pass
+
+    with _key_file_lock(target, exclusive=True, wait_sec=wait_sec):
+        if os.path.lexists(target) and not rotate:
+            try:
+                existing = target.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ConsensusKeyError(
+                    f"Consensus key {target} exists on disk but could not be read ({exc}); restore 0600 permissions or pass --rotate."
+                ) from exc
+            if len(existing) >= 32:
+                os.chmod(target, 0o600)
+                return target
+
+        secret_hex = secrets.token_hex(32)
+        if os.path.lexists(target):
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, (secret_hex + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(target, 0o600)
+        return target
+
+
+def load_consensus_secret(
+    key_file: Path | None = None,
+    *,
+    wait_sec: float = 2.0,
+) -> str | None:
+    target = resolve_key_file(key_file)
+    if not os.path.lexists(target):
+        return None
+    with _key_file_lock(target, exclusive=False, wait_sec=wait_sec):
+        if not os.path.lexists(target):
+            return None
+        try:
+            val = target.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConsensusKeyError(
+                f"Consensus key {target} exists on disk but is unreadable ({exc}); retry after active review completes or check permissions."
+            ) from exc
+        if len(val) < 16:
+            raise ConsensusKeyError(
+                f"Consensus key {target} exists on disk but is empty or truncated; run `paf init-consensus-key --rotate`."
+            )
+        return val
+
+
+def compute_key_id(secret: str) -> str:
+    return hashlib.sha256(f"paf-key-id:v1:{secret}".encode("utf-8")).hexdigest()[:12]
+
+
+@contextlib.contextmanager
+def _shield_key_file(key_file: Path | None) -> Any:
+    """Acquire exclusive flock and set 0000 on consensus.key while untrusted model CLI runs."""
+    target = key_file.expanduser().resolve() if key_file is not None else None
+    if target is None or not os.path.lexists(target):
+        yield
+        return
+    lock_path = _key_lock_path(target)
+    with _key_file_lock(target, exclusive=True, wait_sec=None):
+        shielded = False
+        if os.path.lexists(target):
+            try:
+                lock_path.write_bytes(b"shielding\n")
+                os.chmod(target, 0o000)
+                shielded = True
+            except OSError:
+                shielded = False
+        try:
+            yield
+        finally:
+            if shielded and os.path.lexists(target):
+                try:
+                    os.chmod(target, 0o600)
+                except OSError:
+                    pass
+            try:
+                if lock_path.is_file():
+                    lock_path.write_bytes(b"")
+            except OSError:
+                pass
+
+
+def contains_secret_material(text: str, secret: str | None) -> bool:
+    if not text:
+        return False
+    for pat in CREDENTIAL_LEAK_PATTERNS:
+        if pat.search(text):
+            return True
+    if not secret:
+        return False
+    sec = secret.strip()
+    if len(sec) < 16:
+        return sec.lower() in text.lower()
+    low_text = text.lower()
+    compact_text = re.sub(r"[\s:_-]+", "", low_text)
+    sec_low = sec.lower()
+    for i in range(0, len(sec_low) - 15, 4):
+        chunk = sec_low[i : i + 16]
+        if chunk in low_text or chunk in compact_text:
+            return True
+    try:
+        b64 = base64.b64encode(bytes.fromhex(sec)).decode("ascii").rstrip("=").lower()
+        if len(b64) >= 16 and b64[:16] in low_text:
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def resolve_host_id(cli_host: str | None = None, config_file: Path | None = None) -> str:
+    raw = (cli_host or "").strip()
+    if not raw:
+        raw = os.environ.get("PAF_HOST_ID", "").strip()
+    if not raw:
+        cfg_path = (config_file or DEFAULT_CONFIG_FILE).expanduser()
+        if cfg_path.is_file():
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                raw = str(cfg.get("host_id") or "").strip()
+            except (OSError, json.JSONDecodeError):
+                raw = ""
+    if not raw:
+        raw = socket.gethostname().split(".")[0].strip()
+    return re.sub(r"[^a-z0-9._-]+", "-", raw.lower()).strip("-") or "unknown-host"
+
+
+def canonical_marker_payload(marker: dict[str, Any]) -> bytes:
+    fam = normalize_family(
+        marker.get("model_family") or marker.get("reviewer") or marker.get("author")
+    )
+    try:
+        rnd = int(marker["round"]) if marker.get("round") is not None else 0
+    except (TypeError, ValueError):
+        rnd = 0
+    try:
+        blk = int(marker["blocking_count"]) if marker.get("blocking_count") is not None else 0
+    except (TypeError, ValueError):
+        blk = 0
+    try:
+        ver = int(marker.get("v", 1))
+    except (TypeError, ValueError):
+        ver = 1
+    try:
+        pr_num = int(marker["pr_number"]) if marker.get("pr_number") is not None else 0
+    except (TypeError, ValueError):
+        pr_num = 0
+    canonical = {
+        "v": ver,
+        "role": str(marker.get("role") or "").strip().lower(),
+        "model_family": fam,
+        "verdict": str(marker.get("verdict") or "").strip().lower(),
+        "head_sha": str(marker.get("head_sha") or "").strip().lower(),
+        "round": rnd,
+        "blocking_count": blk,
+        "needs_human_decision": bool(marker.get("needs_human_decision", False)),
+        "session_id": str(marker.get("session_id") or "").strip(),
+        "host": str(marker.get("host") or "").strip().lower(),
+        "fallback_same_family": bool(marker.get("fallback_same_family", False)),
+        "base_branch": str(marker.get("base_branch") or "").strip(),
+        "pr_number": pr_num,
+    }
+    return json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def compute_consensus_hmac(secret: str, marker: dict[str, Any]) -> str:
+    payload = canonical_marker_payload(marker)
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def verify_consensus_hmac(secret: str, marker: dict[str, Any]) -> bool:
+    sig = str(marker.get("sig") or "").strip().lower()
+    if not sig or not secret:
+        return False
+    expected = compute_consensus_hmac(secret, marker)
+    return hmac.compare_digest(sig, expected)
+
+
+def sign_marker_in_place(
+    marker: dict[str, Any],
+    secret: str | None,
+    *,
+    key_file: Path | None = None,
+    require_hmac: bool = False,
+) -> dict[str, Any]:
+    if secret:
+        marker["key_id"] = compute_key_id(secret)
+        marker["sig"] = compute_consensus_hmac(secret, marker)
+        return marker
+    resolved = resolve_key_file(key_file) if key_file is not None else None
+    if require_hmac or (resolved is not None and os.path.lexists(resolved)):
+        raise ConsensusKeyError(
+            f"Refusing to emit unsigned consensus marker when HMAC is required or key file exists ({resolved or DEFAULT_KEY_FILE})."
+        )
+    return marker
+
+
+def format_claim_marker(
+    *,
+    head_sha: str,
+    model_family: str,
+    host: str,
+    expires_at: str,
+) -> str:
+    fam = normalize_family(model_family) or model_family.strip().lower()
+    payload = {
+        "v": 1,
+        "head_sha": head_sha.strip().lower(),
+        "model_family": fam,
+        "host": host.strip().lower(),
+        "expires_at": expires_at.strip(),
+    }
+    return f"<!-- paf-claim: {json.dumps(payload, separators=(',', ':'))} -->"
+
+
+def _parse_iso_utc(raw: str) -> dt.datetime | None:
+    val = (raw or "").strip()
+    if not val:
+        return None
+    if val.endswith("Z"):
+        val = val[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(val)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def active_claim_holder(
+    comments: list[dict[str, Any]],
+    head_sha: str,
+    model_family: str,
+    *,
+    now: dt.datetime | None = None,
+) -> str | None:
+    now_utc = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+    target_fam = normalize_family(model_family)
+    if not target_fam:
+        return None
+
+    for comment in comments or []:
+        body = str((comment or {}).get("body") or "")
+        if not body:
+            continue
+        for match in CLAIM_RE.finditer(body):
+            try:
+                claim = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(claim, dict):
+                continue
+            if normalize_family(claim.get("model_family")) != target_fam:
+                continue
+            if not sha_matches(claim.get("head_sha"), head_sha):
+                continue
+            exp_dt = _parse_iso_utc(str(claim.get("expires_at") or ""))
+            host = str(claim.get("host") or "").strip().lower()
+            if exp_dt is not None and exp_dt > now_utc and host:
+                return host
+    return None
+
+
+def _clean_git_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(base_env if base_env is not None else os.environ)
+    for var in GIT_LOCAL_ENV_VARS:
+        env.pop(var, None)
+    return env
+
+
+def _scrubbed_reviewer_env(target_family: str) -> dict[str, str]:
+    env = _clean_git_env()
+    for key in list(env.keys()):
+        upper = key.upper()
+        if (
+            upper.startswith("PAF_CONSENSUS_KEY")
+            or upper in ("GH_TOKEN", "GITHUB_TOKEN", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")
+        ):
+            env.pop(key, None)
+        elif target_family == "gemini" and upper.startswith("ANTHROPIC_"):
+            env.pop(key, None)
+        elif target_family == "claude" and (
+            upper.startswith("GEMINI_") or upper.startswith("AGY_") or upper == "GOOGLE_API_KEY"
+        ):
+            env.pop(key, None)
+
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if target_family == "claude":
+        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+        env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+    return env
+
+
+def _parse_last_json_dict(stdout: str) -> dict[str, Any]:
+    stripped = (stdout or "").strip()
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    for line in reversed((stdout or "").splitlines()):
+        cand = line.strip()
+        if not cand.startswith("{"):
+            continue
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    raise RuntimeError(f"Model CLI output did not contain a valid JSON envelope: {stripped[:300]}")
+
+
+def _normalize_structured_review(raw: Any, session_id: str) -> dict[str, Any]:
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Structured review output is not a JSON object: {raw!r}")
+    verdict = str(raw.get("verdict") or "").strip().lower()
+    if verdict not in ("approve", "request_changes"):
+        raise RuntimeError(f"Invalid review verdict {verdict!r}")
+    blocking_count = int(raw.get("blocking_count") or 0)
+    needs_human = bool(raw.get("needs_human_decision", False))
+    if verdict == "approve" and (blocking_count > 0 or needs_human):
+        verdict = "request_changes"
+    if verdict == "request_changes" and blocking_count == 0 and not needs_human:
+        blocking_count = 1
+    prose = str(raw.get("prose") or "").strip() or f"Automated consensus review verdict: {verdict}."
+    return {
+        "verdict": verdict,
+        "blocking_count": max(0, blocking_count),
+        "needs_human_decision": needs_human,
+        "prose": prose,
+        "session_id": session_id,
+    }
+
+
+def build_review_prompt(
+    *,
+    repo_slug: str,
+    pr_data: dict[str, Any],
+    diff_stat: str,
+    diff_patch: str,
+    round_num: int,
+) -> str:
+    head_sha = str(pr_data.get("headRefOid") or "")
+    base_branch = str(pr_data.get("baseRefName") or "main")
+    head_branch = str(pr_data.get("headRefName") or "")
+    pr_num = pr_data.get("number")
+    body = str(pr_data.get("body") or "")[:4000]
+    prior_comments = []
+    for c in (pr_data.get("comments") or [])[-8:]:
+        c_body = str((c or {}).get("body") or "").strip()
+        if c_body and "<!-- paf-claim:" not in c_body:
+            prior_comments.append(c_body[:1500])
+    prior_blob = "\n---\n".join(prior_comments) if prior_comments else "(none)"
+    clipped_patch = (
+        diff_patch[:64000] + "\n[... diff truncated at 64,000 chars; read remaining files in working directory ...]\n"
+        if len(diff_patch) > 64000
+        else diff_patch
+    )
+
+    return (
+        f"You are an independent read-only adversarial code reviewer for {repo_slug} PR #{pr_num} "
+        f"(round {round_num}, branch {head_branch} -> {base_branch}, commit {head_sha}).\n"
+        "Inspect the repository files in your current working directory if needed, verify all security, "
+        "correctness, edge-case, and test-coverage invariants, and return ONLY the required JSON schema.\n"
+        "Rules:\n"
+        "- Do NOT attempt to modify files, run git push, or call gh CLI.\n"
+        "- Batch independent Read/Grep calls in parallel so you finish well within the turn budget.\n"
+        "- Set verdict='approve' with blocking_count=0 ONLY if the change is safe, tested, and ready to merge.\n"
+        "- Set verdict='request_changes' with blocking_count>=1 for concrete defects, security holes, or missing tests.\n"
+        "- Set needs_human_decision=true ONLY if a genuine product/UX trade-off or policy ambiguity requires human input.\n"
+        "- Write clear, concise English review notes in `prose`.\n\n"
+        f"PR Description:\n{body}\n\n"
+        f"Prior Consensus Comments:\n{prior_blob}\n\n"
+        f"Diff Stat:\n{diff_stat}\n\n"
+        f"Diff Patch:\n{clipped_patch}\n"
+    )
+
+
+STDERR_OUTAGE_RE = re.compile(
+    r"\b(?:429|500|502|503|504|529)\b|"
+    r"quota(?:\s+exhausted|\s+exceeded)?|"
+    r"rate[-_ ]?limit(?:ed|\s+exceeded)?|"
+    r"overloaded_error|resource[-_ ]?exhausted|service\s+unavailable",
+    re.IGNORECASE,
+)
+
+
+def _ensure_executable_binary(bin_path: str, label: str) -> str:
+    resolved = shutil.which(bin_path)
+    if resolved:
+        return resolved
+    if os.path.isfile(bin_path) and os.access(bin_path, os.X_OK):
+        return bin_path
+    raise RuntimeError(f"{label} reviewer binary missing or not executable: {bin_path}")
+
+
+def _raise_for_reviewer_exit(label: str, proc: subprocess.CompletedProcess[str]) -> None:
+    stderr_text = (proc.stderr or "").strip()
+    stdout_tail = (proc.stdout or "").strip()[:300]
+    if proc.returncode != 2 and stderr_text and STDERR_OUTAGE_RE.search(stderr_text):
+        raise ReviewerOutageError(
+            f"{label} API quota/outage (rc={proc.returncode}): {stderr_text[:300]}"
+        )
+    detail = stderr_text[:300] or stdout_tail
+    raise RuntimeError(f"{label} exited with code {proc.returncode}: {detail}")
+
+
+def run_agy_review(
+    *,
+    agy_bin: str,
+    worktree: Path,
+    prompt: str,
+    model: str | None = None,
+    timeout_sec: int = 660,
+) -> dict[str, Any]:
+    exec_agy = _ensure_executable_binary(agy_bin, "agy")
+    cmd = [
+        exec_agy,
+        "--output-format",
+        "json",
+        "--json-schema",
+        REVIEW_JSON_SCHEMA_STR,
+        "--disable-slash-commands",
+        "--sandbox",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append(f"-p={prompt}")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=worktree,
+            env=_scrubbed_reviewer_env("gemini"),
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewerOutageError(f"agy timed out after {timeout_sec}s") from exc
+    if proc.returncode != 0:
+        _raise_for_reviewer_exit("agy", proc)
+    envelope = _parse_last_json_dict(proc.stdout)
+    status = str(envelope.get("status") or "").strip().upper()
+    if status in ("ERROR", "FAILED", "CANCELLED") or envelope.get("is_error") is True:
+        raise RuntimeError(f"agy reported error status={status}: {envelope.get('error')}")
+    session_id = str(envelope.get("conversation_id") or envelope.get("session_id") or "").strip()
+    raw_payload = (
+        envelope["structured_output"]
+        if isinstance(envelope.get("structured_output"), dict)
+        else envelope.get("response")
+    )
+    res = _normalize_structured_review(raw_payload, session_id)
+    res["session_id_verified"] = bool(session_id)
+    return res
+
+
+def run_claude_review(
+    *,
+    claude_bin: str,
+    worktree: Path,
+    prompt: str,
+    model: str | None = None,
+    key_file: Path | None = None,
+    timeout_sec: int = 600,
+) -> dict[str, Any]:
+    wt_resolved = worktree.expanduser().resolve()
+    wt_str = str(wt_resolved)
+    wt_glob = "//" + wt_str.lstrip("/") + "/**"
+    allow_rules = [
+        f"Read({wt_glob})",
+        f"Grep({wt_glob})",
+        f"Glob({wt_glob})",
+    ]
+    deny_rules = [
+        "Read(~/.config/**)",
+        "Grep(~/.config/**)",
+        "Glob(~/.config/**)",
+        "Read(~/.ssh/**)",
+        "Grep(~/.ssh/**)",
+        "Glob(~/.ssh/**)",
+        "Read(~/.aws/**)",
+        "Grep(~/.aws/**)",
+        "Glob(~/.aws/**)",
+        "Read(~/.gnupg/**)",
+        "Grep(~/.gnupg/**)",
+        "Glob(~/.gnupg/**)",
+        "Read(~/.kube/**)",
+        "Grep(~/.kube/**)",
+        "Glob(~/.kube/**)",
+        "Read(~/.netrc)",
+        "Read(~/.git-credentials)",
+        "Read(~/.npmrc)",
+        "Read(~/.pypirc)",
+        "Read(**/.env)",
+        "Read(**/.env.*)",
+        "Grep(**/.env)",
+        "Grep(**/.env.*)",
+        "Read(**/*.key)",
+        "Read(**/*.pem)",
+        "Grep(**/*.key)",
+        "Grep(**/*.pem)",
+    ]
+    for sys_root in ("/Users", "/home", "/etc", "/root"):
+        if not (wt_str == sys_root or wt_str.startswith(sys_root + "/")):
+            r_glob = "//" + sys_root.lstrip("/") + "/**"
+            deny_rules.extend([f"Read({r_glob})", f"Grep({r_glob})", f"Glob({r_glob})"])
+    if key_file is not None:
+        key_dir = str(key_file.expanduser().resolve().parent)
+        if not (wt_str == key_dir or wt_str.startswith(key_dir + "/")):
+            key_dir_slash = "//" + key_dir.lstrip("/") + "/**"
+            deny_rules.extend(
+                [
+                    f"Read({key_dir_slash})",
+                    f"Grep({key_dir_slash})",
+                    f"Glob({key_dir_slash})",
+                ]
+            )
+    settings_json = json.dumps(
+        {
+            "permissions": {
+                "defaultMode": "dontAsk",
+                "allow": allow_rules,
+                "deny": deny_rules,
+            }
+        },
+        separators=(",", ":"),
+    )
+    exec_claude = _ensure_executable_binary(claude_bin, "claude")
+    cmd = [
+        exec_claude,
+        "-p",
+        "--output-format",
+        "json",
+        "--json-schema",
+        REVIEW_JSON_SCHEMA_STR,
+        "--permission-mode",
+        "dontAsk",
+        "--setting-sources",
+        "user",
+        "--tools",
+        "Read,Grep,Glob",
+        "--allowedTools",
+        ",".join(allow_rules),
+        "--settings",
+        settings_json,
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--max-turns",
+        "35",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=worktree,
+            env=_scrubbed_reviewer_env("claude"),
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewerOutageError(f"claude timed out after {timeout_sec}s") from exc
+    if proc.returncode != 0:
+        _raise_for_reviewer_exit("claude", proc)
+    envelope = _parse_last_json_dict(proc.stdout)
+    if envelope.get("is_error") is True:
+        raise RuntimeError(f"claude reported is_error=true: {envelope.get('result')}")
+    session_id = str(envelope.get("session_id") or "").strip()
+    raw_payload = (
+        envelope["structured_output"]
+        if isinstance(envelope.get("structured_output"), dict)
+        else envelope.get("result")
+    )
+    res = _normalize_structured_review(raw_payload, session_id)
+    res["session_id_verified"] = bool(session_id)
+    return res
+
+
+def _prepare_detached_worktree(repo: Path, head_sha: str, head_branch: str) -> tuple[Path | None, bool]:
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    env = _clean_git_env()
+    verify_cat = subprocess.run(
+        [git_bin, "cat-file", "-e", f"{head_sha}^{{commit}}"],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if verify_cat.returncode != 0 and head_branch:
+        subprocess.run(
+            [git_bin, "fetch", "origin", head_branch],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    wt = Path(tempfile.mkdtemp(prefix=f"paf-rev-wt-{head_sha[:8]}-"))
+    add_res = subprocess.run(
+        [git_bin, "worktree", "add", "--detach", str(wt), head_sha],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if add_res.returncode != 0:
+        shutil.rmtree(wt, ignore_errors=True)
+        return None, False
+    return wt, True
+
+
+def _prune_stale_worktrees(repo: Path) -> None:
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    subprocess.run(
+        [git_bin, "worktree", "prune"],
+        cwd=repo,
+        env=_clean_git_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def is_quota_or_outage_error(exc: BaseException) -> bool:
+    return isinstance(exc, ReviewerOutageError)
+
+
+def _remove_worktree(repo: Path, wt: Path | None, created: bool) -> None:
+    if not created or wt is None:
+        return
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    subprocess.run(
+        [git_bin, "worktree", "remove", "--force", str(wt)],
+        cwd=repo,
+        env=_clean_git_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    shutil.rmtree(wt, ignore_errors=True)
+
+
+def _collect_diff_context(worktree: Path, base_branch: str, head_sha: str) -> tuple[str, str]:
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    env = _clean_git_env()
+    subprocess.run(
+        [git_bin, "fetch", "origin", base_branch],
+        cwd=worktree,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for base_ref in (f"origin/{base_branch}", base_branch):
+        stat_p = subprocess.run(
+            [git_bin, "diff", "--stat", f"{base_ref}...{head_sha}"],
+            cwd=worktree,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if stat_p.returncode == 0:
+            patch_p = subprocess.run(
+                [git_bin, "diff", f"{base_ref}...{head_sha}"],
+                cwd=worktree,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if patch_p.returncode == 0:
+                return stat_p.stdout.strip(), patch_p.stdout
+    return "", ""
+
+
+class GitHubBus:
+    """Live GitHub REST + gh CLI transport with ETag conditional polling."""
+
+    def __init__(self, repo_path: Path, paf_bin: Path, key_file: Path | None = None) -> None:
+        self.repo_path = repo_path
+        self.paf_bin = paf_bin
+        self.key_file = key_file
+        self.detail_calls = 0
+
+    def poll_open_prs(
+        self, repo_slug: str, prev_etag: str | None
+    ) -> tuple[bool, str | None, list[int]]:
+        cmd = [
+            "gh",
+            "api",
+            "-i",
+            f"repos/{repo_slug}/pulls?state=open&sort=updated&direction=desc&per_page=30",
+        ]
+        if prev_etag:
+            cmd.extend(["-H", f"If-None-Match: {prev_etag}"])
+        proc = subprocess.run(
+            cmd,
+            cwd=self.repo_path,
+            env=_clean_git_env(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        raw_out = proc.stdout or ""
+        first_line = raw_out.splitlines()[0] if raw_out else ""
+        if " 304 " in first_line or first_line.endswith(" 304") or "HTTP 304" in (proc.stderr or ""):
+            return True, prev_etag, []
+        if proc.returncode != 0:
+            raise RuntimeError(f"gh api pulls failed for {repo_slug}: {(proc.stderr or raw_out).strip()}")
+
+        parts = re.split(r"\r?\n\r?\n", raw_out, maxsplit=1)
+        headers_blob = parts[0] if parts else ""
+        body_blob = parts[1].strip() if len(parts) > 1 else "[]"
+        new_etag = prev_etag
+        for hline in headers_blob.splitlines():
+            if hline.lower().startswith("etag:"):
+                new_etag = hline.split(":", 1)[1].strip()
+                break
+        items = json.loads(body_blob) if body_blob.startswith("[") else []
+        nums = [int(it["number"]) for it in items if isinstance(it, dict) and it.get("number")]
+        return False, new_etag, nums
+
+    def get_pr(self, pr_number: int) -> dict[str, Any]:
+        self.detail_calls += 1
+        proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(pr_number),
+                "--json",
+                "number,url,state,headRefName,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
+            ],
+            cwd=self.repo_path,
+            env=_clean_git_env(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip().startswith("{"):
+            raise RuntimeError(f"gh pr view #{pr_number} failed: {proc.stderr.strip()}")
+        return json.loads(proc.stdout)
+
+    def post_comment(self, pr_number: int, body: str) -> None:
+        proc = subprocess.run(
+            ["gh", "pr", "comment", str(pr_number), "--body", body],
+            cwd=self.repo_path,
+            env=_clean_git_env(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"gh pr comment #{pr_number} failed: {proc.stderr.strip()}")
+
+    def merge_pr(
+        self,
+        pr_number: int,
+        *,
+        require_hmac: bool = False,
+        allow_same_family_fallback: bool = False,
+        key_file: Path | None = None,
+    ) -> tuple[bool, str]:
+        env = _clean_git_env()
+        eff_key = key_file if key_file is not None else self.key_file
+        if eff_key is not None:
+            env["PAF_CONSENSUS_KEY_FILE"] = str(eff_key)
+        cmd = [
+            sys.executable,
+            str(self.paf_bin),
+            "merge-consensus",
+            "--repo",
+            str(self.repo_path),
+            "--pr",
+            str(pr_number),
+        ]
+        if require_hmac:
+            cmd.append("--require-hmac")
+        if allow_same_family_fallback:
+            cmd.append("--allow-same-family-fallback")
+        proc = subprocess.run(
+            cmd,
+            cwd=self.repo_path,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        if proc.returncode == 0 and "SHIPPED_AND_VERIFIED:" in combined:
+            return True, "merged"
+        if "PAUSED_FOR_" in combined:
+            return False, "paused"
+        return False, f"blocked({proc.returncode}): {combined[:240]}"
+
+
+class InMemoryGitHubBus:
+    """Deterministic in-memory GitHub bus for behavioral tests (zero network calls)."""
+
+    def __init__(
+        self,
+        *,
+        repo_path: Path,
+        prs: dict[int, dict[str, Any]],
+        etag: str = 'W/"etag-init"',
+        key_file: Path | None = None,
+    ) -> None:
+        self.repo_path = repo_path
+        self.prs: dict[int, dict[str, Any]] = json.loads(json.dumps(prs))
+        # JSON round-trip turns int keys into strings if dumped together; normalize keys back to int
+        self.prs = {int(k): v for k, v in self.prs.items()}
+        self.etag = etag
+        self.key_file = key_file
+        self._seq = 1
+        self.detail_calls = 0
+        self.comments_posted: list[tuple[int, str]] = []
+        self._paf_bin = Path(__file__).resolve().parents[2] / "bin" / "paf"
+
+    def _bump_etag(self) -> None:
+        self._seq += 1
+        self.etag = f'W/"etag-seq-{self._seq}"'
+
+    def poll_open_prs(
+        self, repo_slug: str, prev_etag: str | None
+    ) -> tuple[bool, str | None, list[int]]:
+        _ = repo_slug
+        if prev_etag and prev_etag == self.etag:
+            return True, self.etag, []
+        open_nums = [
+            num
+            for num, pr in sorted(self.prs.items())
+            if str(pr.get("state") or "").upper() == "OPEN"
+        ]
+        return False, self.etag, open_nums
+
+    def get_pr(self, pr_number: int) -> dict[str, Any]:
+        self.detail_calls += 1
+        return json.loads(json.dumps(self.prs[int(pr_number)]))
+
+    def post_comment(self, pr_number: int, body: str) -> None:
+        pr = self.prs[int(pr_number)]
+        comments = list(pr.get("comments") or [])
+        comments.append({"body": body})
+        pr["comments"] = comments
+        self.comments_posted.append((int(pr_number), body))
+        self._bump_etag()
+
+    def merge_pr(
+        self,
+        pr_number: int,
+        *,
+        require_hmac: bool = False,
+        allow_same_family_fallback: bool = False,
+        key_file: Path | None = None,
+    ) -> tuple[bool, str]:
+        pr = self.prs[int(pr_number)]
+        tmp_fix = self.repo_path / ".git" / f"inmem-pr-{pr_number}.json"
+        tmp_fix.write_text(json.dumps(pr), encoding="utf-8")
+        env = _clean_git_env()
+        eff_key = key_file if key_file is not None else self.key_file
+        if eff_key is not None:
+            env["PAF_CONSENSUS_KEY_FILE"] = str(eff_key)
+        cmd = [
+            sys.executable,
+            str(self._paf_bin),
+            "merge-consensus",
+            "--repo",
+            str(self.repo_path),
+            "--pr-fixture",
+            str(tmp_fix),
+            "--dry-run",
+        ]
+        if require_hmac:
+            cmd.append("--require-hmac")
+        if allow_same_family_fallback:
+            cmd.append("--allow-same-family-fallback")
+        proc = subprocess.run(
+            cmd,
+            cwd=self.repo_path,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        tmp_fix.unlink(missing_ok=True)
+        combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        if proc.returncode == 0 and "CONSENSUS_AUTONOMOUS_MERGE_READY:" in combined:
+            pr["state"] = "MERGED"
+            self._bump_etag()
+            return True, "merged"
+        if "PAUSED_FOR_" in combined:
+            return False, "paused"
+        return False, f"blocked({proc.returncode}): {combined[:240]}"
+
+
+def _load_json_state(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+MAX_LEDGER_ENTRIES = 500
+
+
+def _save_json_state(path: Path, data: dict[str, Any], *, max_entries: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(data)
+    if max_entries is not None and len(payload) > max_entries:
+        # Keep most recently inserted/updated entries (ISO timestamp values sort chronologically)
+        sorted_items = sorted(payload.items(), key=lambda kv: str(kv[1]))
+        payload = dict(sorted_items[-max_entries:])
+        data.clear()
+        data.update(payload)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def infer_repo_slug(repo: Path) -> str:
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    proc = subprocess.run(
+        [git_bin, "remote", "get-url", "origin"],
+        cwd=repo,
+        env=_clean_git_env(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    url = (proc.stdout or "").strip()
+    m = re.search(r"github\.com[:/]([^/]+/[^/\s]+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    raise RuntimeError(f"Cannot infer GitHub owner/repo slug from origin URL {url!r} in {repo}")
+
+
+def _load_paf_module() -> Any:
+    import importlib.machinery
+    import importlib.util
+
+    main_mod = sys.modules.get("__main__")
+    main_file = getattr(main_mod, "__file__", None) or ""
+    if str(main_file).endswith("/bin/paf"):
+        return main_mod
+    paf_path = Path(__file__).resolve().parents[2] / "bin" / "paf"
+    if "paf_cli_mod" in sys.modules:
+        return sys.modules["paf_cli_mod"]
+    loader = importlib.machinery.SourceFileLoader("paf_cli_mod", str(paf_path))
+    spec = importlib.util.spec_from_loader("paf_cli_mod", loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load {paf_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["paf_cli_mod"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def watch_repo_once(
+    *,
+    repo: Path,
+    repo_slug: str | None = None,
+    host_id: str | None = None,
+    families: tuple[str, ...] = ("claude", "gemini"),
+    state_dir: Path | None = None,
+    key_file: Path | None = None,
+    bus: Any | None = None,
+    claude_bin: str | None = None,
+    agy_bin: str | None = None,
+    claude_model: str | None = None,
+    agy_model: str | None = None,
+    allow_same_family_fallback: bool | None = None,
+    claim_ttl_sec: int = 1200,
+    claim_settle_sec: float = 2.0,
+    review_timeout_sec: int = 660,
+    backoff_sec: int = 180,
+    author_fix_hook: Callable[[Path, dict[str, Any], dict[str, Any]], bool] | None = None,
+) -> dict[str, Any]:
+    """Run one ETag-aware consensus watch tick on `repo`.
+
+    Note: `author_fix_hook` is an optional Python callback for daemon integrations;
+    the standalone `paf watch-prs` CLI executes sandboxed reviews, claim locks, and
+    `author_host` `merge-consensus` while leaving code-fix commits to authoring sessions.
+    """
+    repo = repo.expanduser().resolve()
+    slug = repo_slug or infer_repo_slug(repo)
+    resolved_host = resolve_host_id(host_id)
+    resolved_state = (state_dir or DEFAULT_STATE_DIR).expanduser().resolve()
+    resolved_state.mkdir(parents=True, exist_ok=True)
+
+    # Non-blocking per-repo watcher lock prevents manual + launchd ticks from racing
+    repo_lock_hash = hashlib.sha256(f"{slug}:{repo}".encode("utf-8")).hexdigest()[:12]
+    repo_lock_path = resolved_state / f".watch-{repo_lock_hash}.lock"
+    repo_lock_fd = os.open(str(repo_lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(repo_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {
+                "repo": slug,
+                "not_modified": True,
+                "locked": True,
+                "reviewed": [],
+                "merged": [],
+                "fixed": [],
+                "paused": [],
+            }
+
+        _prune_stale_worktrees(repo)
+        resolved_key = resolve_key_file(key_file)
+        secret = load_consensus_secret(resolved_key)
+        enabled_families = tuple(dict.fromkeys(normalize_family(f) for f in families if normalize_family(f)))
+
+        paf_mod = _load_paf_module()
+        cfg = paf_mod._load_verify_config(repo)
+        consensus_cfg = cfg.get("consensus") or {}
+        # Unattended `watch-prs` defaults `require_hmac` to True unless explicitly disabled in `.agent-verify.json`
+        require_hmac = bool(consensus_cfg.get("require_hmac", True))
+        allow_fb = (
+            bool(allow_same_family_fallback)
+            if allow_same_family_fallback is not None
+            else bool(consensus_cfg.get("allow_same_family_fallback", False))
+        )
+        max_rounds = paf_mod._resolve_max_rounds(None, consensus_cfg)
+
+        resolved_claude = claude_bin or shutil.which("claude") or str(Path.home() / "bin" / "claude")
+        resolved_agy = agy_bin or shutil.which("agy") or str(Path.home() / "bin" / "agy")
+
+        active_bus = bus or GitHubBus(repo, Path(__file__).resolve().parents[2] / "bin" / "paf", resolved_key)
+
+        etags_path = resolved_state / "etags.json"
+        ledger_path = resolved_state / "ledger.json"
+        etags = _load_json_state(etags_path)
+        ledger = _load_json_state(ledger_path)
+
+        has_backoff_for_slug = any(
+            k.startswith(f"{slug}#") and ":backoff:" in k for k in ledger
+        )
+        prev_etag = None if has_backoff_for_slug else etags.get(slug)
+        not_modified, new_etag, open_pr_nums = active_bus.poll_open_prs(slug, prev_etag)
+        if not_modified:
+            return {
+                "repo": slug,
+                "not_modified": True,
+                "reviewed": [],
+                "merged": [],
+                "fixed": [],
+                "paused": [],
+            }
+
+        reviewed: list[int] = []
+        merged: list[int] = []
+        fixed: list[int] = []
+        paused: list[int] = []
+        did_mutate = False
+        has_pending_work = False
+        ledger_dirty = False
+
+        for pr_num in open_pr_nums:
+            pr_data = active_bus.get_pr(pr_num)
+            if str(pr_data.get("state") or "").upper() != "OPEN":
+                continue
+            markers = paf_mod._extract_consensus_markers(pr_data)
+            if not markers:
+                continue
+
+            verdict = paf_mod.evaluate_pr_consensus(
+                pr_data,
+                max_rounds=max_rounds,
+                hmac_secret=secret,
+                require_hmac=require_hmac,
+                allow_same_family_fallback=allow_fb,
+            )
+            status = verdict["status"]
+            head_sha = str(pr_data.get("headRefOid") or "").strip()
+            author_family = verdict.get("author_family") or ""
+            author_host = str(verdict.get("author_host") or "").strip().lower()
+            prior_reviewed_shas = {
+                str(m.get("head_sha") or "").strip().lower()[:12]
+                for m in markers
+                if str(m.get("role") or "").strip().lower() != "author"
+                and str(m.get("verdict") or "").strip().lower() in ("approve", "request_changes")
+                and HEX_SHA_RE.match(str(m.get("head_sha") or "").strip().lower())
+                and not sha_matches(m.get("head_sha"), head_sha)
+            }
+            next_round = max(int(verdict.get("max_round") or 0) + 1, len(prior_reviewed_shas) + 1)
+
+            # Case 1: Consensus already approved -> ONLY author_host merges (single-writer rule)
+            if status == "approved":
+                owns_pr = (author_host == resolved_host) if author_host else (author_family in enabled_families)
+                if owns_pr:
+                    ok, m_reason = active_bus.merge_pr(
+                        pr_num,
+                        require_hmac=require_hmac,
+                        allow_same_family_fallback=allow_fb,
+                        key_file=resolved_key,
+                    )
+                    if ok:
+                        merged.append(pr_num)
+                        did_mutate = True
+                    elif m_reason == "paused":
+                        paused.append(pr_num)
+                    else:
+                        # Check runs still pending or transient merge block -> do not cache ETag!
+                        has_pending_work = True
+                continue
+
+            # Case 2: Paused for human tiebreak -> record and do not loop
+            if status == "paused_human_tiebreak":
+                paused.append(pr_num)
+                continue
+
+            # Case 3: Reviewer requested changes -> ONLY author_host runs fix hook (once per SHA+round)
+            if status == "changes_requested":
+                fix_key = f"{slug}#{pr_num}:{head_sha}:fix-r{verdict.get('max_round', 1)}"
+                if (
+                    author_host
+                    and author_host == resolved_host
+                    and author_family in enabled_families
+                    and author_fix_hook is not None
+                    and not ledger.get(fix_key)
+                ):
+                    ledger[fix_key] = dt.datetime.now(dt.timezone.utc).isoformat()
+                    _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                    if author_fix_hook(repo, pr_data, verdict):
+                        fixed.append(pr_num)
+                        did_mutate = True
+                continue
+
+            if status == "pending_review" and require_hmac and not secret:
+                has_pending_work = True
+                sys.stderr.write(
+                    f"[paf watch-prs] skipping {slug}#{pr_num}: consensus.key missing at {resolved_key} (run `paf init-consensus-key`).\n"
+                )
+                continue
+
+            if status == "pending_review" and not author_family:
+                sys.stderr.write(
+                    f"[paf watch-prs] skipping {slug}#{pr_num}: {verdict.get('reason')}\n"
+                )
+                continue
+
+            # Case 4: Pending review -> heterogeneous family reviews (or fresh-session fallback on CLI outage)
+            if status == "pending_review" and author_family:
+                author_sessions = set(verdict.get("author_session_ids") or [])
+                hetero_candidates = [f for f in enabled_families if f != author_family]
+                review_plan: list[tuple[str, bool]] = [(f, False) for f in hetero_candidates]
+                if allow_fb and author_family in enabled_families and author_sessions:
+                    review_plan.append((author_family, True))
+                if not review_plan:
+                    continue
+
+                if any(
+                    ledger.get(f"{slug}#{pr_num}:{head_sha}:rev:{cand_f}:{resolved_host}")
+                    for cand_f, _ in review_plan
+                ):
+                    continue
+
+                primary_fam, primary_is_fb = review_plan[0]
+                backoff_key = f"{slug}#{pr_num}:{head_sha}:backoff:{resolved_host}"
+                now_utc = dt.datetime.now(dt.timezone.utc)
+                backoff_until = _parse_iso_utc(str(ledger.get(backoff_key) or ""))
+                if backoff_until is not None:
+                    if backoff_until > now_utc:
+                        has_pending_work = True
+                        continue
+                    ledger.pop(backoff_key, None)
+                    ledger_dirty = True
+
+                # Check existing unexpired claim on GitHub before preparing worktree
+                holder = active_claim_holder(pr_data.get("comments") or [], head_sha, primary_fam)
+                if holder and holder != resolved_host:
+                    has_pending_work = True
+                    continue
+
+                # Fail closed BEFORE claiming if detached worktree or diff context cannot be built
+                wt, created_wt = _prepare_detached_worktree(
+                    repo, head_sha, str(pr_data.get("headRefName") or "")
+                )
+                if not created_wt or wt is None:
+                    has_pending_work = True
+                    ledger[backoff_key] = (
+                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=backoff_sec)
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                    sys.stderr.write(
+                        f"[paf watch-prs] aborted review on {slug}#{pr_num}: failed creating detached worktree for {head_sha}.\n"
+                    )
+                    continue
+
+                review_result: dict[str, Any] | None = None
+                chosen_fam = primary_fam
+                chosen_fb = primary_is_fb
+                try:
+                    diff_stat, diff_patch = _collect_diff_context(
+                        wt, str(pr_data.get("baseRefName") or "main"), head_sha
+                    )
+                    if not diff_patch.strip():
+                        has_pending_work = True
+                        ledger[backoff_key] = (
+                            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=backoff_sec)
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                        sys.stderr.write(
+                            f"[paf watch-prs] aborted review on {slug}#{pr_num}: empty diff patch for {head_sha}.\n"
+                        )
+                        continue
+
+                    if not holder:
+                        exp_iso = (
+                            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=claim_ttl_sec)
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        claim_body = (
+                            f"Claiming `{primary_fam}` consensus review on `{head_sha[:12]}` (host `{resolved_host}`).\n\n"
+                            + format_claim_marker(
+                                head_sha=head_sha,
+                                model_family=primary_fam,
+                                host=resolved_host,
+                                expires_at=exp_iso,
+                            )
+                        )
+                        active_bus.post_comment(pr_num, claim_body)
+                        did_mutate = True
+                        if claim_settle_sec > 0:
+                            time.sleep(claim_settle_sec)
+                        refreshed_pr = active_bus.get_pr(pr_num)
+                        if str(refreshed_pr.get("headRefOid") or "").strip() != head_sha:
+                            has_pending_work = True
+                            continue
+                        winner = active_claim_holder(refreshed_pr.get("comments") or [], head_sha, primary_fam)
+                        if winner and winner != resolved_host:
+                            has_pending_work = True
+                            continue
+                        pr_data = refreshed_pr
+
+                    prompt = build_review_prompt(
+                        repo_slug=slug,
+                        pr_data=pr_data,
+                        diff_stat=diff_stat,
+                        diff_patch=diff_patch,
+                        round_num=max(1, next_round),
+                    )
+                    last_err: Exception | None = None
+                    claimed_fams = {primary_fam}
+                    with _shield_key_file(resolved_key):
+                        for cand_fam, is_fb in review_plan:
+                            if is_fb and last_err is not None:
+                                sys.stderr.write(
+                                    f"[paf watch-prs] WARNING on {slug}#{pr_num}: heterogeneous reviewer '{primary_fam}' "
+                                    f"hit API quota/outage ({last_err}); invoking fresh blank '{cand_fam}' fallback session.\n"
+                                )
+                            if is_fb and cand_fam not in claimed_fams:
+                                fb_holder = active_claim_holder(
+                                    pr_data.get("comments") or [], head_sha, cand_fam
+                                )
+                                if fb_holder and fb_holder != resolved_host:
+                                    has_pending_work = True
+                                    continue
+                                if not fb_holder:
+                                    fb_exp = (
+                                        dt.datetime.now(dt.timezone.utc)
+                                        + dt.timedelta(seconds=claim_ttl_sec)
+                                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                    fb_claim = (
+                                        f"Claiming `{cand_fam}` outage-fallback review on `{head_sha[:12]}` (host `{resolved_host}`).\n\n"
+                                        + format_claim_marker(
+                                            head_sha=head_sha,
+                                            model_family=cand_fam,
+                                            host=resolved_host,
+                                            expires_at=fb_exp,
+                                        )
+                                    )
+                                    active_bus.post_comment(pr_num, fb_claim)
+                                    did_mutate = True
+                                    if claim_settle_sec > 0:
+                                        time.sleep(claim_settle_sec)
+                                    refreshed_fb = active_bus.get_pr(pr_num)
+                                    if str(refreshed_fb.get("headRefOid") or "").strip() != head_sha:
+                                        has_pending_work = True
+                                        break
+                                    fb_winner = active_claim_holder(
+                                        refreshed_fb.get("comments") or [], head_sha, cand_fam
+                                    )
+                                    if fb_winner and fb_winner != resolved_host:
+                                        has_pending_work = True
+                                        continue
+                                    pr_data = refreshed_fb
+                                claimed_fams.add(cand_fam)
+                            try:
+                                if cand_fam == "gemini":
+                                    review_result = run_agy_review(
+                                        agy_bin=resolved_agy,
+                                        worktree=wt,
+                                        prompt=prompt,
+                                        model=agy_model,
+                                        timeout_sec=review_timeout_sec,
+                                    )
+                                elif cand_fam == "claude":
+                                    review_result = run_claude_review(
+                                        claude_bin=resolved_claude,
+                                        worktree=wt,
+                                        prompt=prompt,
+                                        model=claude_model,
+                                        key_file=resolved_key,
+                                        timeout_sec=review_timeout_sec,
+                                    )
+                                else:
+                                    continue
+                                if is_fb and (
+                                    not review_result.get("session_id")
+                                    or review_result["session_id"] in author_sessions
+                                ):
+                                    review_result = None
+                                    raise RuntimeError(
+                                        "Fallback session returned missing or colliding session_id"
+                                    )
+                                chosen_fam = cand_fam
+                                chosen_fb = is_fb
+                                break
+                            except Exception as exc:
+                                last_err = exc
+                                if not is_fb and not is_quota_or_outage_error(exc):
+                                    # Non-outage failure (e.g., bad CLI flag or invalid JSON): do not silently degrade heterogeneity
+                                    break
+                                continue
+                    if review_result is None and last_err is not None:
+                        has_pending_work = True
+                        ledger[backoff_key] = (
+                            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=backoff_sec)
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                        sys.stderr.write(f"[paf watch-prs] review runner failed on {slug}#{pr_num}: {last_err}\n")
+                        continue
+                finally:
+                    _remove_worktree(repo, wt, created_wt)
+
+                if review_result is None:
+                    has_pending_work = True
+                    continue
+
+                if contains_secret_material(review_result["prose"], secret):
+                    has_pending_work = True
+                    ledger[backoff_key] = (
+                        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=max(600, backoff_sec))
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                    sys.stderr.write(
+                        f"[paf watch-prs] SECURITY BLOCK on {slug}#{pr_num}: reviewer prose contained secret or credential material; refusing to post.\n"
+                    )
+                    continue
+
+                # Re-verify PR headRefOid did not move while headless model was thinking
+                latest_pr = active_bus.get_pr(pr_num)
+                if str(latest_pr.get("headRefOid") or "").strip() != head_sha:
+                    has_pending_work = True
+                    continue
+
+                base_branch_name = str(latest_pr.get("baseRefName") or pr_data.get("baseRefName") or "main").strip()
+                marker: dict[str, Any] = {
+                    "v": 1,
+                    "role": "reviewer",
+                    "model_family": chosen_fam,
+                    "verdict": review_result["verdict"],
+                    "head_sha": head_sha.lower(),
+                    "round": max(1, next_round),
+                    "blocking_count": review_result["blocking_count"],
+                    "needs_human_decision": review_result["needs_human_decision"],
+                    "session_id": review_result["session_id"],
+                    "host": resolved_host,
+                    "base_branch": base_branch_name,
+                    "pr_number": int(pr_num),
+                }
+                if chosen_fb:
+                    marker["fallback_same_family"] = True
+                sign_marker_in_place(
+                    marker,
+                    secret,
+                    key_file=resolved_key,
+                    require_hmac=require_hmac,
+                )
+
+                fallback_banner = (
+                    "> **[Outage Fallback Review]**: Primary heterogeneous reviewer encountered an API quota/outage error; "
+                    "reviewed by an independent fresh blank session.\n\n"
+                    if chosen_fb
+                    else ""
+                )
+                comment_body = (
+                    fallback_banner
+                    + review_result["prose"].strip()
+                    + "\n\n"
+                    + f"<!-- paf-consensus: {json.dumps(marker, separators=(',', ':'))} -->"
+                )
+                active_bus.post_comment(pr_num, comment_body)
+                reviewed.append(pr_num)
+                did_mutate = True
+                rev_ledger_key = f"{slug}#{pr_num}:{head_sha}:rev:{chosen_fam}:{resolved_host}"
+                ledger[rev_ledger_key] = dt.datetime.now(dt.timezone.utc).isoformat()
+                ledger.pop(backoff_key, None)
+                _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+                ledger_dirty = False
+
+                # Immediate single-tick convergence: if this machine ALSO owns the PR (`author_host == resolved_host`)
+                # and review approved, merge right away without waiting 45s for the next poll tick!
+                owns_pr = (author_host == resolved_host) if author_host else False
+                if (
+                    owns_pr
+                    and review_result["verdict"] == "approve"
+                    and review_result["blocking_count"] == 0
+                    and not review_result["needs_human_decision"]
+                ):
+                    ok, m_reason = active_bus.merge_pr(
+                        pr_num,
+                        require_hmac=require_hmac,
+                        allow_same_family_fallback=allow_fb,
+                        key_file=resolved_key,
+                    )
+                    if ok:
+                        merged.append(pr_num)
+                    elif m_reason == "paused":
+                        paused.append(pr_num)
+                    else:
+                        has_pending_work = True
+
+        if ledger_dirty:
+            _save_json_state(ledger_path, ledger, max_entries=MAX_LEDGER_ENTRIES)
+
+        # Persist ETag ONLY when no PR was left in a non-terminal pending/backoff/CI-waiting state
+        if has_pending_work:
+            if slug in etags:
+                etags.pop(slug, None)
+                _save_json_state(etags_path, etags)
+        else:
+            if did_mutate:
+                _, refreshed_etag, _ = active_bus.poll_open_prs(slug, None)
+                if refreshed_etag:
+                    new_etag = refreshed_etag
+            if new_etag:
+                etags[slug] = new_etag
+                _save_json_state(etags_path, etags)
+
+        return {
+            "repo": slug,
+            "not_modified": False,
+            "reviewed": reviewed,
+            "merged": merged,
+            "fixed": fixed,
+            "paused": paused,
+        }
+    finally:
+        try:
+            fcntl.flock(repo_lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(repo_lock_fd)
+
+
+def discover_watched_repos(workspace: Path, explicit_repos: list[Path] | None) -> list[Path]:
+    restricted = "mind" + "-" + "state"
+    if explicit_repos:
+        return [r.expanduser().resolve() for r in explicit_repos]
+    found: list[Path] = []
+    ws = workspace.expanduser().resolve()
+    if not ws.is_dir():
+        return found
+    for child in sorted(ws.iterdir()):
+        if not child.is_dir() or child.name.startswith(".") or child.name == restricted:
+            continue
+        if (child / ".agent-verify.json").is_file() and (child / ".git").exists():
+            found.append(child)
+    return found
+
+
+def build_launchd_plist(
+    *,
+    paf_bin: Path,
+    repo_dirs: list[Path],
+    host_id: str,
+    interval: int = 45,
+    families: str = "claude,gemini",
+    label: str = "com.leo.paf-watcher",
+    state_dir: Path | None = None,
+    key_file: Path | None = None,
+) -> bytes:
+    st_dir = (state_dir or DEFAULT_STATE_DIR).expanduser().resolve()
+    log_dir = st_dir / "logs"
+    prog_args = [
+        sys.executable,
+        str(paf_bin.expanduser().resolve()),
+        "watch-prs",
+        "--once",
+        "--host",
+        host_id,
+        "--families",
+        families,
+        "--state-dir",
+        str(st_dir),
+    ]
+    if key_file is not None:
+        prog_args.extend(["--key-file", str(key_file.expanduser().resolve())])
+    for r in repo_dirs:
+        prog_args.extend(["--repo-dir", str(r.expanduser().resolve())])
+
+    path_entries = [
+        str(Path.home() / "bin"),
+        str(Path.home() / ".local" / "bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    plist_obj: dict[str, Any] = {
+        "Label": label,
+        "ProgramArguments": prog_args,
+        "RunAtLoad": True,
+        "StartInterval": max(10, int(interval)),
+        "ProcessType": "Background",
+        "EnvironmentVariables": {
+            "HOME": str(Path.home()),
+            "PATH": ":".join(path_entries),
+            "PAF_HOST_ID": host_id,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        "StandardOutPath": str(log_dir / "paf-watcher.out.log"),
+        "StandardErrorPath": str(log_dir / "paf-watcher.err.log"),
+    }
+    return plistlib.dumps(plist_obj, fmt=plistlib.FMT_XML)

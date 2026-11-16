@@ -3,6 +3,10 @@
   "zone": "autonomous",
   "default_branch": "main",
   "require_blind_review": true,
+  "consensus": {
+    "require_hmac": true,
+    "allow_same_family_fallback": true
+  },
   "dune_lint": {
     "enabled": true,
     "cjk_allow_globs": [
@@ -18,6 +22,7 @@
       "python3 framework/scripts/tests/memory-scoring-frontmatter.test.py",
       "python3 framework/checks/tests/test_dune_lint.py",
       "python3 framework/scripts/tests/test_paf_cli.py",
+      "python3 framework/scripts/tests/test_paf_watcher.py",
       "bash framework/hooks/tests/validate-git-push.test.sh",
       "bash framework/hooks/tests/validate-outbound-placeholders.test.sh",
       "bash framework/hooks/tests/remind-engineering-lessons.test.sh",
@@ -28,6 +33,7 @@
       "python3 framework/scripts/tests/memory-scoring-frontmatter.test.py",
       "python3 framework/checks/tests/test_dune_lint.py",
       "python3 framework/scripts/tests/test_paf_cli.py",
+      "python3 framework/scripts/tests/test_paf_watcher.py",
       "bash framework/hooks/tests/protect-verification-assets.test.sh"
     ]
   }
