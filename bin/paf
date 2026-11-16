@@ -152,6 +152,7 @@ GOVERNANCE_FILE_RE = re.compile(
 def _governance_files_touched(repo: Path, pr_data: dict[str, Any] | None, base_branch: str) -> list[str]:
     pr_paths: list[str] = []
     expected_count: int | None = None
+    files_listed = False
     if pr_data is not None:
         if pr_data.get("changedFiles") is not None:
             try:
@@ -159,25 +160,40 @@ def _governance_files_touched(repo: Path, pr_data: dict[str, Any] | None, base_b
             except (TypeError, ValueError):
                 expected_count = None
         if isinstance(pr_data.get("files"), list):
+            files_listed = True
             for item in pr_data["files"]:
                 if isinstance(item, dict) and item.get("path"):
                     pr_paths.append(str(item["path"]))
                 elif isinstance(item, str) and item:
                     pr_paths.append(item)
     truncated = expected_count is not None and expected_count > len(pr_paths)
+    # A PR payload with no file list at all says nothing about which files changed.
+    unknown = pr_data is not None and not files_listed
     paths: list[str] = list(pr_paths)
-    if (not paths or truncated) and (repo / ".git").exists():
-        for ref in (base_branch, f"origin/{base_branch}"):
-            diff_res = _git(repo, "diff", "--name-only", f"{ref}...HEAD", check=False)
-            if diff_res.returncode == 0 and diff_res.stdout.strip():
-                git_paths = [line.strip() for line in diff_res.stdout.splitlines() if line.strip()]
-                paths.extend(git_paths)
-                if expected_count is not None and len(set(paths)) >= expected_count:
-                    truncated = False
-                break
+    if (not paths or truncated or unknown) and (repo / ".git").exists():
+        # The local diff describes the PR only when the local checkout is the PR head. Without a PR payload
+        # (`paf ship` before a PR exists) the local branch is what ships, so the diff is the right source.
+        local_is_pr_head = True
+        if pr_data is not None:
+            pr_head = str(pr_data.get("headRefOid") or "").strip().lower()
+            local_head_res = _git(repo, "rev-parse", "HEAD", check=False)
+            local_head = local_head_res.stdout.strip().lower() if local_head_res.returncode == 0 else ""
+            local_is_pr_head = bool(pr_head) and pr_head == local_head
+        if local_is_pr_head:
+            for ref in (base_branch, f"origin/{base_branch}"):
+                diff_res = _git(repo, "diff", "--name-only", f"{ref}...HEAD", check=False)
+                if diff_res.returncode == 0:
+                    git_paths = [line.strip() for line in diff_res.stdout.splitlines() if line.strip()]
+                    paths.extend(git_paths)
+                    unknown = False
+                    if expected_count is not None and len(set(paths)) >= expected_count:
+                        truncated = False
+                    break
     matched = sorted({p for p in paths if GOVERNANCE_FILE_RE.search(re.sub(r"^(?:\./)+", "", p))})
     if truncated:
         matched.append(f"<truncated-pr-files:{len(pr_paths)}/{expected_count}>")
+    elif unknown:
+        matched.append("<unknown-pr-files>")
     return matched
 
 
