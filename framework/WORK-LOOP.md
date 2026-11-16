@@ -63,18 +63,18 @@
 4. 失敗時立即記錄到 STM Failures，分析 root cause
 5. 記錄到 STM: Code Changes
 
-## Step 6: Deterministic Verify & Blind Adversarial Review（雙重驗證）
+## Step 6: Deterministic Verify & Cross-Model PR Consensus（確定性驗證與雙異質模型共識）
 1. 執行 `paf verify --repo {repo} --mode pre-push`，產生綁定 `HEAD` SHA 的 Verification Artifact（含 Dune static checks、build、typecheck、行為級 unit test、boot smoke）。新 logic 必附**行為級**測試（mock 掉共用路徑的假綠燈不算）。
-2. **派獨立 Blind Adversarial Reviewer 子代理（`research` 唯讀）**：
-   - 輸入**僅限** `git diff {base}...HEAD` 與測試輸出，**絕不傳入**主 agent 的推理過程或為何這樣寫的辯護。
-   - 審查重點：測試是否漏測失敗分支、是否 mock 掉受測標的、是否有跨環境寫死預設值、是否違反安全邊界。
-   - 審查通過後執行 `paf record-review --repo {repo} --verdict approve --reviewer blind-subagent --summary "..."` 寫入 SHA 綁定收據；若為 `request_changes` 則回 Step 5 修正並重跑新 SHA 的驗證與審查。
+2. **雙異質模型 PR 共識審查（預設標準）**：
+   - 作者模型執行 `paf ship --repo {repo} --open-for-consensus --author-family <claude|gemini>` 推送分支並開立／更新附帶 Verification Artifact 與作者模型標籤的 PR。
+   - 另一家族模型（`claude` <-> `gemini`）僅讀 `git diff`、程式碼與測試輸出進行獨立審查，並透過 `paf post-consensus --pr {num} --role reviewer --family <fam> --head-sha <reviewed_sha> --verdict <approve|request_changes>` 留下讀寫雙向綁定 `headRefOid` 的結構化留言（單一 GitHub 帳號架構下以 `paf-consensus` HTML 標記自聲明 `model_family`，嚴禁代簽非自身模型家族，亦不使用 GitHub 原生 Review Approve 按鈕）。
+   - 若為 `request_changes`，作者模型直接在同一 PR 推修正 commit 重審（上限 3 輪；超過 3 輪死鎖或涉及消費者 UX 偏好決策時觸發 `PAUSED_FOR_CONSENSUS_TIEBREAK` 請使用者拍板）。只有異質家族能簽出有效 `approve`，但任何家族（含同家族第二視窗或未標記家族）在當前 SHA 留下的 `request_changes` 或 `needs_human_decision: true` 皆會阻斷合併；且一旦 PR 帶有共識標記，本機 `paf record-review` 收據絕不可覆蓋共識閘門（僅從未進入共識的單機備援 PR 才使用 `paf record-review`）。
 
-## Step 7: Ship & Post-Merge Self-Healing（交付與善後閉環）
+## Step 7: Auto-Merge on Consensus & Post-Merge Self-Healing（共識後自動合併與善後閉環）
 1. Commit（明確指定路徑暫存，禁用 `git add -A`）: `git commit -m "[{ticket_id}] {描述}"`
-2. 依 `.agent-verify.json` 的 `zone` 執行 `paf ship`：
-   - **`zone: "autonomous"`（個人倉庫）**：`paf ship` 全自動執行 push → 開立附帶 Verification Artifact 與 Blind Review 收據的 PR → 等待 GitHub Actions CI 全綠（失敗自動抓取 `gh run view --log-failed` 進除錯迴圈）→ `gh pr merge --squash --delete-branch --match-head-commit <SHA>` 原子合併進 `main` → 同步 `main` 並執行 `post-merge` 驗收（失敗立即自動開立 revert PR 回滾善後）。全程不需人類介入。
-   - **`zone: "guarded"`（公司／團隊倉庫）**：自動完成 PR、CI 與 `stage_test` 驗證；對 `main` 執行 `paf ship` 時停在 `PAUSED_FOR_MAIN_APPROVAL` 呈報使用者。**一旦使用者回覆 `approve`**，立即執行 `paf ship --approved-main`，自動跑完原子 merge、部署後測試、異常自動除錯或自動回滾閉環。
+2. **達成共識後由 Agent 自己合併（通則）**——依 `.agent-verify.json` 的明確 `zone`（缺 `zone` 一律 fail-closed）執行 `paf merge-consensus`（或 `paf post-consensus --head-sha <SHA> --auto-merge` / `paf ship`）：
+   - **`zone: "autonomous"`（個人倉庫）**：一般程式碼 PR 一旦雙異質模型對最新 `headRefOid` 達成 `approve` 共識且 GitHub Actions CI 全綠，Agent **立即自己執行** `gh pr merge --squash --match-head-commit <SHA>` 原子合併進 `main`、刪除遠端分支、同步 `main` 並執行可攜式 `post-merge` 驗收（驗收失敗立即由 `paf` 自動開立 revert PR 回滾善後；綁定特定機器的動作如 `launchd/install.sh` 或 VPN 探針不可放進 `post_merge_check`，由宿主端 pull 後執行）。若基底衝突需從新 `main` 重建分支，重建後的新 SHA **必須經異質模型以 `git range-diff` 等方式補簽一次 `approve`** 才能合併；若 PR 修改了 `CORE.md`、`AGENTS.md`、`CLAUDE.md`、`.agent-verify.json`、`bin/paf`、hooks 等權限／治理檔案，則停在 `PAUSED_FOR_GOVERNANCE_APPROVAL` 等使用者確認一次（`--approved-governance`）。
+   - **`zone: "guarded"`（公司／團隊倉庫）**：僅 `.agent-verify.json` `staging_branches` 白名單內的預演分支（預設 `staging`、`stage_test`）在達成共識、人類必要審查無阻斷且測試通過後由 Agent 自己合併並驗證；**其餘所有分支（`main`、`master`、`release/*`）一律在完成雙模型共識後停在 `PAUSED_FOR_MAIN_APPROVAL` 呈報使用者**。模型共識不取代人類同事 Code Review（GitHub `reviewDecision` 要求人類審查時 `paf` 自動阻斷），且工作區 `CLAUDE.md` 若有更嚴規則（例如由使用者本人合併 release PR）一律從其規定；使用者核准且符合工作區規則後，以 `--approved-main` 跑完閉環。
 3. **文件比對** — 這次改的行為，去 fetch 描述它的文件並搜尋，確認仍然成立。
    新的 error code / reason / status 值也算。文件寫過舊行為時要明講「先前版本說 X，
    當時為真，現已不是」，不要默默覆蓋。仍然不寫尚未部署的行為。
