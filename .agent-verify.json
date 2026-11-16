@@ -3,6 +3,10 @@
   "zone": "autonomous",
   "default_branch": "main",
   "require_blind_review": true,
+  "consensus": {
+    "require_hmac": true,
+    "allow_same_family_fallback": true
+  },
   "dune_lint": {
     "enabled": true,
     "cjk_allow_globs": [

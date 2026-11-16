@@ -758,30 +758,53 @@ def _extract_author_metadata(
     *,
     hmac_secret: str | None = None,
     require_hmac: bool = False,
-) -> tuple[str, list[str], str, set[str], bool]:
+    expected_base: str = "",
+    expected_pr_num: int = 0,
+) -> tuple[str, list[str], str, set[str], bool, str]:
     pw = _watcher_mod()
     seen: list[str] = []
     author_host = ""
-    all_author_sessions: set[str] = set()
+    verified_author_sessions: set[str] = set()
     bad_author_sig = False
+    mismatch_detail = ""
+    local_kid = pw.compute_key_id(hmac_secret) if hmac_secret else ""
 
     for m in markers:
         role = str(m.get("role") or "").strip().lower()
         verdict = str(m.get("verdict") or "").strip().lower()
         if role != "author" and verdict != "open":
             continue
-        raw_sess = str(m.get("session_id") or "").strip()
-        if raw_sess:
-            all_author_sessions.add(raw_sess)
 
         has_sig = bool(str(m.get("sig") or "").strip())
+        m_kid = str(m.get("key_id") or "").strip()
         if has_sig and hmac_secret and not pw.verify_consensus_hmac(hmac_secret, m):
             bad_author_sig = True
+            if m_kid and local_kid and m_kid != local_kid:
+                mismatch_detail = f"key_id mismatch (marker={m_kid}, local={local_kid}); sync ~/.config/paf/consensus.key across machines"
             continue
         if require_hmac:
             if not hmac_secret or not has_sig or not pw.verify_consensus_hmac(hmac_secret, m):
                 bad_author_sig = True
+                if m_kid and local_kid and m_kid != local_kid:
+                    mismatch_detail = f"key_id mismatch (marker={m_kid}, local={local_kid}); sync ~/.config/paf/consensus.key across machines"
                 continue
+
+        m_base = str(m.get("base_branch") or "").strip()
+        if m_base and expected_base and m_base != expected_base:
+            bad_author_sig = True
+            continue
+        try:
+            m_pr_num = int(m["pr_number"]) if m.get("pr_number") is not None else 0
+        except (TypeError, ValueError):
+            m_pr_num = 0
+        if m_pr_num > 0 and expected_pr_num > 0 and m_pr_num != expected_pr_num:
+            bad_author_sig = True
+            continue
+
+        # Only harvest session_ids AFTER signature/context verification so an unsigned comment cannot DoS a reviewer
+        raw_sess = str(m.get("session_id") or "").strip()
+        if raw_sess:
+            verified_author_sessions.add(raw_sess)
 
         fam = _normalize_family(m.get("model_family") or m.get("author"))
         if fam and fam not in seen:
@@ -791,11 +814,11 @@ def _extract_author_metadata(
             author_host = host_cand
 
     inferred = seen[0] if len(seen) == 1 else ""
-    return inferred, seen, author_host, all_author_sessions, bad_author_sig
+    return inferred, seen, author_host, verified_author_sessions, bad_author_sig, mismatch_detail
 
 
 def _infer_author_family_from_markers(markers: list[dict[str, Any]]) -> tuple[str, list[str]]:
-    inferred, seen, _host, _sessions, _bad = _extract_author_metadata(markers)
+    inferred, seen, _host, _sessions, _bad, _mm = _extract_author_metadata(markers)
     return inferred, seen
 
 
@@ -835,11 +858,22 @@ def evaluate_pr_consensus(
             "max_round": 0,
         }
 
+    expected_base = str(pr_data.get("baseRefName") or "").strip()
+    try:
+        expected_pr_num = int(pr_data["number"]) if pr_data.get("number") is not None else 0
+    except (TypeError, ValueError):
+        expected_pr_num = 0
+    local_kid = pw.compute_key_id(hmac_secret) if hmac_secret else ""
+
     markers = _extract_consensus_markers(pr_data)
-    inferred_af, seen_authors, author_host, author_session_ids, bad_author_sig = _extract_author_metadata(
-        markers,
-        hmac_secret=hmac_secret,
-        require_hmac=require_hmac,
+    inferred_af, seen_authors, author_host, author_session_ids, bad_author_sig, key_mismatch = (
+        _extract_author_metadata(
+            markers,
+            hmac_secret=hmac_secret,
+            require_hmac=require_hmac,
+            expected_base=expected_base,
+            expected_pr_num=expected_pr_num,
+        )
     )
     author_family = _normalize_family(author_family_override)
     if not author_family:
@@ -859,7 +893,11 @@ def evaluate_pr_consensus(
         author_family = inferred_af
 
     if not author_family:
-        extra_hint = " (unsigned or tampered author marker ignored)" if bad_author_sig else ""
+        extra_hint = ""
+        if key_mismatch:
+            extra_hint = f" ({key_mismatch})"
+        elif bad_author_sig:
+            extra_hint = " (unsigned, replayed, or tampered author marker ignored)"
         return {
             "status": "pending_review",
             "reason": (
@@ -878,6 +916,7 @@ def evaluate_pr_consensus(
     same_family_rejected = False
     same_session_rejected = False
     hmac_rejected = False
+    replay_rejected = False
     unknown_reviewer_rejected = False
     latest_by_family: dict[str, dict[str, Any]] = {}
     unlabeled_objections: list[dict[str, Any]] = []
@@ -906,8 +945,11 @@ def evaluate_pr_consensus(
 
         if not is_objection:
             has_sig = bool(str(m.get("sig") or "").strip())
+            m_kid = str(m.get("key_id") or "").strip()
             if has_sig and hmac_secret and not pw.verify_consensus_hmac(hmac_secret, m):
                 hmac_rejected = True
+                if m_kid and local_kid and m_kid != local_kid:
+                    key_mismatch = f"key_id mismatch (marker={m_kid}, local={local_kid}); sync ~/.config/paf/consensus.key across machines"
                 continue
             if require_hmac:
                 raw_m_sha = str(m.get("head_sha") or "").strip().lower()
@@ -918,7 +960,26 @@ def evaluate_pr_consensus(
                     or not pw.verify_consensus_hmac(hmac_secret, m)
                 ):
                     hmac_rejected = True
+                    if m_kid and local_kid and m_kid != local_kid:
+                        key_mismatch = f"key_id mismatch (marker={m_kid}, local={local_kid}); sync ~/.config/paf/consensus.key across machines"
                     continue
+            m_base = str(m.get("base_branch") or "").strip()
+            try:
+                m_pr_num = int(m["pr_number"]) if m.get("pr_number") is not None else 0
+            except (TypeError, ValueError):
+                m_pr_num = 0
+            if m_base and expected_base and m_base != expected_base:
+                replay_rejected = True
+                continue
+            if m_pr_num > 0 and expected_pr_num > 0 and m_pr_num != expected_pr_num:
+                replay_rejected = True
+                continue
+            if require_hmac and (
+                (expected_base and m_base != expected_base)
+                or (expected_pr_num > 0 and m_pr_num != expected_pr_num)
+            ):
+                replay_rejected = True
+                continue
             if not rev_fam:
                 unknown_reviewer_rejected = True
                 continue
@@ -1043,9 +1104,14 @@ def evaluate_pr_consensus(
             "max_round": max_round_seen,
         }
 
-    if hmac_rejected:
+    if replay_rejected:
         reason = (
-            f"Rejected unsigned or tampered consensus signature; awaiting valid HMAC-signed approval on --head-sha {head_sha}."
+            f"Rejected replayed consensus marker (PR number or base_branch mismatch) on --head-sha {head_sha}."
+        )
+    elif hmac_rejected:
+        detail = f" ({key_mismatch})" if key_mismatch else ""
+        reason = (
+            f"Rejected unsigned or tampered consensus signature{detail}; awaiting valid HMAC-signed approval on --head-sha {head_sha}."
         )
     elif same_session_rejected:
         reason = (
@@ -1396,7 +1462,12 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
 
     if args.role == "reviewer" and session_id:
         existing_markers = _extract_consensus_markers(pr_data)
-        _inf_af, _seen_af, _ah, author_sessions, _bad = _extract_author_metadata(existing_markers)
+        _inf_af, _seen_af, _ah, author_sessions, _bad, _mm = _extract_author_metadata(
+            existing_markers,
+            hmac_secret=hmac_secret,
+            expected_base=str(pr_data.get("baseRefName") or "").strip(),
+            expected_pr_num=int(pr_data["number"]) if pr_data.get("number") is not None else 0,
+        )
         if session_id in author_sessions and args.verdict == "approve":
             print(
                 f"paf post-consensus REFUSED: authoring session '{session_id}' cannot post an approve review on its own PR.",
@@ -1404,6 +1475,8 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
             )
             return 2
 
+    pr_base = str(pr_data.get("baseRefName") or "").strip()
+    pr_num_int = int(pr_data["number"]) if pr_data.get("number") is not None else 0
     marker: dict[str, Any] = {
         "v": 1,
         "role": args.role,
@@ -1415,6 +1488,10 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
         "needs_human_decision": bool(args.needs_human_decision),
         "host": host_id,
     }
+    if pr_base:
+        marker["base_branch"] = pr_base
+    if pr_num_int > 0:
+        marker["pr_number"] = pr_num_int
     if session_id:
         marker["session_id"] = session_id
     if getattr(args, "fallback_same_family", False):
@@ -1538,7 +1615,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
                 "view",
                 branch,
                 "--json",
-                "number,url,state,headRefOid,body,comments,files,changedFiles,reviewDecision",
+                "number,url,state,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
             ],
             cwd=repo,
             text=True,
@@ -1557,10 +1634,12 @@ def cmd_ship(args: argparse.Namespace) -> int:
         open_pr_info = parsed_pr
         pr_markers = _extract_consensus_markers(parsed_pr)
         has_consensus_markers = bool(pr_markers)
-        inferred_af, seen_af, inferred_host, _a_sess, _bad_sig = _extract_author_metadata(
+        inferred_af, seen_af, inferred_host, _a_sess, _bad_sig, _mm = _extract_author_metadata(
             pr_markers,
             hmac_secret=hmac_secret,
             require_hmac=require_hmac,
+            expected_base=str(parsed_pr.get("baseRefName") or base_branch).strip(),
+            expected_pr_num=int(parsed_pr["number"]) if parsed_pr.get("number") is not None else 0,
         )
         existing_author_host = inferred_host
         if not author_fam and len(seen_af) == 1:
@@ -1682,7 +1761,10 @@ def cmd_ship(args: argparse.Namespace) -> int:
             "verdict": "open",
             "head_sha": head_sha.lower(),
             "host": existing_author_host or host_id,
+            "base_branch": base_branch,
         }
+        if open_pr_info is not None and open_pr_info.get("number") is not None:
+            author_marker["pr_number"] = int(open_pr_info["number"])
         if session_id:
             author_marker["session_id"] = session_id
         pw.sign_marker_in_place(author_marker, hmac_secret)
