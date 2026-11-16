@@ -53,16 +53,15 @@
 - 依上方結構 `mkdir` + 建立 `.agent-factory/manifest.json` 與 `.agent-factory/instance.json`
 - **禁止複製完整 `memory_scoring.py` 或 `.claude/hooks/`**：所有評分與壓縮邏輯集中於 `$FACTORY/framework/scripts/memory_scoring.py`（透過 `paf score --dir {instance}` 或 10 行 thin wrapper 執行）；hooks 在 `.claude/settings.json` 直接填 `{factory_path}/framework/hooks/*.sh`
 - `CLAUDE.md`：填 `framework/templates/CLAUDE.instance.md` 的所有 `{佔位符}`；沒有答案的欄位保留 TODO 並列給 Leo。其中 `{factory_path}` 一律填**本機解析後的絕對路徑**（上方 `$FACTORY` 探測結果）——instance 檔案內不留探測邏輯，烘死路徑
-- 產品 repo 建立 `.agent-verify.json`（個人倉庫 `zone: "autonomous"`，公司／團隊倉庫 `zone: "guarded"`；個人倉庫同步建立 `.github/workflows/ci.yml` 執行對應的靜態檢查與單元測試，本機 pre-push 與 `paf ship` 由 `paf verify` 驅動）。若同時建立全新個人產品 repo，從第一筆 commit 起直接依 `framework/HIGH-TRUST-REPO.md` 流程 A 備齊功能同處一室目錄、極薄誠實共用基礎層與標準範本、雙向機器驗證的 `FEATURE_MAP.md` 與 `scripts/check-architecture.*`、啟用 `dune_lint` 且不含 `--passWithNoTests` 的 `.agent-verify.json`，以及執行完整 `init()` 生命週期的啟動測試
+- 產品 repo 建立 `.agent-verify.json`（個人倉庫 `zone: "autonomous"`，公司／團隊倉庫 `zone: "guarded"`；個人倉庫同步建立 `.github/workflows/ci.yml` 執行對應的靜態檢查與單元測試，本機 pre-push 與 `paf ship` 由 `paf verify` 驅動）。若同時從零建立全新個人產品 repo，從第一筆 commit 起依 `framework/HIGH-TRUST-REPO.md` 流程 A 備齊同功能集中目錄、名稱如實對應底層技術的極薄共用基礎層與標準範本、雙向機器驗證的 `FEATURE_MAP.md` 與放入 `commands.lint` 的 `scripts/check-architecture.*`、啟用 `dune_lint` 且不含 `--passWithNoTests` 的 `.agent-verify.json`，以及執行完整 `init()` 生命週期的啟動測試
 - 各 `_index.md` 由 `paf score --dir {instance}` 初始化生成（單列摘要強制壓縮 ≤160 字元，`journal/_index.md` 預設只列最新 50 筆確保 L2 預算恆定）
 
 ### 3. 餵 repos（長出第一版 LTM）
 對每個 repo 派一個 Explore 子 agent（可平行）：
 - 掃 README、package.json/build 設定、目錄結構、CI/deploy 設定、env var 用法
 - 產出：這個 repo 是什麼、tech stack、怎麼 build/test/run、部署方式、明顯的 gotchas
-- **High-Trust 與欄杆盤點**：對照 `framework/HIGH-TRUST-REPO.md` 的六項結構準則與 enforcement ladder 第 1–6 階，檢查這個 repo 現有哪些確定性欄杆，包含功能同處一室與跨服務匯入禁令、誠實薄基礎層與連線池保護、雙向驗證的 `FEATURE_MAP.md`、strict type、`dune_lint`、CI 檢查，以及完整 `init()` 啟動與邊界測試，並列出缺少的項目。
-  團隊倉庫 `zone: "guarded"` 將缺口寫成 `long-term-memory/guardrail-gaps.md`，只做盤點與提案而不擅自修改共用 repo，因為加 lint 或 CI 規則會影響整個團隊，由 Leo 決定何時以正式 ticket 或 PR 提給團隊。這份檔案同時讓 agent 寫 code 時知道哪些紀律沒有自動把關，需要在 work loop Step 5–6 自行補齊驗證。
-  個人倉庫 `zone: "autonomous"` 若需要升級或瘦身為 High-Trust Environment，直接依 `framework/HIGH-TRUST-REPO.md` 流程 B 執行改造與雙模型共識交付
+- **High-Trust 與欄杆唯讀盤點**：對照 `framework/HIGH-TRUST-REPO.md` 的六項結構準則與 enforcement ladder 第 1–6 階，唯讀檢查這個 repo 現有哪些確定性欄杆，包含同功能集中目錄與跨服務匯入禁令、極薄基礎層與連線池保護、雙向驗證的 `FEATURE_MAP.md`、strict type、`dune_lint`、CI 檢查，以及完整 `init()` 啟動與邊界測試，並列出缺少的項目寫入 `long-term-memory/guardrail-gaps.md`。
+  初始化階段一律只做盤點與提案，不擅自修改產品 repo。團隊倉庫 `zone: "guarded"` 加 lint 或 CI 規則會影響整個團隊，由 Leo 決定何時以正式 ticket 或 PR 提給團隊；個人倉庫 `zone: "autonomous"` 待日後 Leo 指派瘦身或升級任務時，再依 `framework/HIGH-TRUST-REPO.md` 流程 B 執行改造與雙模型共識交付。這份檔案同時讓 agent 日常寫 code 時知道哪些紀律沒有自動把關，需要在 work loop Step 5–6 自行補齊驗證
 彙整寫入：
 - `long-term-memory/repos.md` — 每 repo 一節
 - `long-term-memory/patterns.md` — build/deploy/config 慣例
