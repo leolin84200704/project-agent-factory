@@ -1393,6 +1393,204 @@ print(json.dumps({{"status": "DONE", "conversation_id": sid, "structured_output"
     else:
         print("PASS 11 drives multi-round persistent --session-id/--resume & --conversation consensus, merges, closes both sessions, and runs deploy + post-deploy check")
 
+    # ------------------------------------------------------------------
+    # 12. Dialogue <-> Watcher Interlock, Refreshed Verify Artifact, Empty Session Guard, & Nonce Cleanup
+    # ------------------------------------------------------------------
+    final_dlg_sha = str(dlg_res.get("head_sha") or "")
+    refreshed_art = repo_dlg / ".git" / f"paf-verify-{final_dlg_sha[:12]}-pre-push.md"
+    updated_pr88_body = str(dlg_bus.prs[88].get("body") or "")
+    nb3_ok = (
+        bool(final_dlg_sha)
+        and final_dlg_sha != dlg_sha1
+        and refreshed_art.is_file()
+        and final_dlg_sha in updated_pr88_body
+        and "## Verification Artifact" in updated_pr88_body
+        and "caller-interactive-sess-001" in updated_pr88_body
+    )
+
+    # NB4 expanded protected path regex check
+    nb4_ok = all(
+        paf_watcher.FORBIDDEN_AUTO_EDIT_RE.search(p) is not None
+        for p in (
+            ".claude/settings.local.json",
+            ".gemini/settings.json",
+            "githooks/pre-push",
+            "framework/githooks/pre-push",
+            "hooks/pre-tool.py",
+            "framework/hooks/guard.py",
+        )
+    ) and all(
+        paf_watcher.FORBIDDEN_AUTO_EDIT_RE.search(p) is None
+        for p in ("bin/paf", "framework/scripts/paf_watcher.py", "CORE.md")
+    )
+
+    # Nonce-attributed agy brain session lookup (never touches unrelated concurrent brain dirs)
+    old_home_12 = os.environ.get("HOME")
+    os.environ["HOME"] = str(fake_home)
+    try:
+        b_unrelated = fake_home / ".gemini" / "antigravity-cli" / "brain" / "concurrent-unrelated-sess-777"
+        b_unrelated.mkdir(parents=True, exist_ok=True)
+        (b_unrelated / "transcript.jsonl").write_text('{"prompt":"other task"}\n', encoding="utf-8")
+        b_target = fake_home / ".gemini" / "antigravity-cli" / "brain" / "timed-out-author-sess-888"
+        b_target.mkdir(parents=True, exist_ok=True)
+        (b_target / "transcript.jsonl").write_text('{"prompt":"<!-- paf-agy-nonce-test-123 -->"}\n', encoding="utf-8")
+        matched_nonce_sid = paf_watcher._find_agy_session_by_nonce(
+            {"caller-interactive-sess-001"}, "paf-agy-nonce-test-123"
+        )
+    finally:
+        if old_home_12 is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home_12
+
+    # Interlock check: `run_consensus_dialogue` lock + registry lease blocks duplicate dialogue and skips `watch_repo_once`
+    ilock_state = dlg_root / "ilock_state"
+    ilock_bus = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo_dlg,
+        prs={
+            89: {
+                "number": 89,
+                "url": "https://example.test/pr/89",
+                "state": "OPEN",
+                "headRefName": "feature/persistent-dlg",
+                "baseRefName": "main",
+                "headRefOid": dlg_sha1,
+                "body": f"Feature\n\n<!-- paf-consensus: {json.dumps(dict(dlg_author_m, pr_number=89, sig='', key_id=''), separators=(',', ':'))} -->",
+                "comments": [],
+                "files": [{"path": "app.py"}],
+                "reviewDecision": "",
+            }
+        },
+        key_file=key_file,
+    )
+    m89 = dict(dlg_author_m, pr_number=89)
+    m89.pop("sig", None)
+    m89.pop("key_id", None)
+    paf_watcher.sign_marker_in_place(m89, dlg_secret, key_file=key_file, require_hmac=True)
+    ilock_bus.prs[89]["body"] = f"Feature\n\n<!-- paf-consensus: {json.dumps(m89, separators=(',', ':'))} -->"
+
+    dup_lock_blocked = False
+    with paf_watcher._acquire_pr_dialogue_lock(ilock_state, "leolin84200704/dlg", 89):
+        watch_while_locked = paf_watcher.watch_repo_once(
+            repo=repo_dlg,
+            repo_slug="leolin84200704/dlg",
+            host_id="personal-mac",
+            state_dir=ilock_state,
+            key_file=key_file,
+            bus=ilock_bus,
+            claude_bin=str(dlg_claude),
+            agy_bin=str(dlg_agy),
+        )
+        try:
+            paf_watcher.run_consensus_dialogue(
+                repo=repo_dlg,
+                pr_number=89,
+                repo_slug="leolin84200704/dlg",
+                author_family="gemini",
+                host_id="personal-mac",
+                state_dir=ilock_state,
+                key_file=key_file,
+                bus=ilock_bus,
+                claude_bin=str(dlg_claude),
+                agy_bin=str(dlg_agy),
+            )
+        except RuntimeError as exc:
+            dup_lock_blocked = "already held" in str(exc)
+
+    # Stale registry entry (dead PID) is evicted automatically so `watch_repo_once` recovers after crash
+    reg_ilock_file = ilock_state / "active-pr-sessions.json"
+    reg_ilock_file.write_text(
+        json.dumps(
+            {
+                "active": {
+                    "leolin84200704/dlg#89": {
+                        "pr_number": 89,
+                        "pid": 99999999,
+                        "host": "personal-mac",
+                        "expires_epoch": paf_watcher.time.time() + 600,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_active = paf_watcher.is_pr_actively_driven(
+        ilock_state, "leolin84200704/dlg", 89, local_host="personal-mac"
+    )
+    evicted_after = json.loads(reg_ilock_file.read_text(encoding="utf-8")).get("active")
+
+    # NB2 check: primary reviewer returning empty `session_id` fails closed instead of running non-persistent
+    empty_sid_claude = dlg_mock_bin / "mock_claude_empty_sid"
+    empty_sid_claude.write_text(
+        """#!/usr/bin/env python3
+import json
+print(json.dumps({"type": "result", "is_error": False, "session_id": "", "structured_output": {
+    "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "ok"
+}}))
+""",
+        encoding="utf-8",
+    )
+    empty_sid_claude.chmod(0o755)
+    # Note: `run_claude_review` falls back to `init_session_id` if `reported_sid` is empty, so test `gemini` reviewer returning empty `conversation_id`!
+    empty_sid_agy = dlg_mock_bin / "mock_agy_empty_sid"
+    empty_sid_agy.write_text(
+        """#!/usr/bin/env python3
+import json
+print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": {
+    "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "ok"
+}}))
+""",
+        encoding="utf-8",
+    )
+    empty_sid_agy.chmod(0o755)
+    m90 = dict(m89, pr_number=90, model_family="claude")
+    m90.pop("sig", None)
+    m90.pop("key_id", None)
+    paf_watcher.sign_marker_in_place(m90, dlg_secret, key_file=key_file, require_hmac=True)
+    ilock_bus.prs[90] = dict(
+        ilock_bus.prs[89],
+        number=90,
+        body=f"Feature\n\n<!-- paf-consensus: {json.dumps(m90, separators=(',', ':'))} -->",
+    )
+    empty_sid_rejected = False
+    try:
+        paf_watcher.run_consensus_dialogue(
+            repo=repo_dlg,
+            pr_number=90,
+            repo_slug="leolin84200704/dlg",
+            author_family="claude",
+            host_id="personal-mac",
+            state_dir=ilock_state,
+            key_file=key_file,
+            bus=ilock_bus,
+            claude_bin=str(empty_sid_claude),
+            agy_bin=str(empty_sid_agy),
+        )
+    except RuntimeError as exc:
+        empty_sid_rejected = "empty session_id" in str(exc)
+
+    if (
+        not nb3_ok
+        or not nb4_ok
+        or matched_nonce_sid != "timed-out-author-sess-888"
+        or watch_while_locked.get("reviewed") != []
+        or watch_while_locked.get("merged") != []
+        or ilock_bus.prs[89]["comments"] != []
+        or not dup_lock_blocked
+        or stale_active is not False
+        or evicted_after != {}
+        or not empty_sid_rejected
+    ):
+        print(
+            f"FAIL 12 interlock & hardening:\n"
+            f"  nb3_ok={nb3_ok} nb4_ok={nb4_ok} nonce_sid={matched_nonce_sid!r}\n"
+            f"  watch_locked={watch_while_locked} dup_blocked={dup_lock_blocked}\n"
+            f"  stale_active={stale_active} evicted_after={evicted_after} empty_sid_rejected={empty_sid_rejected}"
+        )
+        failures += 1
+    else:
+        print("PASS 12 interlocks run_consensus_dialogue with watch-prs, refreshes verify artifact SHA, blocks protected edits, and enforces session_id")
+
     return 1 if failures else 0
 
 

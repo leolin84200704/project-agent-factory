@@ -23,6 +23,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import importlib.util
@@ -88,14 +89,40 @@ def _resolve_session_id(cli_session_id: str | None = None) -> str:
 
 
 def _infer_caller_family() -> str:
+    has_agy = bool(os.environ.get("AGY_CONVERSATION_ID", "").strip())
+    has_claude = bool(
+        os.environ.get("CLAUDE_SESSION_ID", "").strip()
+        or os.environ.get("CLAUDECODE", "").strip()
+    )
+    if has_agy and not has_claude:
+        return "gemini"
+    if has_claude and not has_agy:
+        return "claude"
     explicit = os.environ.get("PAF_AUTHOR_FAMILY", "").strip().lower()
     if explicit in ("claude", "gemini", "openai"):
         return explicit
-    if os.environ.get("AGY_CONVERSATION_ID", "").strip():
-        return "gemini"
-    if os.environ.get("CLAUDE_SESSION_ID", "").strip() or os.environ.get("CLAUDECODE", "").strip():
-        return "claude"
     return ""
+
+
+def _validate_claimed_family(claimed_family: str | None, subcmd: str) -> bool:
+    if not claimed_family or not claimed_family.strip():
+        return True
+    norm_claimed = _normalize_family(claimed_family)
+    if not norm_claimed:
+        print(
+            f"paf {subcmd} REFUSED: unrecognized family '{claimed_family}' (expected claude, gemini, or openai).",
+            file=sys.stderr,
+        )
+        return False
+    inferred = _infer_caller_family()
+    if inferred and inferred != norm_claimed:
+        print(
+            f"paf {subcmd} REFUSED (family_mismatch): caller environment belongs to '{inferred}', "
+            f"cannot claim '{norm_claimed}'.",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -1626,6 +1653,8 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if not _validate_claimed_family(args.family, "post-consensus"):
+        return 2
 
     if args.role == "reviewer" and not args.head_sha:
         print(
@@ -1832,6 +1861,8 @@ def cmd_ship(args: argparse.Namespace) -> int:
     )
 
     requires_human_merge_approval = zone == "guarded" and base_branch not in staging_branches
+    if not _validate_claimed_family(args.author_family, "ship"):
+        return 2
     author_fam = _normalize_family(args.author_family) or (_infer_caller_family() if open_or_drive_consensus else "")
 
     parsed_pr: dict[str, Any] | None = None
@@ -1905,6 +1936,18 @@ def cmd_ship(args: argparse.Namespace) -> int:
             )
             return 1
 
+    if open_pr_info is not None:
+        rev_dec = str(open_pr_info.get("reviewDecision") or "").strip().upper()
+        if rev_dec == "CHANGES_REQUESTED" or (
+            rev_dec == "REVIEW_REQUIRED" and (zone == "guarded" or not open_or_drive_consensus)
+        ):
+            print(
+                f"paf ship BLOCKED (human_review_required): GitHub reviewDecision is '{rev_dec}' - "
+                "model consensus does not replace required human colleague review.",
+                file=sys.stderr,
+            )
+            return 2
+
     if open_or_drive_consensus:
         if not author_fam:
             print(
@@ -1923,16 +1966,6 @@ def cmd_ship(args: argparse.Namespace) -> int:
             tag = "DRY_RUN_DRIVE_CONSENSUS_READY" if drive_consensus else "DRY_RUN_OPEN_FOR_CONSENSUS_READY"
             print(f"{tag}: zone={zone} base={base_branch} author={author_fam} sha={head_sha}")
             return 0
-
-    if open_pr_info is not None:
-        rev_dec = str(open_pr_info.get("reviewDecision") or "").strip().upper()
-        if rev_dec in ("REVIEW_REQUIRED", "CHANGES_REQUESTED") and not open_or_drive_consensus:
-            print(
-                f"paf ship BLOCKED (human_review_required): GitHub reviewDecision is '{rev_dec}' — "
-                "model consensus does not replace required human colleague review.",
-                file=sys.stderr,
-            )
-            return 2
 
     # When an open PR carries any consensus marker, PR consensus is the sole gate (a local receipt never overrides it)
     local_review_ok = bool(review and review.get("verdict") == "approve" and review.get("head_sha") == head_sha)
@@ -2102,6 +2135,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
                 allow_same_family_fallback=allow_fb,
                 max_rounds=max_rounds,
                 review_timeout_sec=int(getattr(args, "review_timeout", 660)),
+                author_timeout_sec=int(getattr(args, "author_timeout", 1200)),
                 approved_main=bool(args.approved_main),
                 max_wait_ci=int(args.max_wait_ci),
                 no_auto_revert=bool(args.no_auto_revert),
@@ -2151,6 +2185,8 @@ def cmd_ship(args: argparse.Namespace) -> int:
 
 def cmd_drive_consensus(args: argparse.Namespace) -> int:
     repo = args.repo.expanduser().resolve()
+    if not _validate_claimed_family(args.author_family, "drive-consensus"):
+        return 2
     pw = _watcher_mod()
     pr_num: int
     if args.pr:
@@ -2174,24 +2210,27 @@ def cmd_drive_consensus(args: argparse.Namespace) -> int:
 
     session_id = _resolve_session_id(getattr(args, "session_id", None))
     allow_fb: bool | None = True if args.allow_same_family_fallback else None
+    out_guard = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
     try:
-        res = pw.run_consensus_dialogue(
-            repo=repo,
-            pr_number=pr_num,
-            author_family=args.author_family or _infer_caller_family() or None,
-            caller_session_id=session_id,
-            host_id=args.host,
-            state_dir=args.state_dir,
-            key_file=args.key_file,
-            claude_model=args.claude_model,
-            agy_model=args.agy_model,
-            allow_same_family_fallback=allow_fb,
-            max_rounds=args.max_rounds,
-            review_timeout_sec=args.review_timeout,
-            approved_main=args.approved_main,
-            max_wait_ci=args.max_wait_ci,
-            no_auto_revert=args.no_auto_revert,
-        )
+        with out_guard:
+            res = pw.run_consensus_dialogue(
+                repo=repo,
+                pr_number=pr_num,
+                author_family=_normalize_family(args.author_family) or _infer_caller_family() or None,
+                caller_session_id=session_id,
+                host_id=args.host,
+                state_dir=args.state_dir,
+                key_file=args.key_file,
+                claude_model=args.claude_model,
+                agy_model=args.agy_model,
+                allow_same_family_fallback=allow_fb,
+                max_rounds=args.max_rounds,
+                review_timeout_sec=args.review_timeout,
+                author_timeout_sec=int(getattr(args, "author_timeout", 1200)),
+                approved_main=args.approved_main,
+                max_wait_ci=args.max_wait_ci,
+                no_auto_revert=args.no_auto_revert,
+            )
     except Exception as exc:
         print(f"paf drive-consensus ERROR: {exc}", file=sys.stderr)
         return 1
@@ -2531,7 +2570,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_pst_c.add_argument("--author-family", default=None)
     s_pst_c.add_argument("--max-rounds", type=int, default=None)
     s_pst_c.add_argument("--approved-main", action="store_true")
-    s_pst_c.add_argument("--approved-governance", action="store_true")
+    s_pst_c.add_argument(
+        "--approved-governance",
+        action="store_true",
+        help="deprecated no-op; governance files are confirmed by peer model consensus",
+    )
     s_pst_c.add_argument("--max-wait-ci", type=int, default=600)
     s_pst_c.add_argument("--no-auto-revert", action="store_true")
     s_pst_c.set_defaults(func=cmd_post_consensus)
@@ -2546,7 +2589,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_mrg_c.add_argument("--require-hmac", action="store_true")
     s_mrg_c.add_argument("--allow-same-family-fallback", action="store_true")
     s_mrg_c.add_argument("--approved-main", action="store_true")
-    s_mrg_c.add_argument("--approved-governance", action="store_true")
+    s_mrg_c.add_argument(
+        "--approved-governance",
+        action="store_true",
+        help="deprecated no-op; governance files are confirmed by peer model consensus",
+    )
     s_mrg_c.add_argument("--max-wait-ci", type=int, default=600)
     s_mrg_c.add_argument("--no-auto-revert", action="store_true")
     s_mrg_c.add_argument("--dry-run", action="store_true")
@@ -2570,9 +2617,14 @@ def build_parser() -> argparse.ArgumentParser:
     s_ship.add_argument("--agy-model", default=None)
     s_ship.add_argument("--max-rounds", type=int, default=None)
     s_ship.add_argument("--review-timeout", type=int, default=660)
+    s_ship.add_argument("--author-timeout", type=int, default=1200)
     s_ship.add_argument("--allow-same-family-fallback", action="store_true")
     s_ship.add_argument("--approved-main", action="store_true")
-    s_ship.add_argument("--approved-governance", action="store_true")
+    s_ship.add_argument(
+        "--approved-governance",
+        action="store_true",
+        help="deprecated no-op; governance files are confirmed by peer model consensus",
+    )
     s_ship.add_argument("--allow-update-pr", action="store_true")
     s_ship.add_argument("--allow-cross-host", action="store_true")
     s_ship.add_argument("--max-wait-ci", type=int, default=600)
@@ -2592,6 +2644,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_drv.add_argument("--agy-model", default=None)
     s_drv.add_argument("--max-rounds", type=int, default=None)
     s_drv.add_argument("--review-timeout", type=int, default=660)
+    s_drv.add_argument("--author-timeout", type=int, default=1200)
     s_drv.add_argument("--allow-same-family-fallback", action="store_true")
     s_drv.add_argument("--approved-main", action="store_true")
     s_drv.add_argument("--max-wait-ci", type=int, default=600)
