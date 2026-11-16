@@ -601,6 +601,7 @@ def _auto_revert_merge(repo: Path, base_branch: str, bad_merge_sha: str) -> tupl
 
 
 CONSENSUS_RE = re.compile(r"<!--\s*paf-consensus:\s*(\{.*?\})\s*-->", re.DOTALL)
+HEX_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 def _normalize_family(raw: Any) -> str:
@@ -611,17 +612,25 @@ def _normalize_family(raw: Any) -> str:
         return "claude"
     if any(k in val for k in ("gemini", "antigravity", "google")):
         return "gemini"
-    if any(k in val for k in ("gpt", "o1", "o3", "codex", "openai")):
+    if any(k in val for k in ("gpt", "o1", "o3", "o4", "codex", "openai")):
         return "openai"
-    return val
+    return ""
 
 
 def _sha_matches(candidate: Any, expected_full: str) -> bool:
     cand = str(candidate or "").strip().lower()
     exp = expected_full.strip().lower()
-    if len(cand) < 7 or len(exp) < 7:
+    if not (HEX_SHA_RE.match(cand) and HEX_SHA_RE.match(exp)):
         return False
     return exp.startswith(cand) or cand.startswith(exp)
+
+
+def _resolve_max_rounds(cli_val: int | None, consensus_cfg: dict[str, Any]) -> int:
+    if cli_val is not None:
+        return int(cli_val)
+    if consensus_cfg.get("max_rounds") is not None:
+        return int(consensus_cfg["max_rounds"])
+    return 3
 
 
 def _extract_consensus_markers(pr_data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -643,6 +652,20 @@ def _extract_consensus_markers(pr_data: dict[str, Any]) -> list[dict[str, Any]]:
     return markers
 
 
+def _infer_author_family_from_markers(markers: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    seen: list[str] = []
+    for m in markers:
+        role = str(m.get("role") or "").strip().lower()
+        verdict = str(m.get("verdict") or "").strip().lower()
+        if role == "author" or verdict == "open":
+            fam = _normalize_family(m.get("model_family") or m.get("author"))
+            if fam and fam not in seen:
+                seen.append(fam)
+    if len(seen) == 1:
+        return seen[0], seen
+    return "", seen
+
+
 def evaluate_pr_consensus(
     pr_data: dict[str, Any],
     *,
@@ -650,19 +673,48 @@ def evaluate_pr_consensus(
     max_rounds: int = 3,
 ) -> dict[str, Any]:
     head_sha = str(pr_data.get("headRefOid") or "").strip()
+    if not HEX_SHA_RE.match(head_sha.lower()):
+        return {
+            "status": "pending_review",
+            "reason": "PR headRefOid is missing or invalid.",
+            "head_sha": head_sha,
+            "author_family": None,
+            "max_round": 0,
+        }
+
     markers = _extract_consensus_markers(pr_data)
     author_family = _normalize_family(author_family_override)
     if not author_family:
-        for m in markers:
-            if m.get("role") == "author" or m.get("verdict") == "open":
-                fam = _normalize_family(m.get("model_family") or m.get("author") or m.get("reviewer"))
-                if fam:
-                    author_family = fam
-                    break
+        inferred, seen_authors = _infer_author_family_from_markers(markers)
+        if len(seen_authors) > 1:
+            return {
+                "status": "pending_review",
+                "reason": (
+                    f"Conflicting author model_family markers ({', '.join(seen_authors)}) on {head_sha}; "
+                    "pass --author-family explicitly."
+                ),
+                "head_sha": head_sha,
+                "author_family": None,
+                "max_round": 0,
+            }
+        author_family = inferred
+
+    if not author_family:
+        return {
+            "status": "pending_review",
+            "reason": (
+                f"Cannot verify heterogeneity on {head_sha}: author model_family is unknown "
+                "(no recognized author marker on PR and no --author-family provided)."
+            ),
+            "head_sha": head_sha,
+            "author_family": None,
+            "max_round": 0,
+        }
 
     max_round_seen = 0
     needs_human = False
     same_family_rejected = False
+    unknown_reviewer_rejected = False
     matching_reviews: list[dict[str, Any]] = []
 
     for m in markers:
@@ -672,39 +724,53 @@ def evaluate_pr_consensus(
             continue
         if verdict not in ("approve", "request_changes"):
             continue
-        rnd = int(m.get("round") or 1)
-        if rnd > max_round_seen:
-            max_round_seen = rnd
-        rev_fam = _normalize_family(m.get("model_family") or m.get("reviewer"))
         if not _sha_matches(m.get("head_sha"), head_sha):
             continue
-        if bool(m.get("needs_human_decision")):
-            needs_human = True
-        if author_family and rev_fam and rev_fam == author_family:
+        try:
+            rnd = int(m["round"]) if m.get("round") is not None else 1
+            blocking = int(m["blocking_count"]) if m.get("blocking_count") is not None else 0
+        except (TypeError, ValueError):
+            continue
+        if rnd < 1 or blocking < 0:
+            continue
+        rev_fam = _normalize_family(m.get("model_family") or m.get("reviewer"))
+        if not rev_fam:
+            unknown_reviewer_rejected = True
+            continue
+        if rev_fam == author_family:
             same_family_rejected = True
             continue
-        if author_family and not rev_fam:
-            continue
-        matching_reviews.append({**m, "normalized_family": rev_fam, "verdict": verdict, "round": rnd})
+        if rnd > max_round_seen:
+            max_round_seen = rnd
+        if bool(m.get("needs_human_decision")):
+            needs_human = True
+        matching_reviews.append(
+            {
+                **m,
+                "normalized_family": rev_fam,
+                "verdict": verdict,
+                "round": rnd,
+                "blocking_count": blocking,
+            }
+        )
 
     if needs_human:
         return {
             "status": "paused_human_tiebreak",
-            "reason": "Reviewer flagged needs_human_decision=true on current HEAD.",
+            "reason": f"Reviewer flagged needs_human_decision=true on {head_sha}.",
             "head_sha": head_sha,
-            "author_family": author_family or None,
+            "author_family": author_family,
             "max_round": max_round_seen,
         }
 
     if matching_reviews:
         latest = matching_reviews[-1]
-        blocking = int(latest.get("blocking_count") or 0)
-        if latest["verdict"] == "approve" and blocking == 0:
+        if latest["verdict"] == "approve" and latest["blocking_count"] == 0:
             return {
                 "status": "approved",
-                "reason": f"Heterogeneous consensus approved by '{latest['normalized_family']}' on {head_sha[:12]}.",
+                "reason": f"Heterogeneous consensus approved by '{latest['normalized_family']}' on {head_sha}.",
                 "head_sha": head_sha,
-                "author_family": author_family or None,
+                "author_family": author_family,
                 "reviewer_family": latest["normalized_family"],
                 "round": latest["round"],
                 "max_round": max_round_seen,
@@ -712,40 +778,35 @@ def evaluate_pr_consensus(
         if max_round_seen > max_rounds:
             return {
                 "status": "paused_human_tiebreak",
-                "reason": f"Consensus exceeded max_rounds={max_rounds} (saw round {max_round_seen}) without approval.",
+                "reason": f"Consensus exceeded max_rounds={max_rounds} (saw round {max_round_seen}) without approval on {head_sha}.",
                 "head_sha": head_sha,
-                "author_family": author_family or None,
+                "author_family": author_family,
                 "max_round": max_round_seen,
             }
         return {
             "status": "changes_requested",
-            "reason": f"Latest review on {head_sha[:12]} by '{latest['normalized_family']}' requested changes.",
+            "reason": f"Latest review on {head_sha} by '{latest['normalized_family']}' requested changes.",
             "head_sha": head_sha,
-            "author_family": author_family or None,
+            "author_family": author_family,
             "reviewer_family": latest["normalized_family"],
-            "max_round": max_round_seen,
-        }
-
-    if max_round_seen > max_rounds:
-        return {
-            "status": "paused_human_tiebreak",
-            "reason": f"Consensus exceeded max_rounds={max_rounds} (saw round {max_round_seen}) without approval.",
-            "head_sha": head_sha,
-            "author_family": author_family or None,
             "max_round": max_round_seen,
         }
 
     if same_family_rejected:
         reason = (
-            f"Rejected same-family review ('{author_family}'); awaiting heterogeneous reviewer on {head_sha[:12]}."
+            f"Rejected same-family review ('{author_family}'); awaiting heterogeneous reviewer on --head-sha {head_sha}."
+        )
+    elif unknown_reviewer_rejected:
+        reason = (
+            f"Rejected review marker with missing or unrecognized model_family; awaiting heterogeneous reviewer on --head-sha {head_sha}."
         )
     else:
-        reason = f"No SHA-pinned heterogeneous consensus marker found yet for {head_sha[:12]}."
+        reason = f"No SHA-pinned heterogeneous consensus marker found yet for --head-sha {head_sha}."
     return {
         "status": "pending_review",
         "reason": reason,
         "head_sha": head_sha,
-        "author_family": author_family or None,
+        "author_family": author_family,
         "max_round": max_round_seen,
     }
 
@@ -890,7 +951,7 @@ def cmd_check_consensus(args: argparse.Namespace) -> int:
     repo = args.repo.expanduser().resolve()
     cfg = _load_verify_config(repo)
     consensus_cfg = cfg.get("consensus") or {}
-    max_rounds = int(args.max_rounds or consensus_cfg.get("max_rounds") or 3)
+    max_rounds = _resolve_max_rounds(args.max_rounds, consensus_cfg)
     try:
         pr_data = _load_pr_data(repo, args.pr, args.pr_fixture)
     except Exception as exc:
@@ -925,7 +986,7 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
     zone = str(cfg.get("zone", "autonomous"))
     default_branch = str(cfg.get("default_branch", "main"))
     consensus_cfg = cfg.get("consensus") or {}
-    max_rounds = int(args.max_rounds or consensus_cfg.get("max_rounds") or 3)
+    max_rounds = _resolve_max_rounds(args.max_rounds, consensus_cfg)
 
     try:
         pr_data = _load_pr_data(repo, args.pr, args.pr_fixture)
@@ -957,7 +1018,7 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
     is_guarded_main = zone == "guarded" and base_branch == default_branch
 
     if is_guarded_main and not args.approved_main:
-        print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (head={head_sha[:12]})")
+        print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (head={head_sha})")
         print(
             f"Dual-model consensus is complete. Once Leo replies 'approve', resume autonomous merge+verify+revert via:\n"
             f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-main"
@@ -982,22 +1043,41 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
 
 def cmd_post_consensus(args: argparse.Namespace) -> int:
     repo = args.repo.expanduser().resolve()
+    family = _normalize_family(args.family)
+    if not family:
+        print(
+            "paf post-consensus REFUSED: unrecognized --family (expected claude, gemini, or openai).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.role == "reviewer" and not args.head_sha:
+        print(
+            "paf post-consensus REFUSED: --head-sha <reviewed_commit_sha> is required when --role reviewer "
+            "so a concurrent push cannot be certified unreviewed.",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
-        pr_data = _load_pr_data(repo, args.pr)
+        pr_data = _load_pr_data(repo, args.pr, args.pr_fixture)
     except Exception as exc:
         print(f"paf post-consensus ERROR: {exc}", file=sys.stderr)
         return 1
 
     live_head = str(pr_data.get("headRefOid") or "").strip()
+    if not HEX_SHA_RE.match(live_head.lower()):
+        print(f"paf post-consensus ERROR: invalid PR headRefOid '{live_head}'.", file=sys.stderr)
+        return 1
+
     if args.head_sha and not _sha_matches(args.head_sha, live_head):
         print(
             f"paf post-consensus REFUSED: PR #{pr_data.get('number')} moved to {live_head[:12]} "
-            f"(expected {args.head_sha[:12]}).",
+            f"(expected {args.head_sha[:12]}). Re-read the updated diff before posting.",
             file=sys.stderr,
         )
         return 2
 
-    family = _normalize_family(args.family)
     marker = {
         "v": 1,
         "role": args.role,
@@ -1014,6 +1094,10 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
     elif args.body:
         prose = args.body.strip()
     comment_body = (prose + "\n\n" if prose else "") + f"<!-- paf-consensus: {json.dumps(marker, separators=(',', ':'))} -->"
+
+    if args.pr_fixture is not None:
+        print(comment_body)
+        return 0
 
     post_proc = subprocess.run(
         ["gh", "pr", "comment", str(pr_data["number"]), "--body", comment_body],
@@ -1050,6 +1134,8 @@ def cmd_ship(args: argparse.Namespace) -> int:
     default_branch = str(cfg.get("default_branch", "main"))
     base_branch = str(args.base or default_branch)
     require_blind = bool(cfg.get("require_blind_review", True))
+    consensus_cfg = cfg.get("consensus") or {}
+    max_rounds = _resolve_max_rounds(None, consensus_cfg)
 
     branch = _git_branch(repo)
     if branch in (default_branch, "main", "master", "HEAD", "unknown"):
@@ -1093,46 +1179,58 @@ def cmd_ship(args: argparse.Namespace) -> int:
     is_guarded_main = zone == "guarded" and base_branch == default_branch
     author_fam = _normalize_family(args.author_family)
 
-    if args.open_for_consensus:
-        if not author_fam:
-            print("paf ship BLOCKED: --open-for-consensus requires --author-family (e.g. claude or gemini).", file=sys.stderr)
-            return 2
-        if args.dry_run:
-            print(f"DRY_RUN_OPEN_FOR_CONSENSUS_READY: zone={zone} base={base_branch} author={author_fam} sha={head_sha}")
-            return 0
-
-    existing_pr = (
-        subprocess.run(
+    parsed_pr: dict[str, Any] | None = None
+    if args.pr_fixture is not None:
+        parsed_pr = json.loads(args.pr_fixture.expanduser().resolve().read_text(encoding="utf-8"))
+    else:
+        existing_pr = subprocess.run(
             ["gh", "pr", "view", branch, "--json", "number,url,state,headRefOid,body,comments"],
             cwd=repo,
             text=True,
             capture_output=True,
             check=False,
         )
-        if not args.dry_run
-        else None
-    )
+        if existing_pr.returncode == 0 and existing_pr.stdout.strip().startswith("{"):
+            parsed_pr = json.loads(existing_pr.stdout)
+
     open_pr_info: dict[str, Any] | None = None
     pr_consensus_ok = False
-    if existing_pr is not None and existing_pr.returncode == 0 and existing_pr.stdout.strip().startswith("{"):
-        parsed_pr = json.loads(existing_pr.stdout)
-        if parsed_pr.get("state") == "OPEN":
-            open_pr_info = parsed_pr
-            remote_pr_head = str(parsed_pr.get("headRefOid") or "")
-            if remote_pr_head == head_sha:
-                pr_consensus_ok = (
-                    evaluate_pr_consensus(parsed_pr, author_family_override=author_fam or None).get("status")
-                    == "approved"
-                )
-            elif remote_pr_head and not (args.allow_update_pr or args.open_for_consensus):
-                print(
-                    f"paf ship REFUSED ('one PR one head'): OPEN PR #{parsed_pr.get('number')} "
-                    f"already exists on '{branch}' at {remote_pr_head[:12]}, while local HEAD is "
-                    f"{head_sha[:12]}. Open a fresh branch from '{base_branch}' or pass "
-                    "--open-for-consensus / --allow-update-pr for multi-round PR consensus.",
-                    file=sys.stderr,
-                )
-                return 1
+    if parsed_pr is not None and parsed_pr.get("state") == "OPEN":
+        open_pr_info = parsed_pr
+        if not author_fam:
+            inferred_af, seen_af = _infer_author_family_from_markers(_extract_consensus_markers(parsed_pr))
+            if len(seen_af) == 1:
+                author_fam = inferred_af
+        remote_pr_head = str(parsed_pr.get("headRefOid") or "")
+        if remote_pr_head == head_sha:
+            pr_consensus_ok = (
+                evaluate_pr_consensus(
+                    parsed_pr,
+                    author_family_override=author_fam or None,
+                    max_rounds=max_rounds,
+                ).get("status")
+                == "approved"
+            )
+        elif remote_pr_head and not (args.allow_update_pr or args.open_for_consensus):
+            print(
+                f"paf ship REFUSED ('one PR one head'): OPEN PR #{parsed_pr.get('number')} "
+                f"already exists on '{branch}' at {remote_pr_head[:12]}, while local HEAD is "
+                f"{head_sha[:12]}. Open a fresh branch from '{base_branch}' or pass "
+                "--open-for-consensus / --allow-update-pr for multi-round PR consensus.",
+                file=sys.stderr,
+            )
+            return 1
+
+    if args.open_for_consensus:
+        if not author_fam:
+            print(
+                "paf ship BLOCKED: --open-for-consensus requires --author-family (claude, gemini, or openai).",
+                file=sys.stderr,
+            )
+            return 2
+        if args.dry_run:
+            print(f"DRY_RUN_OPEN_FOR_CONSENSUS_READY: zone={zone} base={base_branch} author={author_fam} sha={head_sha}")
+            return 0
 
     # Require Blind Adversarial Review OR heterogeneous PR consensus BEFORE merging (unless --open-for-consensus)
     local_review_ok = bool(review and review.get("verdict") == "approve" and review.get("head_sha") == head_sha)
@@ -1235,7 +1333,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
         pr_url = str(info2["url"])
 
     if args.open_for_consensus:
-        print(f"OPENED_FOR_CONSENSUS: {pr_url} (pr=#{pr_number} head={head_sha[:12]} author={author_fam})")
+        print(f"OPENED_FOR_CONSENSUS: {pr_url} (pr=#{pr_number} head={head_sha} author={author_fam})")
         return 0
 
     # Step 4: Guarded zone targeting main pauses for single human `approve`
@@ -1448,6 +1546,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_pst_c = sub.add_parser("post-consensus", help="post SHA-pinned consensus marker comment on a PR")
     s_pst_c.add_argument("--repo", type=Path, default=Path.cwd())
     s_pst_c.add_argument("--pr", required=True)
+    s_pst_c.add_argument("--pr-fixture", type=Path, default=None)
     s_pst_c.add_argument("--role", choices=("author", "reviewer"), default="reviewer")
     s_pst_c.add_argument("--family", required=True)
     s_pst_c.add_argument("--verdict", choices=("open", "approve", "request_changes"), required=True)
@@ -1482,6 +1581,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_ship.add_argument("--base", default=None)
     s_ship.add_argument("--title", default=None)
     s_ship.add_argument("--body", default=None)
+    s_ship.add_argument("--pr-fixture", type=Path, default=None)
     s_ship.add_argument("--open-for-consensus", action="store_true")
     s_ship.add_argument("--author-family", default=None)
     s_ship.add_argument("--approved-main", action="store_true")

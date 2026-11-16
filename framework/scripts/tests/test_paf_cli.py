@@ -313,6 +313,172 @@ def main() -> int:
     else:
         print("PASS paf ship --open-for-consensus prepares PR for cross-model review without local self-review")
 
+    # 13. B1: Unknown `author_family` or unrecognized/empty `reviewer` family MUST fail closed (both check-consensus and paf ship)
+    mul_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+    unlabeled_approve = f'<!-- paf-consensus: {{"verdict":"approve","head_sha":"{mul_sha}"}} -->'
+    claude_approve_mul = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"claude","verdict":"approve","head_sha":"{mul_sha}","round":1}} -->'
+    )
+    unknown_fam_approve = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"mystery-bot","verdict":"approve","head_sha":"{mul_sha}","round":1}} -->'
+    )
+    gemini_author_mul = f'<!-- paf-consensus: {{"role":"author","model_family":"gemini","verdict":"open","head_sha":"{mul_sha}"}} -->'
+
+    write_pr_fixture(mul_sha, "Manual PR body without author marker", [{"body": unlabeled_approve}])
+    res_b1_unlabeled = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+
+    write_pr_fixture(mul_sha, "Manual PR body without author marker", [{"body": claude_approve_mul}])
+    res_b1_no_author = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+    res_b1_ship_no_author = run_paf(
+        ["ship", "--repo", str(repo), "--base", "stage_test", "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": unknown_fam_approve}])
+    res_b1_unknown_rev = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+
+    if (
+        res_b1_unlabeled.returncode == 0
+        or res_b1_no_author.returncode == 0
+        or res_b1_ship_no_author.returncode == 0
+        or res_b1_unknown_rev.returncode == 0
+    ):
+        print(
+            "FAIL B1 fail-closed identity check: "
+            f"unlabeled={res_b1_unlabeled.returncode} no_author={res_b1_no_author.returncode} "
+            f"ship_no_author={res_b1_ship_no_author.returncode} unknown_rev={res_b1_unknown_rev.returncode}"
+        )
+        failures += 1
+    else:
+        print("PASS B1 fails closed when author_family or reviewer model_family is missing/unknown")
+
+    # 14. B2: `paf post-consensus --role reviewer` requires explicit `--head-sha` and rejects moved HEAD
+    write_pr_fixture(mul_sha, gemini_author_mul, [])
+    res_b2_missing_sha = run_paf(
+        [
+            "post-consensus",
+            "--repo",
+            str(repo),
+            "--pr",
+            "88",
+            "--pr-fixture",
+            str(pr_fixture),
+            "--role",
+            "reviewer",
+            "--family",
+            "claude",
+            "--verdict",
+            "approve",
+        ],
+        cwd=repo,
+    )
+    res_b2_moved_sha = run_paf(
+        [
+            "post-consensus",
+            "--repo",
+            str(repo),
+            "--pr",
+            "88",
+            "--pr-fixture",
+            str(pr_fixture),
+            "--role",
+            "reviewer",
+            "--family",
+            "claude",
+            "--verdict",
+            "approve",
+            "--head-sha",
+            "0000000000000000",
+        ],
+        cwd=repo,
+    )
+    if (
+        res_b2_missing_sha.returncode != 2
+        or "--head-sha" not in res_b2_missing_sha.stderr
+        or res_b2_moved_sha.returncode != 2
+        or "moved to" not in res_b2_moved_sha.stderr
+    ):
+        print(
+            f"FAIL B2 write-time SHA pinning: missing={res_b2_missing_sha.returncode} ({res_b2_missing_sha.stderr.strip()}) "
+            f"moved={res_b2_moved_sha.returncode} ({res_b2_moved_sha.stderr.strip()})"
+        )
+        failures += 1
+    else:
+        print("PASS B2 enforces required --head-sha and rejects concurrent HEAD movement at post time")
+
+    # 15. B3: `paf ship --dry-run` evaluates live/fixture PR consensus identically to real ship
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": claude_approve_mul}], base="stage_test")
+    res_b3_stage = run_paf(
+        ["ship", "--repo", str(repo), "--base", "stage_test", "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": claude_approve_mul}], base="main")
+    res_b3_main = run_paf(
+        ["ship", "--repo", str(repo), "--base", "main", "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+    if (
+        res_b3_stage.returncode != 0
+        or "DRY_RUN_AUTONOMOUS_MERGE_READY" not in res_b3_stage.stdout
+        or res_b3_main.returncode != 0
+        or "PAUSED_FOR_MAIN_APPROVAL" not in res_b3_main.stdout
+    ):
+        print(
+            f"FAIL B3 ship --dry-run consensus fidelity: stage={res_b3_stage.returncode} ({res_b3_stage.stdout.strip()}) "
+            f"main={res_b3_main.returncode} ({res_b3_main.stdout.strip()})"
+        )
+        failures += 1
+    else:
+        print("PASS B3 paf ship --dry-run honors heterogeneous PR consensus identically to real ship")
+
+    # 16. Edge cases: needs_human_decision=true, malformed markers, stale-SHA round scoping, and --max-rounds 0
+    needs_human_comment = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"claude","verdict":"request_changes","head_sha":"{mul_sha}","round":1,"needs_human_decision":true}} -->'
+    )
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": needs_human_comment}])
+    res_nh = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+
+    malformed_comment = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"claude","verdict":"approve","head_sha":"{mul_sha}","round":"two","blocking_count":"nan"}} -->'
+    )
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": malformed_comment}])
+    res_malformed_only = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": malformed_comment}, {"body": claude_approve_mul}])
+    res_malformed_then_valid = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+
+    stale_high_round = (
+        '<!-- paf-consensus: {"role":"reviewer","model_family":"claude","verdict":"request_changes","head_sha":"0000000000000000000000000000000000000000","round":9} -->'
+    )
+    current_r1_req = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"claude","verdict":"request_changes","head_sha":"{mul_sha}","round":1}} -->'
+    )
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": stale_high_round}, {"body": current_r1_req}])
+    res_stale_round = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+    res_zero_max_rounds = run_paf(
+        ["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture), "--max-rounds", "0"],
+        cwd=repo,
+    )
+
+    if (
+        res_nh.returncode != 4
+        or "PAUSED_FOR_CONSENSUS_TIEBREAK" not in (res_nh.stdout + res_nh.stderr)
+        or res_malformed_only.returncode != 2
+        or "Traceback" in res_malformed_only.stderr
+        or res_malformed_then_valid.returncode != 0
+        or res_stale_round.returncode != 2
+        or res_zero_max_rounds.returncode != 4
+    ):
+        print(
+            f"FAIL edge cases: nh={res_nh.returncode} malformed_only={res_malformed_only.returncode} "
+            f"malformed_valid={res_malformed_then_valid.returncode} stale_round={res_stale_round.returncode} "
+            f"zero_max={res_zero_max_rounds.returncode}"
+        )
+        failures += 1
+    else:
+        print("PASS needs_human_decision, malformed marker tolerance, active-SHA round scoping, and --max-rounds 0")
+
     return 1 if failures else 0
 
 
