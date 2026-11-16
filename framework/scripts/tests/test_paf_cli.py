@@ -588,6 +588,185 @@ def main() -> int:
     else:
         print("PASS C3/C4 pause governance-file PRs for Leo and honor required human GitHub reviews")
 
+    # 19. D1: Local `paf record-review` receipt NEVER overrides an open PR consensus gate (`request_changes`, `pending_review`, `needs_human_decision`)
+    res_rec = run_paf(
+        [
+            "record-review",
+            "--repo",
+            str(repo),
+            "--verdict",
+            "approve",
+            "--reviewer",
+            "local-subagent",
+            "--summary",
+            "Local review pass",
+        ],
+        cwd=repo,
+    )
+    claude_req_block2 = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"claude","verdict":"request_changes","head_sha":"{mul_sha}","round":1,"blocking_count":2}} -->'
+    )
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": claude_req_block2}], base="stage_test")
+    res_d1_req = run_paf(
+        ["ship", "--repo", str(repo), "--base", "stage_test", "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": needs_human_comment}], base="stage_test")
+    res_d1_nh = run_paf(
+        ["ship", "--repo", str(repo), "--base", "stage_test", "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+    write_pr_fixture(mul_sha, gemini_author_mul, [], base="stage_test")
+    res_d1_pending = run_paf(
+        ["ship", "--repo", str(repo), "--base", "stage_test", "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+    write_pr_fixture(mul_sha, "Plain PR body with zero consensus markers", [], base="stage_test")
+    res_d1_plain_local = run_paf(
+        ["ship", "--repo", str(repo), "--base", "stage_test", "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+    if (
+        res_rec.returncode != 0
+        or res_d1_req.returncode != 2
+        or res_d1_nh.returncode != 4
+        or res_d1_pending.returncode != 2
+        or res_d1_plain_local.returncode != 0
+        or "DRY_RUN_AUTONOMOUS_MERGE_READY" not in res_d1_plain_local.stdout
+    ):
+        print(
+            f"FAIL D1 local receipt bypass check: rec={res_rec.returncode} req={res_d1_req.returncode} "
+            f"nh={res_d1_nh.returncode} pending={res_d1_pending.returncode} plain={res_d1_plain_local.returncode}"
+        )
+        failures += 1
+    else:
+        print("PASS D1 local review receipt never overrides PR consensus objections, pending review, or human tiebreak")
+
+    # 20. D2 + alias hygiene: Same-family or unlabeled `request_changes` / `needs_human_decision` blocks merge,
+    #     and substring collisions like `pro1` / `info1` / `gemini (claude subagent)` never approve
+    claude_author_mul = (
+        f'<!-- paf-consensus: {{"role":"author","model_family":"claude","verdict":"open","head_sha":"{mul_sha}"}} -->'
+    )
+    gemini_approve_mul = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"gemini","verdict":"approve","head_sha":"{mul_sha}","round":1}} -->'
+    )
+    claude_req_mul = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"claude","verdict":"request_changes","head_sha":"{mul_sha}","round":1,"blocking_count":1}} -->'
+    )
+    unlabeled_req_mul = (
+        f'<!-- paf-consensus: {{"role":"reviewer","verdict":"request_changes","head_sha":"{mul_sha}","round":1,"blocking_count":1}} -->'
+    )
+    claude_nh_mul = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"claude","verdict":"request_changes","head_sha":"{mul_sha}","round":1,"needs_human_decision":true}} -->'
+    )
+    write_pr_fixture(mul_sha, claude_author_mul, [{"body": gemini_approve_mul}, {"body": claude_req_mul}])
+    res_d2_same_after = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+
+    write_pr_fixture(mul_sha, claude_author_mul, [{"body": claude_req_mul}, {"body": gemini_approve_mul}])
+    res_d2_same_before = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+
+    write_pr_fixture(mul_sha, claude_author_mul, [{"body": gemini_approve_mul}, {"body": unlabeled_req_mul}])
+    res_d2_unlabeled = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+
+    write_pr_fixture(mul_sha, claude_author_mul, [{"body": gemini_approve_mul}, {"body": claude_nh_mul}])
+    res_d2_same_nh = run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo)
+
+    alias_bad_results = []
+    for bad_fam in ("pro1", "info1", "gemini (claude subagent)"):
+        bad_approve = (
+            f'<!-- paf-consensus: {{"role":"reviewer","model_family":"{bad_fam}","verdict":"approve","head_sha":"{mul_sha}","round":1}} -->'
+        )
+        write_pr_fixture(mul_sha, gemini_author_mul, [{"body": bad_approve}])
+        alias_bad_results.append(
+            run_paf(["check-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture)], cwd=repo).returncode
+        )
+
+    if (
+        res_d2_same_after.returncode != 2
+        or res_d2_same_before.returncode != 2
+        or res_d2_unlabeled.returncode != 2
+        or res_d2_same_nh.returncode != 4
+        or any(rc == 0 for rc in alias_bad_results)
+    ):
+        print(
+            f"FAIL D2 objection & alias check: same_after={res_d2_same_after.returncode} "
+            f"same_before={res_d2_same_before.returncode} unlabeled={res_d2_unlabeled.returncode} "
+            f"same_nh={res_d2_same_nh.returncode} aliases={alias_bad_results}"
+        )
+        failures += 1
+    else:
+        print("PASS D2 honors same-family/unlabeled objections and rejects substring family collisions")
+
+    # 21. D3 + truncated files guard: `.claude/settings*.json`, `.gemini/settings.json`, `framework/WORK-LOOP.md`,
+    #     `GEMINI.md`, `skills/verify/SKILL.md`, `framework/githooks/commit-msg`, and truncated `changedFiles > len(files)` all pause
+    d3_paths = (
+        ".agent-verify.json",
+        ".github/workflows/verify.yml",
+        ".claude/settings.json",
+        ".claude/settings.local.json",
+        ".claude/skills/ship/SKILL.md",
+        ".gemini/settings.json",
+        "framework/WORK-LOOP.md",
+        "GEMINI.md",
+        "skills/verify/SKILL.md",
+        "framework/githooks/commit-msg",
+    )
+    d3_ok = True
+    for gov_path in d3_paths:
+        auto_pr_fix.write_text(
+            json.dumps(
+                {
+                    "number": 115,
+                    "url": "https://example.test/pr/115",
+                    "state": "OPEN",
+                    "headRefName": "feature/rules",
+                    "baseRefName": "main",
+                    "headRefOid": mul_sha,
+                    "body": gemini_author_mul,
+                    "comments": [{"body": claude_approve_mul}],
+                    "files": [{"path": gov_path}],
+                    "changedFiles": 1,
+                    "reviewDecision": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        r_gov = run_paf(
+            ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
+            cwd=auto_repo,
+        )
+        if r_gov.returncode != 0 or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_gov.stdout:
+            d3_ok = False
+            print(f"FAIL D3 governance path missed: {gov_path} -> {r_gov.stdout.strip()}")
+
+    auto_pr_fix.write_text(
+        json.dumps(
+            {
+                "number": 115,
+                "url": "https://example.test/pr/115",
+                "state": "OPEN",
+                "headRefName": "feature/rules",
+                "baseRefName": "main",
+                "headRefOid": mul_sha,
+                "body": gemini_author_mul,
+                "comments": [{"body": claude_approve_mul}],
+                "files": [{"path": "src/app.py"}],
+                "changedFiles": 250,
+                "reviewDecision": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    r_trunc = run_paf(
+        ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
+        cwd=auto_repo,
+    )
+    if not d3_ok or r_trunc.returncode != 0 or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_trunc.stdout:
+        print(f"FAIL D3 / truncated changedFiles guard: d3_ok={d3_ok} trunc={r_trunc.stdout.strip()}")
+        failures += 1
+    else:
+        print("PASS D3 expands governance-file coverage and pauses when PR file list is truncated")
+
     return 1 if failures else 0
 
 

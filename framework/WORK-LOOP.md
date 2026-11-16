@@ -68,7 +68,7 @@
 2. **雙異質模型 PR 共識審查（預設標準）**：
    - 作者模型執行 `paf ship --repo {repo} --open-for-consensus --author-family <claude|gemini>` 推送分支並開立／更新附帶 Verification Artifact 與作者模型標籤的 PR。
    - 另一家族模型（`claude` <-> `gemini`）僅讀 `git diff`、程式碼與測試輸出進行獨立審查，並透過 `paf post-consensus --pr {num} --role reviewer --family <fam> --head-sha <reviewed_sha> --verdict <approve|request_changes>` 留下讀寫雙向綁定 `headRefOid` 的結構化留言（單一 GitHub 帳號架構下以 `paf-consensus` HTML 標記自聲明 `model_family`，嚴禁代簽非自身模型家族，亦不使用 GitHub 原生 Review Approve 按鈕）。
-   - 若為 `request_changes`，作者模型直接在同一 PR 推修正 commit 重審（上限 3 輪；超過 3 輪死鎖或涉及消費者 UX 偏好決策時觸發 `PAUSED_FOR_CONSENSUS_TIEBREAK` 請使用者拍板）。單機無跨模型環境時的備援才使用獨立唯讀 `research` 子代理搭配 `paf record-review`。
+   - 若為 `request_changes`，作者模型直接在同一 PR 推修正 commit 重審（上限 3 輪；超過 3 輪死鎖或涉及消費者 UX 偏好決策時觸發 `PAUSED_FOR_CONSENSUS_TIEBREAK` 請使用者拍板）。只有異質家族能簽出有效 `approve`，但任何家族（含同家族第二視窗或未標記家族）在當前 SHA 留下的 `request_changes` 或 `needs_human_decision: true` 皆會阻斷合併；且一旦 PR 帶有共識標記，本機 `paf record-review` 收據絕不可覆蓋共識閘門（僅從未進入共識的單機備援 PR 才使用 `paf record-review`）。
 
 ## Step 7: Auto-Merge on Consensus & Post-Merge Self-Healing（共識後自動合併與善後閉環）
 1. Commit（明確指定路徑暫存，禁用 `git add -A`）: `git commit -m "[{ticket_id}] {描述}"`

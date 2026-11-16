@@ -138,30 +138,47 @@ def _resolve_staging_branches(cfg: dict[str, Any]) -> set[str]:
 
 
 GOVERNANCE_FILE_RE = re.compile(
-    r"(^|/)(CORE\.md|AGENTS\.md|CLAUDE\.md|PERMISSIONS\.md|FEEDBACK\.md|\.agent-verify\.json|"
-    r"run-regression\.py|dune_lint\.py)$|"
+    r"(^|/)(CORE\.md|AGENTS\.md|CLAUDE\.md|GEMINI\.md|WORK-LOOP\.md|PERMISSIONS\.md|FEEDBACK\.md|"
+    r"\.agent-verify\.json|run-regression\.py|dune_lint\.py)$|"
     r"^bin/paf$|"
-    r"(^|/)(\.github/workflows/[^/]+\.ya?ml|eval-tasks/[^/]+\.md|hooks/[^/]+\.sh|"
-    r"githooks/(pre-commit|pre-push|install\.sh|lib/[^/]+\.sh)|"
-    r"scripts/dream\.md|DailyJob/|launchd/|\.claude/skills/|skills/ship/)"
+    r"(^|/)(\.claude/settings[^/]*\.json|\.gemini/settings[^/]*\.json|\.gemini/config/|"
+    r"\.github/workflows/[^/]+\.ya?ml|eval-tasks/[^/]+\.md|"
+    r"hooks/|githooks/|framework/githooks/|"
+    r"scripts/dream\.md|DailyJob/|launchd/|"
+    r"\.claude/skills/|\.gemini/skills/|skills/)"
 )
 
 
 def _governance_files_touched(repo: Path, pr_data: dict[str, Any] | None, base_branch: str) -> list[str]:
-    paths: list[str] = []
-    if pr_data is not None and isinstance(pr_data.get("files"), list):
-        for item in pr_data["files"]:
-            if isinstance(item, dict) and item.get("path"):
-                paths.append(str(item["path"]))
-            elif isinstance(item, str) and item:
-                paths.append(item)
-    if not paths and (repo / ".git").exists():
+    pr_paths: list[str] = []
+    expected_count: int | None = None
+    if pr_data is not None:
+        if pr_data.get("changedFiles") is not None:
+            try:
+                expected_count = int(pr_data["changedFiles"])
+            except (TypeError, ValueError):
+                expected_count = None
+        if isinstance(pr_data.get("files"), list):
+            for item in pr_data["files"]:
+                if isinstance(item, dict) and item.get("path"):
+                    pr_paths.append(str(item["path"]))
+                elif isinstance(item, str) and item:
+                    pr_paths.append(item)
+    truncated = expected_count is not None and expected_count > len(pr_paths)
+    paths: list[str] = list(pr_paths)
+    if (not paths or truncated) and (repo / ".git").exists():
         for ref in (base_branch, f"origin/{base_branch}"):
             diff_res = _git(repo, "diff", "--name-only", f"{ref}...HEAD", check=False)
             if diff_res.returncode == 0 and diff_res.stdout.strip():
-                paths.extend(line.strip() for line in diff_res.stdout.splitlines() if line.strip())
+                git_paths = [line.strip() for line in diff_res.stdout.splitlines() if line.strip()]
+                paths.extend(git_paths)
+                if expected_count is not None and len(set(paths)) >= expected_count:
+                    truncated = False
                 break
-    return sorted({p for p in paths if GOVERNANCE_FILE_RE.search(p.lstrip("./"))})
+    matched = sorted({p for p in paths if GOVERNANCE_FILE_RE.search(re.sub(r"^(?:\./)+", "", p))})
+    if truncated:
+        matched.append(f"<truncated-pr-files:{len(pr_paths)}/{expected_count}>")
+    return matched
 
 
 def _run_shell_step(repo: Path, stage: str, command: str, timeout_sec: int = 900) -> dict[str, Any]:
@@ -647,17 +664,38 @@ CONSENSUS_RE = re.compile(r"<!--\s*paf-consensus:\s*(\{.*?\})\s*-->", re.DOTALL)
 HEX_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 
+FAMILY_ALIASES: dict[str, str] = {
+    "claude": "claude",
+    "anthropic": "claude",
+    "opus": "claude",
+    "sonnet": "claude",
+    "haiku": "claude",
+    "fable": "claude",
+    "claude-code": "claude",
+    "claude-opus": "claude",
+    "claude-sonnet": "claude",
+    "claude-haiku": "claude",
+    "gemini": "gemini",
+    "google": "gemini",
+    "antigravity": "gemini",
+    "gemini-pro": "gemini",
+    "gemini-flash": "gemini",
+    "openai": "openai",
+    "gpt": "openai",
+    "codex": "openai",
+    "o1": "openai",
+    "o3": "openai",
+    "o4": "openai",
+    "o4-mini": "openai",
+    "gpt-4": "openai",
+    "gpt-4o": "openai",
+    "gpt-5": "openai",
+}
+
+
 def _normalize_family(raw: Any) -> str:
-    val = str(raw or "").strip().lower()
-    if not val:
-        return ""
-    if any(k in val for k in ("claude", "opus", "sonnet", "haiku", "anthropic", "fable")):
-        return "claude"
-    if any(k in val for k in ("gemini", "antigravity", "google")):
-        return "gemini"
-    if any(k in val for k in ("gpt", "o1", "o3", "o4", "codex", "openai")):
-        return "openai"
-    return ""
+    val = re.sub(r"[\s_]+", "-", str(raw or "").strip().lower())
+    return FAMILY_ALIASES.get(val, "")
 
 
 def _sha_matches(candidate: Any, expected_full: str) -> bool:
@@ -758,14 +796,16 @@ def evaluate_pr_consensus(
     needs_human = False
     same_family_rejected = False
     unknown_reviewer_rejected = False
-    matching_reviews: list[dict[str, Any]] = []
+    latest_by_family: dict[str, dict[str, Any]] = {}
+    unlabeled_objections: list[dict[str, Any]] = []
 
     for m in markers:
         role = str(m.get("role") or "").strip().lower()
         verdict = str(m.get("verdict") or "").strip().lower()
+        flag_nh = bool(m.get("needs_human_decision"))
         if role == "author" or verdict == "open":
             continue
-        if verdict not in ("approve", "request_changes"):
+        if verdict not in ("approve", "request_changes") and not flag_nh:
             continue
         if not _sha_matches(m.get("head_sha"), head_sha):
             continue
@@ -777,25 +817,30 @@ def evaluate_pr_consensus(
         if rnd < 1 or blocking < 0:
             continue
         rev_fam = _normalize_family(m.get("model_family") or m.get("reviewer"))
-        if not rev_fam:
-            unknown_reviewer_rejected = True
-            continue
-        if rev_fam == author_family:
-            same_family_rejected = True
-            continue
+        is_objection = (verdict != "approve") or (blocking > 0) or flag_nh
+        if not is_objection:
+            if not rev_fam:
+                unknown_reviewer_rejected = True
+                continue
+            if rev_fam == author_family:
+                same_family_rejected = True
+                if author_family not in latest_by_family:
+                    continue
         if rnd > max_round_seen:
             max_round_seen = rnd
-        if bool(m.get("needs_human_decision")):
+        if flag_nh:
             needs_human = True
-        matching_reviews.append(
-            {
-                **m,
-                "normalized_family": rev_fam,
-                "verdict": verdict,
-                "round": rnd,
-                "blocking_count": blocking,
-            }
-        )
+        entry = {
+            **m,
+            "normalized_family": rev_fam or "unlabeled",
+            "verdict": "request_changes" if is_objection else "approve",
+            "round": rnd,
+            "blocking_count": blocking,
+        }
+        if rev_fam:
+            latest_by_family[rev_fam] = entry
+        else:
+            unlabeled_objections.append(entry)
 
     if needs_human:
         return {
@@ -806,18 +851,10 @@ def evaluate_pr_consensus(
             "max_round": max_round_seen,
         }
 
-    if matching_reviews:
-        latest = matching_reviews[-1]
-        if latest["verdict"] == "approve" and latest["blocking_count"] == 0:
-            return {
-                "status": "approved",
-                "reason": f"Heterogeneous consensus approved by '{latest['normalized_family']}' on {head_sha}.",
-                "head_sha": head_sha,
-                "author_family": author_family,
-                "reviewer_family": latest["normalized_family"],
-                "round": latest["round"],
-                "max_round": max_round_seen,
-            }
+    open_objections = [
+        e for e in latest_by_family.values() if e["verdict"] != "approve" or e["blocking_count"] > 0
+    ] + unlabeled_objections
+    if open_objections:
         if max_round_seen > max_rounds:
             return {
                 "status": "paused_human_tiebreak",
@@ -826,12 +863,30 @@ def evaluate_pr_consensus(
                 "author_family": author_family,
                 "max_round": max_round_seen,
             }
+        last_obj = open_objections[-1]
         return {
             "status": "changes_requested",
-            "reason": f"Latest review on {head_sha} by '{latest['normalized_family']}' requested changes.",
+            "reason": f"Open objection on {head_sha} by '{last_obj['normalized_family']}' requested changes.",
+            "head_sha": head_sha,
+            "author_family": author_family,
+            "reviewer_family": last_obj["normalized_family"],
+            "max_round": max_round_seen,
+        }
+
+    hetero_approvals = [
+        e
+        for fam, e in latest_by_family.items()
+        if fam != author_family and e["verdict"] == "approve" and e["blocking_count"] == 0
+    ]
+    if hetero_approvals:
+        latest = hetero_approvals[-1]
+        return {
+            "status": "approved",
+            "reason": f"Heterogeneous consensus approved by '{latest['normalized_family']}' on {head_sha}.",
             "head_sha": head_sha,
             "author_family": author_family,
             "reviewer_family": latest["normalized_family"],
+            "round": latest["round"],
             "max_round": max_round_seen,
         }
 
@@ -865,7 +920,7 @@ def _load_pr_data(repo: Path, pr_ref: str | None, pr_fixture: Path | None = None
             "view",
             str(target),
             "--json",
-            "number,url,state,headRefName,baseRefName,headRefOid,body,comments,files,reviewDecision",
+            "number,url,state,headRefName,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
         ],
         cwd=repo,
         text=True,
@@ -1263,7 +1318,14 @@ def cmd_ship(args: argparse.Namespace) -> int:
         parsed_pr = json.loads(args.pr_fixture.expanduser().resolve().read_text(encoding="utf-8"))
     else:
         existing_pr = subprocess.run(
-            ["gh", "pr", "view", branch, "--json", "number,url,state,headRefOid,body,comments,files,reviewDecision"],
+            [
+                "gh",
+                "pr",
+                "view",
+                branch,
+                "--json",
+                "number,url,state,headRefOid,body,comments,files,changedFiles,reviewDecision",
+            ],
             cwd=repo,
             text=True,
             capture_output=True,
@@ -1273,22 +1335,23 @@ def cmd_ship(args: argparse.Namespace) -> int:
             parsed_pr = json.loads(existing_pr.stdout)
 
     open_pr_info: dict[str, Any] | None = None
-    pr_consensus_ok = False
+    has_consensus_markers = False
+    cons_verdict: dict[str, Any] | None = None
+    remote_pr_head = ""
     if parsed_pr is not None and parsed_pr.get("state") == "OPEN":
         open_pr_info = parsed_pr
+        pr_markers = _extract_consensus_markers(parsed_pr)
+        has_consensus_markers = bool(pr_markers)
         if not author_fam:
-            inferred_af, seen_af = _infer_author_family_from_markers(_extract_consensus_markers(parsed_pr))
+            inferred_af, seen_af = _infer_author_family_from_markers(pr_markers)
             if len(seen_af) == 1:
                 author_fam = inferred_af
         remote_pr_head = str(parsed_pr.get("headRefOid") or "")
         if remote_pr_head == head_sha:
-            pr_consensus_ok = (
-                evaluate_pr_consensus(
-                    parsed_pr,
-                    author_family_override=author_fam or None,
-                    max_rounds=max_rounds,
-                ).get("status")
-                == "approved"
+            cons_verdict = evaluate_pr_consensus(
+                parsed_pr,
+                author_family_override=author_fam or None,
+                max_rounds=max_rounds,
             )
         elif remote_pr_head and not (args.allow_update_pr or args.open_for_consensus):
             print(
@@ -1321,16 +1384,35 @@ def cmd_ship(args: argparse.Namespace) -> int:
             )
             return 2
 
-    # Require Blind Adversarial Review OR heterogeneous PR consensus BEFORE merging (unless --open-for-consensus)
+    # When an open PR carries any consensus marker, PR consensus is the sole gate (a local receipt never overrides it)
     local_review_ok = bool(review and review.get("verdict") == "approve" and review.get("head_sha") == head_sha)
-    if require_blind and not args.open_for_consensus and not (local_review_ok or pr_consensus_ok):
-        print(
-            f"paf ship BLOCKED: missing SHA-pinned approval for {head_sha[:12]}.\n"
-            "Either open for cross-model PR consensus (`paf ship --open-for-consensus --author-family <claude|gemini>`)\n"
-            "or record a blind review receipt (`paf record-review --verdict approve ...`).",
-            file=sys.stderr,
-        )
-        return 2
+    if not args.open_for_consensus:
+        if has_consensus_markers:
+            if remote_pr_head != head_sha or cons_verdict is None:
+                print(
+                    f"paf ship BLOCKED (pending_review): PR #{open_pr_info.get('number') if open_pr_info else '?'} "
+                    f"carries consensus markers at {remote_pr_head[:12]}, while local HEAD is {head_sha[:12]}; "
+                    "push with --open-for-consensus and obtain a fresh SHA-pinned approve before merging.",
+                    file=sys.stderr,
+                )
+                return 2
+            if cons_verdict["status"] == "paused_human_tiebreak":
+                print(f"PAUSED_FOR_CONSENSUS_TIEBREAK: {cons_verdict['reason']}", file=sys.stderr)
+                return 4
+            if cons_verdict["status"] != "approved":
+                print(
+                    f"paf ship BLOCKED ({cons_verdict['status']}): {cons_verdict['reason']}",
+                    file=sys.stderr,
+                )
+                return 2
+        elif require_blind and not local_review_ok:
+            print(
+                f"paf ship BLOCKED: missing SHA-pinned approval for {head_sha[:12]}.\n"
+                "Either open for cross-model PR consensus (`paf ship --open-for-consensus --author-family <claude|gemini>`)\n"
+                "or record a blind review receipt (`paf record-review --verdict approve ...`).",
+                file=sys.stderr,
+            )
+            return 2
 
     gov_files = _governance_files_touched(repo, open_pr_info, base_branch)
 
