@@ -520,8 +520,8 @@ def main() -> int:
     else:
         print("PASS C1 guarded repo pauses on every non-staging base branch and fails closed on missing zone")
 
-    # 18. C3 & C4: Autonomous repo pauses once on governance/permission file edits (`CORE.md`, `.agent-verify.json`, etc.)
-    #     until `--approved-governance`, and blocks when GitHub `reviewDecision` requires human review
+    # 18. C3 & C4: Autonomous repo merges governance/tooling PRs directly upon heterogeneous model consensus
+    #     (zero human governance confirmation), while still blocking when GitHub `reviewDecision` requires human review
     auto_repo = pathlib.Path(tempfile.mkdtemp())
     subprocess.run(["git", "init", "-b", "main"], cwd=auto_repo, check=True, capture_output=True)
     (auto_repo / ".agent-verify.json").write_text(
@@ -546,11 +546,11 @@ def main() -> int:
         ),
         encoding="utf-8",
     )
-    res_c3_pause = run_paf(
+    res_c3_direct = run_paf(
         ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
         cwd=auto_repo,
     )
-    res_c3_approved = run_paf(
+    res_c3_legacy_flag = run_paf(
         [
             "merge-consensus",
             "--repo",
@@ -574,19 +574,20 @@ def main() -> int:
         cwd=repo,
     )
     if (
-        res_c3_pause.returncode != 0
-        or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in res_c3_pause.stdout
-        or res_c3_approved.returncode != 0
-        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_approved.stdout
+        res_c3_direct.returncode != 0
+        or "PAUSED_FOR_GOVERNANCE_APPROVAL" in res_c3_direct.stdout
+        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_direct.stdout
+        or res_c3_legacy_flag.returncode != 0
+        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_legacy_flag.stdout
         or res_c4_human_req.returncode == 0
     ):
         print(
-            f"FAIL C3/C4 governance & human-review gates: c3_pause={res_c3_pause.stdout.strip()} "
-            f"c3_approved={res_c3_approved.stdout.strip()} c4_rc={res_c4_human_req.returncode}"
+            f"FAIL C3/C4 autonomous consensus & human-review gates: c3_direct={res_c3_direct.stdout.strip()} "
+            f"c3_legacy={res_c3_legacy_flag.stdout.strip()} c4_rc={res_c4_human_req.returncode}"
         )
         failures += 1
     else:
-        print("PASS C3/C4 pause governance-file PRs for Leo and honor required human GitHub reviews")
+        print("PASS C3/C4 autonomous repo merges rule/tooling PRs on peer-model consensus without asking human, and honors GitHub human review")
 
     # 19. D1: Local `paf record-review` receipt NEVER overrides an open PR consensus gate (`request_changes`, `pending_review`, `needs_human_decision`)
     res_rec = run_paf(
@@ -697,8 +698,8 @@ def main() -> int:
     else:
         print("PASS D2 honors same-family/unlabeled objections and rejects substring family collisions")
 
-    # 21. D3 + truncated files guard: `.claude/settings*.json`, `.gemini/settings.json`, `framework/WORK-LOOP.md`,
-    #     `GEMINI.md`, `skills/verify/SKILL.md`, `framework/githooks/commit-msg`, and truncated `changedFiles > len(files)` all pause
+    # 21. D3: Governance, workflow, settings, skill, and hook PRs in autonomous repos merge directly once
+    #     heterogeneous model consensus approves, and still block when peer model requests changes
     d3_paths = (
         ".agent-verify.json",
         ".github/workflows/verify.yml",
@@ -735,9 +736,13 @@ def main() -> int:
             ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
             cwd=auto_repo,
         )
-        if r_gov.returncode != 0 or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_gov.stdout:
+        if (
+            r_gov.returncode != 0
+            or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in r_gov.stdout
+            or "PAUSED_FOR_GOVERNANCE_APPROVAL" in r_gov.stdout
+        ):
             d3_ok = False
-            print(f"FAIL D3 governance path missed: {gov_path} -> {r_gov.stdout.strip()}")
+            print(f"FAIL D3 autonomous consensus merge blocked on {gov_path}: {r_gov.stdout.strip()}")
 
     auto_pr_fix.write_text(
         json.dumps(
@@ -749,118 +754,167 @@ def main() -> int:
                 "baseRefName": "main",
                 "headRefOid": mul_sha,
                 "body": gemini_author_mul,
-                "comments": [{"body": claude_approve_mul}],
-                "files": [{"path": "src/app.py"}],
-                "changedFiles": 250,
+                "comments": [{"body": claude_req_block2}],
+                "files": [{"path": "CORE.md"}],
+                "changedFiles": 1,
                 "reviewDecision": "",
             }
         ),
         encoding="utf-8",
     )
-    r_trunc = run_paf(
+    r_gov_unapproved = run_paf(
         ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
         cwd=auto_repo,
     )
-    if not d3_ok or r_trunc.returncode != 0 or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_trunc.stdout:
-        print(f"FAIL D3 / truncated changedFiles guard: d3_ok={d3_ok} trunc={r_trunc.stdout.strip()}")
+    if not d3_ok or r_gov_unapproved.returncode != 2:
+        print(f"FAIL D3 peer-model governance check: d3_ok={d3_ok} unapproved_rc={r_gov_unapproved.returncode}")
         failures += 1
     else:
-        print("PASS D3 expands governance-file coverage and pauses when PR file list is truncated")
+        print("PASS D3 confirms governance/hook/workflow PRs via peer model without human governance pause")
 
-    # 22. Truncated or missing PR file list: the local `git diff` fallback counts only when local HEAD is the PR head
-    fb_repo = pathlib.Path(tempfile.mkdtemp())
-    subprocess.run(["git", "init", "-b", "main"], cwd=fb_repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=fb_repo, check=True)
-    subprocess.run(["git", "config", "user.name", "Test User"], cwd=fb_repo, check=True)
-    (fb_repo / ".agent-verify.json").write_text(
-        json.dumps({"version": 1, "zone": "autonomous", "default_branch": "main"}), encoding="utf-8"
-    )
-    subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=fb_repo, check=True, capture_output=True)
-    subprocess.run(["git", "checkout", "-b", "feature/plain"], cwd=fb_repo, check=True, capture_output=True)
-    for name in ("a.py", "b.py", "c.py"):
-        (fb_repo / name).write_text("x = 1\n", encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
-    subprocess.run(["git", "commit", "-m", "plain files"], cwd=fb_repo, check=True, capture_output=True)
-    plain_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=fb_repo, text=True, capture_output=True, check=True
-    ).stdout.strip()
-    fb_fix = fb_repo / ".git" / "pr-fallback.json"
-    other_sha = "d" * 40
+    # 22. Deploy + Post-Deploy Verification Pipeline: if deploy is configured, execute deploy after post-merge
+    #     and immediately re-test after deploy (`post_deploy_check` or fallback stage), failing closed on error
+    import importlib.machinery
+    import importlib.util
 
-    def write_fb_fixture(head_oid: str, files: list[str] | None, changed: int | None) -> None:
-        author = '<!-- paf-consensus: ' + json.dumps(
-            {"v": 1, "role": "author", "model_family": "gemini", "verdict": "open", "head_sha": head_oid}
-        ) + ' -->'
-        approve = '<!-- paf-consensus: ' + json.dumps(
+    loader = importlib.machinery.SourceFileLoader("paf_cli_test_mod", str(PAF_BIN))
+    spec = importlib.util.spec_from_loader("paf_cli_test_mod", loader)
+    assert spec is not None and spec.loader is not None
+    paf_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(paf_mod)
+
+    dep_repo = pathlib.Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-b", "main"], cwd=dep_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=dep_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=dep_repo, check=True)
+    step_log = dep_repo / "pipeline-steps.log"
+    (dep_repo / ".agent-verify.json").write_text(
+        json.dumps(
             {
-                "v": 1,
-                "role": "reviewer",
-                "model_family": "claude",
-                "verdict": "approve",
-                "head_sha": head_oid,
-                "round": 1,
-                "blocking_count": 0,
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "commands": {
+                    "unit_test": [f"echo unit_test >> {step_log}"],
+                    "post_merge_check": [f"echo post_merge >> {step_log}"],
+                    "deploy": [f"echo deploy >> {step_log}"],
+                    "post_deploy_check": [f"echo post_deploy >> {step_log}"],
+                },
             }
-        ) + ' -->'
-        data: dict[str, object] = {
-            "number": 116,
-            "url": "https://example.test/pr/116",
-            "state": "OPEN",
-            "headRefName": "feature/remote",
-            "baseRefName": "main",
-            "headRefOid": head_oid,
-            "body": author,
-            "comments": [{"body": approve}],
-            "reviewDecision": "",
-        }
-        if files is not None:
-            data["files"] = [{"path": f} for f in files]
-        if changed is not None:
-            data["changedFiles"] = changed
-        fb_fix.write_text(json.dumps(data), encoding="utf-8")
-
-    def fb_dry_run() -> subprocess.CompletedProcess[str]:
-        return run_paf(
-            ["merge-consensus", "--repo", str(fb_repo), "--pr-fixture", str(fb_fix), "--dry-run"], cwd=fb_repo
-        )
-
-    # local checkout sits on an unrelated branch with enough files to cover the count: must stay truncated
-    write_fb_fixture(other_sha, ["src/app.py"], 3)
-    r_fb_other = fb_dry_run()
-    # no file list at all and the local checkout is not the PR head: must pause, not pass as "no governance files"
-    write_fb_fixture(other_sha, None, None)
-    r_fb_nofiles = fb_dry_run()
-    # local HEAD is the PR head and holds no governance file: the fallback completes the list, no pause
-    write_fb_fixture(plain_sha, ["a.py"], 3)
-    r_fb_same_plain = fb_dry_run()
-    # local HEAD is the PR head and the truncated-away part holds a governance file: pause and name it
-    (fb_repo / "CORE.md").write_text("rule\n", encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
-    subprocess.run(["git", "commit", "-m", "rule file"], cwd=fb_repo, check=True, capture_output=True)
-    gov_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=fb_repo, text=True, capture_output=True, check=True
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", ".agent-verify.json"], cwd=dep_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init deploy repo"], cwd=dep_repo, check=True, capture_output=True)
+    dep_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=dep_repo, text=True, capture_output=True, check=True
     ).stdout.strip()
-    write_fb_fixture(gov_sha, ["a.py"], 4)
-    r_fb_same_gov = fb_dry_run()
+
+    ok_full, tag_full = paf_mod.run_post_merge_and_deploy_checks(
+        dep_repo,
+        pr_url="https://example.test/pr/118",
+        base_branch="main",
+        merged_sha=dep_sha,
+        host_id="personal-mac",
+    )
+    seq_full = step_log.read_text(encoding="utf-8").splitlines() if step_log.is_file() else []
+
+    # Fallback check: when `deploy` is set without `post_deploy_check`, `post-deploy` still re-runs `post_merge_check`
+    step_log.unlink(missing_ok=True)
+    (dep_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "commands": {
+                    "unit_test": [f"echo unit_test >> {step_log}"],
+                    "post_merge_check": [f"echo post_merge >> {step_log}"],
+                    "deploy": [f"echo deploy >> {step_log}"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_fb, tag_fb = paf_mod.run_post_merge_and_deploy_checks(
+        dep_repo,
+        pr_url="https://example.test/pr/119",
+        base_branch="main",
+        merged_sha=dep_sha,
+        host_id="personal-mac",
+    )
+    seq_fb = step_log.read_text(encoding="utf-8").splitlines() if step_log.is_file() else []
+
+    # Host affinity check: `deploy_host` defers deploy when running on a different machine
+    step_log.unlink(missing_ok=True)
+    (dep_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "deploy_host": "prod-runner",
+                "commands": {
+                    "post_merge_check": [f"echo post_merge >> {step_log}"],
+                    "deploy": [f"echo deploy >> {step_log}"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_def, tag_def = paf_mod.run_post_merge_and_deploy_checks(
+        dep_repo,
+        pr_url="https://example.test/pr/120",
+        base_branch="main",
+        merged_sha=dep_sha,
+        host_id="personal-mac",
+    )
+    seq_def = step_log.read_text(encoding="utf-8").splitlines() if step_log.is_file() else []
+
+    # Failure check: post-deploy failure returns False so auto-revert triggers
+    (dep_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "commands": {
+                    "post_merge_check": ["true"],
+                    "deploy": ["true"],
+                    "post_deploy_check": ["false"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_fail, msg_fail = paf_mod.run_post_merge_and_deploy_checks(
+        dep_repo,
+        pr_url="https://example.test/pr/121",
+        base_branch="main",
+        merged_sha=dep_sha,
+        host_id="personal-mac",
+    )
+
     if (
-        "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_fb_other.stdout
-        or "truncated-pr-files" not in r_fb_other.stdout
-        or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_fb_nofiles.stdout
-        or "unknown-pr-files" not in r_fb_nofiles.stdout
-        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in r_fb_same_plain.stdout
-        or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_fb_same_gov.stdout
-        or "CORE.md" not in r_fb_same_gov.stdout
-        or "truncated-pr-files" in r_fb_same_gov.stdout
+        not ok_full
+        or tag_full != "shipped_and_verified"
+        or seq_full != ["post_merge", "deploy", "post_deploy"]
+        or not ok_fb
+        or tag_fb != "shipped_and_verified"
+        or seq_fb != ["post_merge", "deploy", "post_merge"]
+        or not ok_def
+        or tag_def != "shipped_deploy_deferred"
+        or seq_def != ["post_merge"]
+        or ok_fail
+        or "POST_DEPLOY_VERIFICATION_FAILED" not in msg_fail
     ):
         print(
-            "FAIL file-list fallback bound to PR head: "
-            f"other={r_fb_other.stdout.strip()!r} nofiles={r_fb_nofiles.stdout.strip()!r} "
-            f"same_plain={r_fb_same_plain.stdout.strip()!r} same_gov={r_fb_same_gov.stdout.strip()!r}"
+            f"FAIL deploy + post-deploy pipeline: full=({ok_full},{tag_full},{seq_full}) "
+            f"fb=({ok_fb},{tag_fb},{seq_fb}) def=({ok_def},{tag_def},{seq_def}) fail=({ok_fail},{msg_fail!r})"
         )
         failures += 1
     else:
-        print("PASS truncated or missing PR file list trusts local git diff only when local HEAD is the PR head")
+        print("PASS post-merge -> deploy -> post-deploy re-test pipeline, fallback stage, deploy_host deferral, and failure gate")
 
     return 1 if failures else 0
 

@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -113,6 +114,26 @@ REVIEW_JSON_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 REVIEW_JSON_SCHEMA_STR = json.dumps(REVIEW_JSON_SCHEMA, separators=(",", ":"))
+
+AUTHOR_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "commit_message": {
+            "type": "string",
+            "minLength": 1,
+        },
+        "reply_prose": {
+            "type": "string",
+            "minLength": 1,
+        },
+        "needs_human_decision": {
+            "type": "boolean",
+        },
+    },
+    "required": ["commit_message", "reply_prose", "needs_human_decision"],
+    "additionalProperties": False,
+}
+AUTHOR_JSON_SCHEMA_STR = json.dumps(AUTHOR_JSON_SCHEMA, separators=(",", ":"))
 
 
 def normalize_family(raw: Any) -> str:
@@ -510,7 +531,17 @@ def _scrubbed_reviewer_env(target_family: str) -> dict[str, str]:
         upper = key.upper()
         if (
             upper.startswith("PAF_CONSENSUS_KEY")
-            or upper in ("GH_TOKEN", "GITHUB_TOKEN", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")
+            or upper
+            in (
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "CLAUDECODE",
+                "CLAUDE_CODE_ENTRYPOINT",
+                "CLAUDE_CODE_SSE_PORT",
+                "CLAUDE_SESSION_ID",
+                "AGY_CONVERSATION_ID",
+                "PAF_SESSION_ID",
+            )
         ):
             env.pop(key, None)
         elif target_family == "gemini" and upper.startswith("ANTHROPIC_"):
@@ -571,6 +602,104 @@ def _normalize_structured_review(raw: Any, session_id: str) -> dict[str, Any]:
         "prose": prose,
         "session_id": session_id,
     }
+
+
+def _normalize_structured_author_turn(raw: Any, session_id: str) -> dict[str, Any]:
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Structured author output is not a JSON object: {raw!r}")
+    commit_msg = str(raw.get("commit_message") or "").strip() or "[paf] Address cross-model consensus review feedback"
+    commit_msg = commit_msg.splitlines()[0].strip()[:140]
+    reply_prose = str(raw.get("reply_prose") or "").strip() or "Addressed review feedback and verified locally."
+    needs_human = bool(raw.get("needs_human_decision", False))
+    return {
+        "commit_message": commit_msg,
+        "reply_prose": reply_prose,
+        "needs_human_decision": needs_human,
+        "session_id": session_id,
+    }
+
+
+def build_followup_review_prompt(
+    *,
+    repo_slug: str,
+    pr_data: dict[str, Any],
+    prev_sha: str,
+    head_sha: str,
+    diff_stat: str,
+    delta_patch: str,
+    author_reply: str,
+    round_num: int,
+) -> str:
+    pr_num = pr_data.get("number")
+    base_branch = str(pr_data.get("baseRefName") or "main")
+    head_branch = str(pr_data.get("headRefName") or "")
+    clipped_delta = (
+        delta_patch[:64000] + "\n[... delta truncated at 64,000 chars; read files in working directory ...]\n"
+        if len(delta_patch) > 64000
+        else (delta_patch or "(no file diff between commits; see author reply)")
+    )
+    return (
+        f"Continuing your persistent review session for {repo_slug} PR #{pr_num} "
+        f"(round {round_num}, branch {head_branch} -> {base_branch}, previous commit {prev_sha}, new commit {head_sha}).\n"
+        "Your working directory has been updated to the latest commit. Verify whether every blocking issue you "
+        "raised in the prior round is resolved without regressions, and return ONLY the required JSON schema.\n"
+        "Rules:\n"
+        "- Do NOT attempt to modify files, run git push, or call gh CLI.\n"
+        "- Set verdict='approve' with blocking_count=0 if all blocking issues are resolved and the branch is safe to merge.\n"
+        "- Set verdict='request_changes' with blocking_count>=1 ONLY if concrete blocking defects remain or were introduced.\n"
+        "- Set needs_human_decision=true ONLY if a genuine product/UX trade-off requires human input.\n\n"
+        f"Author Reply (Round {round_num}):\n{author_reply[:6000]}\n\n"
+        f"Overall Diff Stat vs {base_branch}:\n{diff_stat}\n\n"
+        f"Incremental Delta ({prev_sha[:12]}..{head_sha[:12]}):\n{clipped_delta}\n"
+    )
+
+
+def build_author_fix_prompt(
+    *,
+    repo_slug: str,
+    pr_data: dict[str, Any],
+    diff_stat: str,
+    reviewer_prose: str,
+    round_num: int,
+    is_resume: bool,
+    verify_failure: str = "",
+) -> str:
+    pr_num = pr_data.get("number")
+    head_sha = str(pr_data.get("headRefOid") or "")
+    base_branch = str(pr_data.get("baseRefName") or "main")
+    head_branch = str(pr_data.get("headRefName") or "")
+    body = str(pr_data.get("body") or "")[:3000]
+    if verify_failure:
+        return (
+            f"Local `paf verify --mode pre-push` failed on your changes for {repo_slug} PR #{pr_num}.\n"
+            "Fix the failing check(s) directly in the working directory files (do NOT run git commit/push or modify "
+            "`.agent-verify.json` / `.github/workflows/`), keep all code/comments in English, and return the required JSON schema.\n\n"
+            f"Verification Failure Output:\n{verify_failure[:8000]}\n"
+        )
+    header = (
+        f"Continuing your persistent author session for {repo_slug} PR #{pr_num} (round {round_num}, commit {head_sha}).\n"
+        if is_resume
+        else (
+            f"You are the authoring model session maintaining {repo_slug} PR #{pr_num} "
+            f"(branch {head_branch} -> {base_branch}, commit {head_sha}).\n"
+            f"PR Description:\n{body}\n\n"
+            f"Branch Diff Stat vs {base_branch}:\n{diff_stat}\n\n"
+        )
+    )
+    return (
+        header
+        + "The peer heterogeneous reviewer requested changes below. Inspect and edit files directly in your working "
+        "directory to fix every valid defect and add/update tests as needed.\n"
+        "Rules:\n"
+        "- Do NOT run `git commit`, `git push`, or `gh`; the outer orchestrator runs `paf verify`, commits, and pushes.\n"
+        "- Do NOT modify `.agent-verify.json` or `.github/workflows/` during automated fix rounds.\n"
+        "- All code, comments, commit messages, and `reply_prose` MUST be in English (zero CJK characters in code).\n"
+        "- If a point is genuinely a false positive, leave code unchanged and cite exact file/line proof in `reply_prose`.\n"
+        "- Set `needs_human_decision=true` ONLY if resolving the issue requires a human product/UX decision.\n\n"
+        f"Peer Reviewer Feedback (Round {round_num}):\n{reviewer_prose[:8000]}\n"
+    )
 
 
 def build_review_prompt(
@@ -646,66 +775,22 @@ def _raise_for_reviewer_exit(label: str, proc: subprocess.CompletedProcess[str])
     raise RuntimeError(f"{label} exited with code {proc.returncode}: {detail}")
 
 
-def run_agy_review(
-    *,
-    agy_bin: str,
-    worktree: Path,
-    prompt: str,
-    model: str | None = None,
-    timeout_sec: int = 660,
-) -> dict[str, Any]:
-    exec_agy = _ensure_executable_binary(agy_bin, "agy")
-    cmd = [
-        exec_agy,
-        "--output-format",
-        "json",
-        "--json-schema",
-        REVIEW_JSON_SCHEMA_STR,
-        "--disable-slash-commands",
-        "--sandbox",
-    ]
-    if model:
-        cmd.extend(["--model", model])
-    cmd.append(f"-p={prompt}")
-
+def _snapshot_agy_brain_ids() -> set[str]:
+    brain_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+    if not brain_dir.is_dir():
+        return set()
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=worktree,
-            env=_scrubbed_reviewer_env("gemini"),
-            text=True,
-            capture_output=True,
-            timeout=timeout_sec,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ReviewerOutageError(f"agy timed out after {timeout_sec}s") from exc
-    if proc.returncode != 0:
-        _raise_for_reviewer_exit("agy", proc)
-    envelope = _parse_last_json_dict(proc.stdout)
-    status = str(envelope.get("status") or "").strip().upper()
-    if status in ("ERROR", "FAILED", "CANCELLED") or envelope.get("is_error") is True:
-        raise RuntimeError(f"agy reported error status={status}: {envelope.get('error')}")
-    session_id = str(envelope.get("conversation_id") or envelope.get("session_id") or "").strip()
-    raw_payload = (
-        envelope["structured_output"]
-        if isinstance(envelope.get("structured_output"), dict)
-        else envelope.get("response")
-    )
-    res = _normalize_structured_review(raw_payload, session_id)
-    res["session_id_verified"] = bool(session_id)
-    return res
+        return {p.name for p in brain_dir.iterdir() if p.is_dir()}
+    except OSError:
+        return set()
 
 
-def run_claude_review(
-    *,
-    claude_bin: str,
+def _build_claude_confinement_settings(
     worktree: Path,
-    prompt: str,
-    model: str | None = None,
-    key_file: Path | None = None,
-    timeout_sec: int = 600,
-) -> dict[str, Any]:
+    key_file: Path | None,
+    *,
+    allow_write: bool = False,
+) -> tuple[list[str], str]:
     wt_resolved = worktree.expanduser().resolve()
     wt_str = str(wt_resolved)
     wt_glob = "//" + wt_str.lstrip("/") + "/**"
@@ -714,6 +799,13 @@ def run_claude_review(
         f"Grep({wt_glob})",
         f"Glob({wt_glob})",
     ]
+    if allow_write:
+        allow_rules.extend(
+            [
+                f"Edit({wt_glob})",
+                f"Write({wt_glob})",
+            ]
+        )
     deny_rules = [
         "Read(~/.config/**)",
         "Grep(~/.config/**)",
@@ -743,10 +835,26 @@ def run_claude_review(
         "Grep(**/*.key)",
         "Grep(**/*.pem)",
     ]
+    if allow_write:
+        wt_base = "//" + wt_str.lstrip("/")
+        deny_rules.extend(
+            [
+                f"Edit({wt_base}/.agent-verify.json)",
+                f"Write({wt_base}/.agent-verify.json)",
+                f"Edit({wt_base}/.github/workflows/**)",
+                f"Write({wt_base}/.github/workflows/**)",
+                "Edit(**/.env)",
+                "Edit(**/.env.*)",
+                "Write(**/.env)",
+                "Write(**/.env.*)",
+            ]
+        )
     for sys_root in ("/Users", "/home", "/etc", "/root"):
         if not (wt_str == sys_root or wt_str.startswith(sys_root + "/")):
             r_glob = "//" + sys_root.lstrip("/") + "/**"
             deny_rules.extend([f"Read({r_glob})", f"Grep({r_glob})", f"Glob({r_glob})"])
+            if allow_write:
+                deny_rules.extend([f"Edit({r_glob})", f"Write({r_glob})"])
     if key_file is not None:
         key_dir = str(key_file.expanduser().resolve().parent)
         if not (wt_str == key_dir or wt_str.startswith(key_dir + "/")):
@@ -768,6 +876,78 @@ def run_claude_review(
         },
         separators=(",", ":"),
     )
+    return allow_rules, settings_json
+
+
+def run_agy_review(
+    *,
+    agy_bin: str,
+    worktree: Path,
+    prompt: str,
+    model: str | None = None,
+    resume_session_id: str | None = None,
+    timeout_sec: int = 660,
+) -> dict[str, Any]:
+    exec_agy = _ensure_executable_binary(agy_bin, "agy")
+    pre_ids = _snapshot_agy_brain_ids() if not resume_session_id else set()
+    cmd = [
+        exec_agy,
+        "--output-format",
+        "json",
+        "--json-schema",
+        REVIEW_JSON_SCHEMA_STR,
+        "--disable-slash-commands",
+        "--sandbox",
+    ]
+    if resume_session_id:
+        cmd.extend(["--conversation", resume_session_id])
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append(f"-p={prompt}")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=worktree,
+            env=_scrubbed_reviewer_env("gemini"),
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewerOutageError(f"agy timed out after {timeout_sec}s") from exc
+    if proc.returncode != 0:
+        _raise_for_reviewer_exit("agy", proc)
+    envelope = _parse_last_json_dict(proc.stdout)
+    status = str(envelope.get("status") or "").strip().upper()
+    if status in ("ERROR", "FAILED", "CANCELLED") or envelope.get("is_error") is True:
+        raise RuntimeError(f"agy reported error status={status}: {envelope.get('error')}")
+    reported_sid = str(envelope.get("conversation_id") or envelope.get("session_id") or "").strip()
+    session_id = reported_sid or (resume_session_id or "")
+    raw_payload = (
+        envelope["structured_output"]
+        if isinstance(envelope.get("structured_output"), dict)
+        else envelope.get("response")
+    )
+    res = _normalize_structured_review(raw_payload, session_id)
+    res["session_id_verified"] = bool(reported_sid or resume_session_id)
+    res["session_created"] = bool(reported_sid and not resume_session_id and reported_sid not in pre_ids)
+    return res
+
+
+def run_claude_review(
+    *,
+    claude_bin: str,
+    worktree: Path,
+    prompt: str,
+    model: str | None = None,
+    key_file: Path | None = None,
+    init_session_id: str | None = None,
+    resume_session_id: str | None = None,
+    timeout_sec: int = 600,
+) -> dict[str, Any]:
+    allow_rules, settings_json = _build_claude_confinement_settings(worktree, key_file, allow_write=False)
     exec_claude = _ensure_executable_binary(claude_bin, "claude")
     cmd = [
         exec_claude,
@@ -791,6 +971,10 @@ def run_claude_review(
         "--max-turns",
         "35",
     ]
+    if resume_session_id:
+        cmd.extend(["--resume", resume_session_id])
+    elif init_session_id:
+        cmd.extend(["--session-id", init_session_id])
     if model:
         cmd.extend(["--model", model])
 
@@ -812,14 +996,146 @@ def run_claude_review(
     envelope = _parse_last_json_dict(proc.stdout)
     if envelope.get("is_error") is True:
         raise RuntimeError(f"claude reported is_error=true: {envelope.get('result')}")
-    session_id = str(envelope.get("session_id") or "").strip()
+    reported_sid = str(envelope.get("session_id") or "").strip()
+    session_id = reported_sid or (resume_session_id or init_session_id or "")
     raw_payload = (
         envelope["structured_output"]
         if isinstance(envelope.get("structured_output"), dict)
         else envelope.get("result")
     )
     res = _normalize_structured_review(raw_payload, session_id)
-    res["session_id_verified"] = bool(session_id)
+    res["session_id_verified"] = bool(reported_sid or resume_session_id or init_session_id)
+    res["session_created"] = bool((init_session_id or reported_sid) and not resume_session_id)
+    return res
+
+
+def run_agy_author_turn(
+    *,
+    agy_bin: str,
+    worktree: Path,
+    prompt: str,
+    model: str | None = None,
+    resume_session_id: str | None = None,
+    timeout_sec: int = 660,
+) -> dict[str, Any]:
+    exec_agy = _ensure_executable_binary(agy_bin, "agy")
+    pre_ids = _snapshot_agy_brain_ids() if not resume_session_id else set()
+    cmd = [
+        exec_agy,
+        "--output-format",
+        "json",
+        "--json-schema",
+        AUTHOR_JSON_SCHEMA_STR,
+        "--disable-slash-commands",
+        "--sandbox",
+        "--mode",
+        "accept-edits",
+    ]
+    if resume_session_id:
+        cmd.extend(["--conversation", resume_session_id])
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append(f"-p={prompt}")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=worktree,
+            env=_scrubbed_reviewer_env("gemini"),
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewerOutageError(f"agy author session timed out after {timeout_sec}s") from exc
+    if proc.returncode != 0:
+        _raise_for_reviewer_exit("agy", proc)
+    envelope = _parse_last_json_dict(proc.stdout)
+    status = str(envelope.get("status") or "").strip().upper()
+    if status in ("ERROR", "FAILED", "CANCELLED") or envelope.get("is_error") is True:
+        raise RuntimeError(f"agy author reported error status={status}: {envelope.get('error')}")
+    reported_sid = str(envelope.get("conversation_id") or envelope.get("session_id") or "").strip()
+    session_id = reported_sid or (resume_session_id or "")
+    raw_payload = (
+        envelope["structured_output"]
+        if isinstance(envelope.get("structured_output"), dict)
+        else envelope.get("response")
+    )
+    res = _normalize_structured_author_turn(raw_payload, session_id)
+    res["session_created"] = bool(reported_sid and not resume_session_id and reported_sid not in pre_ids)
+    return res
+
+
+def run_claude_author_turn(
+    *,
+    claude_bin: str,
+    worktree: Path,
+    prompt: str,
+    model: str | None = None,
+    key_file: Path | None = None,
+    init_session_id: str | None = None,
+    resume_session_id: str | None = None,
+    timeout_sec: int = 600,
+) -> dict[str, Any]:
+    allow_rules, settings_json = _build_claude_confinement_settings(worktree, key_file, allow_write=True)
+    exec_claude = _ensure_executable_binary(claude_bin, "claude")
+    cmd = [
+        exec_claude,
+        "-p",
+        "--output-format",
+        "json",
+        "--json-schema",
+        AUTHOR_JSON_SCHEMA_STR,
+        "--permission-mode",
+        "dontAsk",
+        "--setting-sources",
+        "user",
+        "--tools",
+        "Read,Edit,Write,Grep,Glob",
+        "--allowedTools",
+        ",".join(allow_rules),
+        "--settings",
+        settings_json,
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--max-turns",
+        "45",
+    ]
+    if resume_session_id:
+        cmd.extend(["--resume", resume_session_id])
+    elif init_session_id:
+        cmd.extend(["--session-id", init_session_id])
+    if model:
+        cmd.extend(["--model", model])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=worktree,
+            env=_scrubbed_reviewer_env("claude"),
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewerOutageError(f"claude author session timed out after {timeout_sec}s") from exc
+    if proc.returncode != 0:
+        _raise_for_reviewer_exit("claude", proc)
+    envelope = _parse_last_json_dict(proc.stdout)
+    if envelope.get("is_error") is True:
+        raise RuntimeError(f"claude author reported is_error=true: {envelope.get('result')}")
+    reported_sid = str(envelope.get("session_id") or "").strip()
+    session_id = reported_sid or (resume_session_id or init_session_id or "")
+    raw_payload = (
+        envelope["structured_output"]
+        if isinstance(envelope.get("structured_output"), dict)
+        else envelope.get("result")
+    )
+    res = _normalize_structured_author_turn(raw_payload, session_id)
+    res["session_created"] = bool((init_session_id or reported_sid) and not resume_session_id)
     return res
 
 
@@ -923,6 +1239,182 @@ def _collect_diff_context(worktree: Path, base_branch: str, head_sha: str) -> tu
     return "", ""
 
 
+def _collect_delta_diff(worktree: Path, prev_sha: str, head_sha: str) -> str:
+    if not prev_sha or prev_sha == head_sha:
+        return ""
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    p = subprocess.run(
+        [git_bin, "diff", f"{prev_sha}..{head_sha}"],
+        cwd=worktree,
+        env=_clean_git_env(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return p.stdout if p.returncode == 0 else ""
+
+
+def _ensure_pr_worktree(repo: Path, wt_path: Path, target_sha: str, fetch_branch: str) -> bool:
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    env = _clean_git_env()
+    verify_cat = subprocess.run(
+        [git_bin, "cat-file", "-e", f"{target_sha}^{{commit}}"],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if verify_cat.returncode != 0 and fetch_branch:
+        subprocess.run(
+            [git_bin, "fetch", "origin", fetch_branch],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    wt_resolved = wt_path.expanduser().resolve()
+    if (wt_resolved / ".git").exists():
+        subprocess.run([git_bin, "reset", "--hard"], cwd=wt_resolved, env=env, capture_output=True, check=False)
+        subprocess.run([git_bin, "clean", "-fd"], cwd=wt_resolved, env=env, capture_output=True, check=False)
+        chk = subprocess.run(
+            [git_bin, "checkout", "--detach", target_sha],
+            cwd=wt_resolved,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if chk.returncode == 0:
+            cur = subprocess.run(
+                [git_bin, "rev-parse", "HEAD"],
+                cwd=wt_resolved,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            if sha_matches(cur, target_sha):
+                return True
+        _remove_worktree(repo, wt_resolved, True)
+
+    if wt_resolved.exists():
+        shutil.rmtree(wt_resolved, ignore_errors=True)
+    wt_resolved.parent.mkdir(parents=True, exist_ok=True)
+    _prune_stale_worktrees(repo)
+    add_res = subprocess.run(
+        [git_bin, "worktree", "add", "--detach", str(wt_resolved), target_sha],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if add_res.returncode != 0:
+        shutil.rmtree(wt_resolved, ignore_errors=True)
+        return False
+    return True
+
+
+UUID_SAFE_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+SAFE_SESSION_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
+
+
+def close_consensus_sessions(session_ctx: dict[str, Any]) -> dict[str, Any]:
+    """Deterministically close and clean up both the author and reviewer consensus sessions."""
+    if session_ctx.get("closed"):
+        return dict(session_ctx.get("close_receipt") or {})
+
+    for proc in list(session_ctx.get("processes") or []):
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    claude_projects = Path.home() / ".claude" / "projects"
+    cleaned_claude: list[str] = []
+    if claude_projects.is_dir():
+        for sid in sorted(session_ctx.get("spawned_claude_sessions") or set()):
+            if not UUID_SAFE_RE.match(sid):
+                continue
+            for proj_dir in claude_projects.iterdir():
+                if not proj_dir.is_dir():
+                    continue
+                jsonl = proj_dir / f"{sid}.jsonl"
+                if jsonl.is_file():
+                    jsonl.unlink(missing_ok=True)
+                    cleaned_claude.append(sid)
+                sdir = proj_dir / sid
+                if sdir.is_dir():
+                    shutil.rmtree(sdir, ignore_errors=True)
+                try:
+                    if not any(proj_dir.iterdir()):
+                        proj_dir.rmdir()
+                except OSError:
+                    pass
+
+    agy_brain = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+    cleaned_agy: list[str] = []
+    if agy_brain.is_dir():
+        for sid in sorted(session_ctx.get("spawned_agy_sessions") or set()):
+            if not SAFE_SESSION_TOKEN_RE.match(sid):
+                continue
+            target_dir = agy_brain / sid
+            if target_dir.is_dir():
+                shutil.rmtree(target_dir, ignore_errors=True)
+                cleaned_agy.append(sid)
+
+    repo_root: Path | None = session_ctx.get("repo")
+    for wt in list(session_ctx.get("worktrees") or []):
+        if repo_root is not None and isinstance(wt, Path):
+            _remove_worktree(repo_root, wt, True)
+    if repo_root is not None:
+        _prune_stale_worktrees(repo_root)
+
+    closed_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    author_sid = str(session_ctx.get("author_session_id") or "")
+    reviewer_sid = str(session_ctx.get("reviewer_session_id") or "")
+    pr_num = session_ctx.get("pr_number")
+    receipt = {
+        "closed": True,
+        "pr_number": pr_num,
+        "author_session_id": author_sid,
+        "reviewer_session_id": reviewer_sid,
+        "cleaned_claude_sessions": sorted(set(cleaned_claude)),
+        "cleaned_agy_sessions": sorted(set(cleaned_agy)),
+        "closed_at": closed_at,
+    }
+
+    reg_path: Path | None = session_ctx.get("registry_path")
+    reg_key = str(session_ctx.get("registry_key") or "")
+    if isinstance(reg_path, Path) and reg_key:
+        reg = _load_json_state(reg_path)
+        active = reg.get("active") if isinstance(reg.get("active"), dict) else {}
+        active.pop(reg_key, None)
+        reg["active"] = active
+        closed_map = reg.get("closed") if isinstance(reg.get("closed"), dict) else {}
+        closed_map[reg_key] = receipt
+        if len(closed_map) > 100:
+            keys_sorted = sorted(closed_map.keys(), key=lambda k: str((closed_map[k] or {}).get("closed_at") or ""))
+            closed_map = {k: closed_map[k] for k in keys_sorted[-100:]}
+        reg["closed"] = closed_map
+        _save_json_state(reg_path, reg)
+
+    session_ctx["closed"] = True
+    session_ctx["close_receipt"] = receipt
+    on_close = session_ctx.get("close_hook")
+    if callable(on_close):
+        on_close(receipt)
+    print(f"CLOSED_CONSENSUS_SESSIONS: pr=#{pr_num} author={author_sid or 'none'} reviewer={reviewer_sid or 'none'}")
+    return receipt
+
+
 class GitHubBus:
     """Live GitHub REST + gh CLI transport with ETag conditional polling."""
 
@@ -1003,6 +1495,59 @@ class GitHubBus:
         if proc.returncode != 0:
             raise RuntimeError(f"gh pr comment #{pr_number} failed: {proc.stderr.strip()}")
 
+    def push_head(self, pr_number: int, new_sha: str, head_branch: str, source_wt: Path) -> None:
+        git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+        push_env = _clean_git_env()
+        push_env["PAF_PRE_PUSH_VERIFIED"] = new_sha
+        proc = subprocess.run(
+            [git_bin, "push", "origin", f"HEAD:refs/heads/{head_branch}"],
+            cwd=source_wt,
+            env=push_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"git push failed for PR #{pr_number} ({head_branch}): {proc.stderr.strip()}")
+        subprocess.run(
+            [git_bin, "fetch", "origin", head_branch],
+            cwd=self.repo_path,
+            env=_clean_git_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        cur_br = subprocess.run(
+            [git_bin, "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=self.repo_path,
+            env=_clean_git_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        clean_st = subprocess.run(
+            [git_bin, "status", "--porcelain"],
+            cwd=self.repo_path,
+            env=_clean_git_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if cur_br == head_branch and not clean_st:
+            subprocess.run(
+                [git_bin, "merge", "--ff-only", new_sha],
+                cwd=self.repo_path,
+                env=_clean_git_env(),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        for _ in range(8):
+            pr_now = self.get_pr(pr_number)
+            if sha_matches(str(pr_now.get("headRefOid") or ""), new_sha):
+                return
+            time.sleep(0.8)
+
     def merge_pr(
         self,
         pr_number: int,
@@ -1010,9 +1555,34 @@ class GitHubBus:
         require_hmac: bool = False,
         allow_same_family_fallback: bool = False,
         key_file: Path | None = None,
+        approved_main: bool = False,
+        max_wait_ci: int = 600,
+        no_auto_revert: bool = False,
+        host_id: str | None = None,
+        on_merged_callback: Callable[[], None] | None = None,
     ) -> tuple[bool, str]:
-        env = _clean_git_env()
         eff_key = key_file if key_file is not None else self.key_file
+        if on_merged_callback is not None:
+            paf_mod = _load_paf_module()
+            rc, status_tag = paf_mod.merge_pr_in_process(
+                repo=self.repo_path,
+                pr_number=pr_number,
+                key_file=eff_key,
+                require_hmac=require_hmac,
+                allow_same_family_fallback=allow_fb if (allow_fb := allow_same_family_fallback) else False,
+                approved_main=approved_main,
+                max_wait_ci=max_wait_ci,
+                no_auto_revert=no_auto_revert,
+                host_id=host_id,
+                on_merged_callback=on_merged_callback,
+            )
+            if rc == 0 and status_tag == "merged":
+                return True, "merged"
+            if status_tag == "paused":
+                return False, "paused"
+            return False, f"blocked({rc}): {status_tag}"
+
+        env = _clean_git_env()
         if eff_key is not None:
             env["PAF_CONSENSUS_KEY_FILE"] = str(eff_key)
         cmd = [
@@ -1023,11 +1593,17 @@ class GitHubBus:
             str(self.repo_path),
             "--pr",
             str(pr_number),
+            "--max-wait-ci",
+            str(max_wait_ci),
         ]
         if require_hmac:
             cmd.append("--require-hmac")
         if allow_same_family_fallback:
             cmd.append("--allow-same-family-fallback")
+        if approved_main:
+            cmd.append("--approved-main")
+        if no_auto_revert:
+            cmd.append("--no-auto-revert")
         proc = subprocess.run(
             cmd,
             cwd=self.repo_path,
@@ -1054,6 +1630,7 @@ class InMemoryGitHubBus:
         prs: dict[int, dict[str, Any]],
         etag: str = 'W/"etag-init"',
         key_file: Path | None = None,
+        run_post_merge_verify: bool = False,
     ) -> None:
         self.repo_path = repo_path
         self.prs: dict[int, dict[str, Any]] = json.loads(json.dumps(prs))
@@ -1061,6 +1638,7 @@ class InMemoryGitHubBus:
         self.prs = {int(k): v for k, v in self.prs.items()}
         self.etag = etag
         self.key_file = key_file
+        self.run_post_merge_verify = run_post_merge_verify
         self._seq = 1
         self.detail_calls = 0
         self.comments_posted: list[tuple[int, str]] = []
@@ -1095,6 +1673,47 @@ class InMemoryGitHubBus:
         self.comments_posted.append((int(pr_number), body))
         self._bump_etag()
 
+    def push_head(self, pr_number: int, new_sha: str, head_branch: str, source_wt: Path) -> None:
+        git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+        rem = subprocess.run(
+            [git_bin, "remote", "get-url", "origin"],
+            cwd=source_wt,
+            env=_clean_git_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if rem.returncode == 0 and rem.stdout.strip():
+            push_env = _clean_git_env()
+            push_env["PAF_PRE_PUSH_VERIFIED"] = new_sha
+            subprocess.run(
+                [git_bin, "push", "origin", f"HEAD:refs/heads/{head_branch}"],
+                cwd=source_wt,
+                env=push_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            subprocess.run(
+                [git_bin, "fetch", "origin", head_branch],
+                cwd=self.repo_path,
+                env=_clean_git_env(),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            subprocess.run(
+                [git_bin, "branch", "-f", head_branch, new_sha],
+                cwd=self.repo_path,
+                env=_clean_git_env(),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.prs[int(pr_number)]["headRefOid"] = new_sha
+        self._bump_etag()
+
     def merge_pr(
         self,
         pr_number: int,
@@ -1102,7 +1721,13 @@ class InMemoryGitHubBus:
         require_hmac: bool = False,
         allow_same_family_fallback: bool = False,
         key_file: Path | None = None,
+        approved_main: bool = False,
+        max_wait_ci: int = 600,
+        no_auto_revert: bool = False,
+        host_id: str | None = None,
+        on_merged_callback: Callable[[], None] | None = None,
     ) -> tuple[bool, str]:
+        _ = (max_wait_ci, no_auto_revert)
         pr = self.prs[int(pr_number)]
         tmp_fix = self.repo_path / ".git" / f"inmem-pr-{pr_number}.json"
         tmp_fix.write_text(json.dumps(pr), encoding="utf-8")
@@ -1124,6 +1749,8 @@ class InMemoryGitHubBus:
             cmd.append("--require-hmac")
         if allow_same_family_fallback:
             cmd.append("--allow-same-family-fallback")
+        if approved_main:
+            cmd.append("--approved-main")
         proc = subprocess.run(
             cmd,
             cwd=self.repo_path,
@@ -1137,6 +1764,29 @@ class InMemoryGitHubBus:
         if proc.returncode == 0 and "CONSENSUS_AUTONOMOUS_MERGE_READY:" in combined:
             pr["state"] = "MERGED"
             self._bump_etag()
+            if on_merged_callback is not None:
+                on_merged_callback()
+            if self.run_post_merge_verify:
+                paf_mod = _load_paf_module()
+                head_oid = str(pr.get("headRefOid") or "")
+                wt_post, created_post = _prepare_detached_worktree(
+                    self.repo_path,
+                    head_oid,
+                    str(pr.get("headRefName") or ""),
+                )
+                try:
+                    target_dir = wt_post if (created_post and wt_post is not None) else self.repo_path
+                    ok, msg = paf_mod.run_post_merge_and_deploy_checks(
+                        target_dir,
+                        pr_url=str(pr.get("url") or f"PR#{pr_number}"),
+                        base_branch=str(pr.get("baseRefName") or "main"),
+                        merged_sha=head_oid,
+                        host_id=host_id,
+                    )
+                    if not ok:
+                        return False, f"post_merge_or_deploy_failed: {msg}"
+                finally:
+                    _remove_worktree(self.repo_path, wt_post, created_post)
             return True, "merged"
         if "PAUSED_FOR_" in combined:
             return False, "paused"
@@ -1206,6 +1856,627 @@ def _load_paf_module() -> Any:
     sys.modules["paf_cli_mod"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+FORBIDDEN_AUTO_EDIT_RE = re.compile(
+    r"(^|/)(\.agent-verify\.json|\.github/workflows/.*|\.env(?:\..+)?|.*\.(?:key|pem))$"
+)
+
+
+def _list_dirty_paths(worktree: Path) -> list[str]:
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    proc = subprocess.run(
+        [git_bin, "status", "--porcelain", "-z", "-uall"],
+        cwd=worktree,
+        env=_clean_git_env(),
+        capture_output=True,
+        check=False,
+    )
+    raw = proc.stdout or b""
+    entries = raw.split(b"\x00")
+    paths: list[str] = []
+    idx = 0
+    while idx < len(entries):
+        item = entries[idx]
+        idx += 1
+        if len(item) < 4:
+            continue
+        status_xy = item[:2].decode("utf-8", errors="replace")
+        rel_path = item[3:].decode("utf-8", errors="replace")
+        if rel_path:
+            paths.append(rel_path)
+        if "R" in status_xy or "C" in status_xy:
+            if idx < len(entries) and entries[idx]:
+                orig_path = entries[idx].decode("utf-8", errors="replace")
+                if orig_path:
+                    paths.append(orig_path)
+                idx += 1
+    deduped = sorted(set(paths))
+    for p in deduped:
+        norm = re.sub(r"^(?:\./)+", "", p)
+        if FORBIDDEN_AUTO_EDIT_RE.search(norm):
+            raise RuntimeError(
+                f"Automated consensus fix session attempted to modify protected/secret path '{norm}'; refusing."
+            )
+    return deduped
+
+
+def _commit_dirty_paths(worktree: Path, paths: list[str], commit_message: str) -> str:
+    git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
+    env = _clean_git_env()
+    add_proc = subprocess.run(
+        [git_bin, "add", "--", *paths],
+        cwd=worktree,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if add_proc.returncode != 0:
+        raise RuntimeError(f"git add failed in author worktree: {add_proc.stderr.strip()}")
+    commit_proc = subprocess.run(
+        [git_bin, "commit", "-m", commit_message],
+        cwd=worktree,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if commit_proc.returncode != 0:
+        raise RuntimeError(f"git commit failed in author worktree: {commit_proc.stderr.strip()}")
+    sha_proc = subprocess.run(
+        [git_bin, "rev-parse", "HEAD"],
+        cwd=worktree,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return sha_proc.stdout.strip()
+
+
+def run_consensus_dialogue(
+    *,
+    repo: Path,
+    pr_number: int,
+    repo_slug: str | None = None,
+    author_family: str | None = None,
+    caller_session_id: str | None = None,
+    host_id: str | None = None,
+    state_dir: Path | None = None,
+    key_file: Path | None = None,
+    bus: Any | None = None,
+    claude_bin: str | None = None,
+    agy_bin: str | None = None,
+    claude_model: str | None = None,
+    agy_model: str | None = None,
+    allow_same_family_fallback: bool | None = None,
+    max_rounds: int | None = None,
+    review_timeout_sec: int = 660,
+    approved_main: bool = False,
+    max_wait_ci: int = 600,
+    no_auto_revert: bool = False,
+    close_hook: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Synchronous persistent two-session PR consensus loop:
+    Open/inspect PR -> keep one persistent Reviewer session and one persistent Author session
+    across back-and-forth rounds -> merge immediately on consensus + green CI -> close both
+    sessions -> run post-merge check and optional deploy + post-deploy check.
+    """
+    repo = repo.expanduser().resolve()
+    st_dir = (state_dir or DEFAULT_STATE_DIR).expanduser().resolve()
+    st_dir.mkdir(parents=True, exist_ok=True)
+    paf_mod = _load_paf_module()
+    paf_bin = Path(paf_mod.__file__).resolve()
+    resolved_host = resolve_host_id(host_id)
+    resolved_key = resolve_key_file(key_file)
+    secret = load_consensus_secret(resolved_key)
+    slug = repo_slug or infer_repo_slug(repo)
+    safe_slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", slug)
+
+    verify_cfg: dict[str, Any] = {}
+    cfg_file = repo / ".agent-verify.json"
+    if cfg_file.is_file():
+        verify_cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+    consensus_cfg = verify_cfg.get("consensus") or {}
+    require_hmac = (
+        bool(consensus_cfg["require_hmac"])
+        if "require_hmac" in consensus_cfg
+        else True
+    )
+    if require_hmac and not secret:
+        raise ConsensusKeyError(
+            f"HMAC consensus key required for {slug}#{pr_number}, but {resolved_key} is missing. "
+            "Run `paf init-consensus-key` first."
+        )
+    allow_fb = (
+        allow_same_family_fallback
+        if allow_same_family_fallback is not None
+        else bool(consensus_cfg.get("allow_same_family_fallback", False))
+    )
+    eff_max_rounds = (
+        max(1, int(max_rounds))
+        if max_rounds is not None
+        else max(1, int(consensus_cfg.get("max_rounds", 3)))
+    )
+
+    eff_claude_bin = (
+        claude_bin
+        or os.environ.get("PAF_CLAUDE_BIN")
+        or ("/Users/linhungfan/bin/claude" if os.path.isfile("/Users/linhungfan/bin/claude") else "claude")
+    )
+    eff_agy_bin = (
+        agy_bin
+        or os.environ.get("PAF_AGY_BIN")
+        or ("/Users/linhungfan/bin/agy" if os.path.isfile("/Users/linhungfan/bin/agy") else "agy")
+    )
+    active_bus = bus if bus is not None else GitHubBus(repo, paf_bin, key_file=resolved_key)
+
+    pr_data = active_bus.get_pr(pr_number)
+    if str(pr_data.get("state") or "").upper() != "OPEN":
+        raise RuntimeError(f"PR #{pr_number} is not OPEN (state={pr_data.get('state')!r}).")
+
+    markers = paf_mod._extract_consensus_markers(pr_data)
+    pr_base = str(pr_data.get("baseRefName") or "main").strip()
+    inferred_af, _seen_af, author_host, author_sessions, _bad_sig, _mm = paf_mod._extract_author_metadata(
+        markers,
+        hmac_secret=secret,
+        require_hmac=require_hmac,
+        expected_base=pr_base,
+        expected_pr_num=int(pr_number),
+    )
+    if author_host and author_host != resolved_host:
+        raise RuntimeError(
+            f"PR #{pr_number} is owned by host '{author_host}' (current host='{resolved_host}')."
+        )
+    eff_author_fam = normalize_family(author_family) or inferred_af
+    if eff_author_fam not in ("claude", "gemini"):
+        raise RuntimeError(
+            f"Cannot determine author_family ('claude' or 'gemini') for PR #{pr_number}; pass --author-family."
+        )
+    primary_reviewer_fam = "claude" if eff_author_fam == "gemini" else "gemini"
+
+    sessions_root = st_dir / "sessions"
+    reviewer_wt = sessions_root / f"{safe_slug}-pr-{pr_number}-reviewer"
+    author_wt = sessions_root / f"{safe_slug}-pr-{pr_number}-author"
+    registry_path = st_dir / "active-pr-sessions.json"
+    registry_key = f"{slug}#{pr_number}"
+
+    pre_author_sid = (
+        str(caller_session_id or "").strip() or (sorted(author_sessions)[0] if author_sessions else "")
+    )
+    session_ctx: dict[str, Any] = {
+        "repo": repo,
+        "pr_number": int(pr_number),
+        "author_family": eff_author_fam,
+        "reviewer_family": primary_reviewer_fam,
+        "author_session_id": pre_author_sid,
+        "reviewer_session_id": "",
+        "spawned_claude_sessions": set(),
+        "spawned_agy_sessions": set(),
+        "worktrees": [reviewer_wt, author_wt],
+        "processes": [],
+        "registry_path": registry_path,
+        "registry_key": registry_key,
+        "close_hook": close_hook,
+        "closed": False,
+    }
+
+    def _sync_active_registry() -> None:
+        reg = _load_json_state(registry_path)
+        active = reg.get("active") if isinstance(reg.get("active"), dict) else {}
+        active[registry_key] = {
+            "pr_number": int(pr_number),
+            "author_family": session_ctx["author_family"],
+            "reviewer_family": session_ctx["reviewer_family"],
+            "author_session_id": session_ctx["author_session_id"],
+            "reviewer_session_id": session_ctx["reviewer_session_id"],
+            "updated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        reg["active"] = active
+        _save_json_state(registry_path, reg)
+
+    _sync_active_registry()
+
+    active_reviewer_fam = primary_reviewer_fam
+    active_reviewer_is_fb = False
+    reviewer_session_started = False
+    author_session_started = False
+    prev_reviewed_sha = ""
+    last_author_reply = ""
+    no_edit_rebuttal_used = False
+    rounds_run = 0
+
+    try:
+        for round_idx in range(1, eff_max_rounds + 1):
+            pr_data = active_bus.get_pr(pr_number)
+            if str(pr_data.get("state") or "").upper() != "OPEN":
+                return {
+                    "status": "closed_externally",
+                    "pr_number": int(pr_number),
+                    "rounds": rounds_run,
+                    "sessions_closed": bool(close_consensus_sessions(session_ctx).get("closed")),
+                }
+
+            head_sha = str(pr_data.get("headRefOid") or "").strip()
+            head_branch = str(pr_data.get("headRefName") or "").strip()
+            base_branch = str(pr_data.get("baseRefName") or "main").strip()
+
+            eval_now = paf_mod.evaluate_pr_consensus(
+                pr_data,
+                author_family_override=eff_author_fam,
+                max_rounds=eff_max_rounds,
+                hmac_secret=secret,
+                require_hmac=require_hmac,
+                allow_same_family_fallback=allow_fb,
+            )
+            if eval_now.get("status") == "approved":
+                break
+            if eval_now.get("status") == "paused_human_tiebreak":
+                close_rec = close_consensus_sessions(session_ctx)
+                return {
+                    "status": "paused_human_tiebreak",
+                    "reason": str(eval_now.get("reason") or ""),
+                    "pr_number": int(pr_number),
+                    "head_sha": head_sha,
+                    "rounds": rounds_run,
+                    "author_session_id": session_ctx["author_session_id"],
+                    "reviewer_session_id": session_ctx["reviewer_session_id"],
+                    "sessions_closed": bool(close_rec.get("closed")),
+                }
+
+            rounds_run = round_idx
+            if not _ensure_pr_worktree(repo, reviewer_wt, head_sha, head_branch):
+                raise RuntimeError(f"Failed preparing reviewer worktree for PR #{pr_number} at {head_sha}.")
+            diff_stat, diff_patch = _collect_diff_context(reviewer_wt, base_branch, head_sha)
+            if not diff_patch.strip():
+                raise RuntimeError(f"Empty diff against '{base_branch}' for PR #{pr_number} at {head_sha}.")
+
+            if reviewer_session_started:
+                delta_patch = _collect_delta_diff(reviewer_wt, prev_reviewed_sha, head_sha)
+                rev_prompt = build_followup_review_prompt(
+                    repo_slug=slug,
+                    pr_data=pr_data,
+                    prev_sha=prev_reviewed_sha,
+                    head_sha=head_sha,
+                    diff_stat=diff_stat,
+                    delta_patch=delta_patch,
+                    author_reply=last_author_reply,
+                    round_num=round_idx,
+                )
+            else:
+                rev_prompt = build_review_prompt(
+                    repo_slug=slug,
+                    pr_data=pr_data,
+                    diff_stat=diff_stat,
+                    diff_patch=diff_patch,
+                    round_num=round_idx,
+                )
+
+            def _invoke_reviewer(fam: str, resume_sid: str | None) -> dict[str, Any]:
+                with _shield_key_file(resolved_key):
+                    if fam == "gemini":
+                        res = run_agy_review(
+                            agy_bin=eff_agy_bin,
+                            worktree=reviewer_wt,
+                            prompt=rev_prompt,
+                            model=agy_model,
+                            resume_session_id=resume_sid,
+                            timeout_sec=review_timeout_sec,
+                        )
+                        if res.get("session_created") and res.get("session_id"):
+                            session_ctx["spawned_agy_sessions"].add(res["session_id"])
+                        return res
+                    init_sid = None if resume_sid else str(uuid.uuid4())
+                    if init_sid:
+                        session_ctx["spawned_claude_sessions"].add(init_sid)
+                    res = run_claude_review(
+                        claude_bin=eff_claude_bin,
+                        worktree=reviewer_wt,
+                        prompt=rev_prompt,
+                        model=claude_model,
+                        key_file=resolved_key,
+                        init_session_id=init_sid,
+                        resume_session_id=resume_sid,
+                        timeout_sec=review_timeout_sec,
+                    )
+                    if res.get("session_created") and res.get("session_id"):
+                        session_ctx["spawned_claude_sessions"].add(res["session_id"])
+                    return res
+
+            try:
+                rev_res = _invoke_reviewer(
+                    active_reviewer_fam,
+                    session_ctx["reviewer_session_id"] if reviewer_session_started else None,
+                )
+            except Exception as exc:
+                known_author_sids = set(author_sessions)
+                if session_ctx["author_session_id"]:
+                    known_author_sids.add(session_ctx["author_session_id"])
+                if (
+                    not active_reviewer_is_fb
+                    and allow_fb
+                    and known_author_sids
+                    and is_quota_or_outage_error(exc)
+                ):
+                    sys.stderr.write(
+                        f"[paf consensus] WARNING on {slug}#{pr_number}: heterogeneous reviewer "
+                        f"'{active_reviewer_fam}' hit API quota/outage ({exc}); switching to persistent "
+                        f"fresh '{eff_author_fam}' fallback reviewer session.\n"
+                    )
+                    active_reviewer_fam = eff_author_fam
+                    active_reviewer_is_fb = True
+                    session_ctx["reviewer_family"] = active_reviewer_fam
+                    reviewer_session_started = False
+                    session_ctx["reviewer_session_id"] = ""
+                    rev_res = _invoke_reviewer(active_reviewer_fam, None)
+                    if not rev_res.get("session_id") or rev_res["session_id"] in known_author_sids:
+                        raise RuntimeError(
+                            "Same-family outage fallback reviewer returned missing or colliding session_id."
+                        ) from exc
+                else:
+                    raise
+
+            if not reviewer_session_started:
+                session_ctx["reviewer_session_id"] = str(rev_res.get("session_id") or "").strip()
+                reviewer_session_started = bool(session_ctx["reviewer_session_id"])
+                _sync_active_registry()
+
+            if contains_secret_material(rev_res["prose"], secret):
+                raise RuntimeError(
+                    f"SECURITY BLOCK on {slug}#{pr_number}: reviewer prose contained secret/credential material."
+                )
+
+            latest_pr = active_bus.get_pr(pr_number)
+            if not sha_matches(str(latest_pr.get("headRefOid") or ""), head_sha):
+                raise RuntimeError(
+                    f"PR #{pr_number} headRefOid moved concurrently during review ({head_sha[:12]} -> {str(latest_pr.get('headRefOid'))[:12]})."
+                )
+
+            rev_marker: dict[str, Any] = {
+                "v": 1,
+                "role": "reviewer",
+                "model_family": active_reviewer_fam,
+                "verdict": rev_res["verdict"],
+                "head_sha": head_sha.lower(),
+                "round": round_idx,
+                "blocking_count": rev_res["blocking_count"],
+                "needs_human_decision": rev_res["needs_human_decision"],
+                "session_id": session_ctx["reviewer_session_id"],
+                "host": resolved_host,
+                "base_branch": base_branch,
+                "pr_number": int(pr_number),
+            }
+            if active_reviewer_is_fb:
+                rev_marker["fallback_same_family"] = True
+            sign_marker_in_place(rev_marker, secret, key_file=resolved_key, require_hmac=require_hmac)
+            fb_banner = (
+                "> **[Outage Fallback Review]**: Primary heterogeneous reviewer encountered an API quota/outage error; "
+                "reviewed by an independent fresh blank session.\n\n"
+                if active_reviewer_is_fb
+                else ""
+            )
+            rev_comment = (
+                fb_banner
+                + rev_res["prose"].strip()
+                + "\n\n"
+                + f"<!-- paf-consensus: {json.dumps(rev_marker, separators=(',', ':'))} -->"
+            )
+            active_bus.post_comment(pr_number, rev_comment)
+            prev_reviewed_sha = head_sha
+
+            if (
+                rev_res["verdict"] == "approve"
+                and rev_res["blocking_count"] == 0
+                and not rev_res["needs_human_decision"]
+            ):
+                break
+
+            if rev_res["needs_human_decision"] or round_idx >= eff_max_rounds:
+                close_rec = close_consensus_sessions(session_ctx)
+                reason = (
+                    "Reviewer flagged needs_human_decision=true."
+                    if rev_res["needs_human_decision"]
+                    else f"Reached max_rounds ({eff_max_rounds}) without approve consensus."
+                )
+                return {
+                    "status": "paused_human_tiebreak",
+                    "reason": reason,
+                    "pr_number": int(pr_number),
+                    "head_sha": head_sha,
+                    "rounds": rounds_run,
+                    "author_session_id": session_ctx["author_session_id"],
+                    "reviewer_session_id": session_ctx["reviewer_session_id"],
+                    "sessions_closed": bool(close_rec.get("closed")),
+                }
+
+            # Author Fix Turn (same persistent author_session_id across all fix rounds)
+            if not _ensure_pr_worktree(repo, author_wt, head_sha, head_branch):
+                raise RuntimeError(f"Failed preparing author worktree for PR #{pr_number} at {head_sha}.")
+
+            fix_prompt = build_author_fix_prompt(
+                repo_slug=slug,
+                pr_data=pr_data,
+                diff_stat=diff_stat,
+                reviewer_prose=rev_res["prose"],
+                round_num=round_idx,
+                is_resume=author_session_started,
+            )
+
+            def _invoke_author(prompt_text: str) -> dict[str, Any]:
+                nonlocal author_session_started
+                with _shield_key_file(resolved_key):
+                    if eff_author_fam == "gemini":
+                        res = run_agy_author_turn(
+                            agy_bin=eff_agy_bin,
+                            worktree=author_wt,
+                            prompt=prompt_text,
+                            model=agy_model,
+                            resume_session_id=(session_ctx["author_session_id"] if author_session_started else None),
+                            timeout_sec=review_timeout_sec,
+                        )
+                        if res.get("session_created") and res.get("session_id"):
+                            session_ctx["spawned_agy_sessions"].add(res["session_id"])
+                        if not author_session_started and res.get("session_id"):
+                            session_ctx["author_session_id"] = res["session_id"]
+                            author_session_started = True
+                            _sync_active_registry()
+                        return res
+                    init_sid = None if author_session_started else str(uuid.uuid4())
+                    if init_sid:
+                        session_ctx["author_session_id"] = init_sid
+                        session_ctx["spawned_claude_sessions"].add(init_sid)
+                    res = run_claude_author_turn(
+                        claude_bin=eff_claude_bin,
+                        worktree=author_wt,
+                        prompt=prompt_text,
+                        model=claude_model,
+                        key_file=resolved_key,
+                        init_session_id=init_sid,
+                        resume_session_id=(session_ctx["author_session_id"] if author_session_started else None),
+                        timeout_sec=review_timeout_sec,
+                    )
+                    if res.get("session_created") and res.get("session_id"):
+                        session_ctx["spawned_claude_sessions"].add(res["session_id"])
+                    if not author_session_started:
+                        if res.get("session_id"):
+                            session_ctx["author_session_id"] = res["session_id"]
+                        author_session_started = True
+                        _sync_active_registry()
+                    return res
+
+            auth_res = _invoke_author(fix_prompt)
+            if auth_res["needs_human_decision"]:
+                close_rec = close_consensus_sessions(session_ctx)
+                return {
+                    "status": "paused_human_tiebreak",
+                    "reason": "Author session flagged needs_human_decision=true.",
+                    "pr_number": int(pr_number),
+                    "head_sha": head_sha,
+                    "rounds": rounds_run,
+                    "author_session_id": session_ctx["author_session_id"],
+                    "reviewer_session_id": session_ctx["reviewer_session_id"],
+                    "sessions_closed": bool(close_rec.get("closed")),
+                }
+
+            dirty_paths = _list_dirty_paths(author_wt)
+            new_sha = head_sha
+            if dirty_paths:
+                verify_ok, verify_rep, _, _ = paf_mod.execute_verify(author_wt, mode="pre-push")
+                if not verify_ok:
+                    fail_tail = "\n\n".join(
+                        f"[{s['stage']}] {s['command']}:\n{s['output_tail']}"
+                        for s in (verify_rep.get("steps") or [])
+                        if not s.get("passed")
+                    )
+                    retry_prompt = build_author_fix_prompt(
+                        repo_slug=slug,
+                        pr_data=pr_data,
+                        diff_stat=diff_stat,
+                        reviewer_prose=rev_res["prose"],
+                        round_num=round_idx,
+                        is_resume=True,
+                        verify_failure=fail_tail,
+                    )
+                    auth_res = _invoke_author(retry_prompt)
+                    dirty_paths = _list_dirty_paths(author_wt)
+                    verify_ok, verify_rep, _, _ = paf_mod.execute_verify(author_wt, mode="pre-push")
+                    if not verify_ok:
+                        raise RuntimeError(
+                            f"Author fix failed pre-push verification on PR #{pr_number} after retry."
+                        )
+                if contains_secret_material(auth_res["commit_message"], secret) or contains_secret_material(
+                    auth_res["reply_prose"], secret
+                ):
+                    raise RuntimeError(
+                        f"SECURITY BLOCK on {slug}#{pr_number}: author output contained secret/credential material."
+                    )
+                if dirty_paths:
+                    new_sha = _commit_dirty_paths(author_wt, dirty_paths, auth_res["commit_message"])
+                    active_bus.push_head(pr_number, new_sha, head_branch, author_wt)
+            else:
+                if no_edit_rebuttal_used:
+                    close_rec = close_consensus_sessions(session_ctx)
+                    return {
+                        "status": "paused_human_tiebreak",
+                        "reason": "Reviewer and Author deadlocked without further code changes.",
+                        "pr_number": int(pr_number),
+                        "head_sha": head_sha,
+                        "rounds": rounds_run,
+                        "author_session_id": session_ctx["author_session_id"],
+                        "reviewer_session_id": session_ctx["reviewer_session_id"],
+                        "sessions_closed": bool(close_rec.get("closed")),
+                    }
+                if contains_secret_material(auth_res["reply_prose"], secret):
+                    raise RuntimeError(
+                        f"SECURITY BLOCK on {slug}#{pr_number}: author reply contained secret/credential material."
+                    )
+                no_edit_rebuttal_used = True
+
+            author_marker: dict[str, Any] = {
+                "v": 1,
+                "role": "author",
+                "model_family": eff_author_fam,
+                "verdict": "open",
+                "head_sha": new_sha.lower(),
+                "round": round_idx + 1,
+                "blocking_count": 0,
+                "needs_human_decision": False,
+                "session_id": session_ctx["author_session_id"],
+                "host": resolved_host,
+                "base_branch": base_branch,
+                "pr_number": int(pr_number),
+            }
+            sign_marker_in_place(author_marker, secret, key_file=resolved_key, require_hmac=require_hmac)
+            author_sessions.add(session_ctx["author_session_id"])
+            author_comment = (
+                auth_res["reply_prose"].strip()
+                + "\n\n"
+                + f"<!-- paf-consensus: {json.dumps(author_marker, separators=(',', ':'))} -->"
+            )
+            active_bus.post_comment(pr_number, author_comment)
+            last_author_reply = auth_res["reply_prose"]
+
+        # Step 3 -> Step 4 -> Step 5: Merge on consensus, close both sessions right after merge,
+        # then run post-merge check and (if deploy configured) deploy + post-deploy check.
+        merged_ok, merge_reason = active_bus.merge_pr(
+            pr_number,
+            require_hmac=require_hmac,
+            allow_same_family_fallback=allow_fb,
+            key_file=resolved_key,
+            approved_main=approved_main,
+            max_wait_ci=max_wait_ci,
+            no_auto_revert=no_auto_revert,
+            host_id=resolved_host,
+            on_merged_callback=lambda: close_consensus_sessions(session_ctx),
+        )
+        close_rec = close_consensus_sessions(session_ctx)
+        final_pr = active_bus.get_pr(pr_number)
+        final_sha = str(final_pr.get("headRefOid") or "")
+        if merged_ok:
+            return {
+                "status": "merged",
+                "pr_number": int(pr_number),
+                "head_sha": final_sha,
+                "rounds": rounds_run,
+                "author_session_id": session_ctx["author_session_id"],
+                "reviewer_session_id": session_ctx["reviewer_session_id"],
+                "sessions_closed": bool(close_rec.get("closed")),
+            }
+        if merge_reason == "paused":
+            return {
+                "status": "paused_main_approval",
+                "reason": merge_reason,
+                "pr_number": int(pr_number),
+                "head_sha": final_sha,
+                "rounds": rounds_run,
+                "author_session_id": session_ctx["author_session_id"],
+                "reviewer_session_id": session_ctx["reviewer_session_id"],
+                "sessions_closed": bool(close_rec.get("closed")),
+            }
+        raise RuntimeError(f"Consensus approved on PR #{pr_number} ({final_sha[:12]}), but merge failed: {merge_reason}")
+    finally:
+        close_consensus_sessions(session_ctx)
 
 
 def watch_repo_once(
