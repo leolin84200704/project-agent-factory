@@ -174,7 +174,14 @@ def main() -> int:
     ).stdout.strip()
     pr_fixture = repo / ".git" / "pr-fixture.json"
 
-    def write_pr_fixture(head_oid: str, body: str, comments: list[dict[str, str]], base: str = "main") -> None:
+    def write_pr_fixture(
+        head_oid: str,
+        body: str,
+        comments: list[dict[str, str]],
+        base: str = "main",
+        files: list[str] | None = None,
+        review_decision: str = "",
+    ) -> None:
         pr_fixture.write_text(
             json.dumps(
                 {
@@ -186,6 +193,8 @@ def main() -> int:
                     "headRefOid": head_oid,
                     "body": body,
                     "comments": comments,
+                    "files": [{"path": p} for p in (files if files is not None else ["app.py"])],
+                    "reviewDecision": review_decision,
                 }
             ),
             encoding="utf-8",
@@ -478,6 +487,106 @@ def main() -> int:
         failures += 1
     else:
         print("PASS needs_human_decision, malformed marker tolerance, active-SHA round scoping, and --max-rounds 0")
+
+    # 17. C1: Guarded non-staging base (`master`, `release/1.0`) pauses for approval, and missing `zone` key fails closed
+    write_pr_fixture(mul_sha, gemini_author_mul, [{"body": claude_approve_mul}], base="master")
+    res_c1_master = run_paf(
+        ["merge-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+    res_c1_ship_master = run_paf(
+        ["ship", "--repo", str(repo), "--base", "master", "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+    no_zone_repo = pathlib.Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-b", "main"], cwd=no_zone_repo, check=True, capture_output=True)
+    (no_zone_repo / ".agent-verify.json").write_text(
+        json.dumps({"default_branch": "main", "commands": {"unit_test": ["true"]}}),
+        encoding="utf-8",
+    )
+    res_c1_no_zone = run_paf(["verify", "--repo", str(no_zone_repo)], cwd=no_zone_repo)
+    if (
+        res_c1_master.returncode != 0
+        or "PAUSED_FOR_MAIN_APPROVAL" not in res_c1_master.stdout
+        or res_c1_ship_master.returncode != 0
+        or "PAUSED_FOR_MAIN_APPROVAL" not in res_c1_ship_master.stdout
+        or res_c1_no_zone.returncode == 0
+    ):
+        print(
+            f"FAIL C1 guarded allowlist & missing-zone check: master={res_c1_master.stdout.strip()} "
+            f"ship_master={res_c1_ship_master.stdout.strip()} no_zone_rc={res_c1_no_zone.returncode}"
+        )
+        failures += 1
+    else:
+        print("PASS C1 guarded repo pauses on every non-staging base branch and fails closed on missing zone")
+
+    # 18. C3 & C4: Autonomous repo pauses once on governance/permission file edits (`CORE.md`, `.agent-verify.json`, etc.)
+    #     until `--approved-governance`, and blocks when GitHub `reviewDecision` requires human review
+    auto_repo = pathlib.Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-b", "main"], cwd=auto_repo, check=True, capture_output=True)
+    (auto_repo / ".agent-verify.json").write_text(
+        json.dumps({"zone": "autonomous", "default_branch": "main", "commands": {"unit_test": ["true"]}}),
+        encoding="utf-8",
+    )
+    auto_pr_fix = auto_repo / ".git" / "pr-auto.json"
+    auto_pr_fix.write_text(
+        json.dumps(
+            {
+                "number": 115,
+                "url": "https://example.test/pr/115",
+                "state": "OPEN",
+                "headRefName": "feature/rules",
+                "baseRefName": "main",
+                "headRefOid": mul_sha,
+                "body": gemini_author_mul,
+                "comments": [{"body": claude_approve_mul}],
+                "files": [{"path": "CORE.md"}, {"path": "bin/paf"}],
+                "reviewDecision": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    res_c3_pause = run_paf(
+        ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
+        cwd=auto_repo,
+    )
+    res_c3_approved = run_paf(
+        [
+            "merge-consensus",
+            "--repo",
+            str(auto_repo),
+            "--pr-fixture",
+            str(auto_pr_fix),
+            "--approved-governance",
+            "--dry-run",
+        ],
+        cwd=auto_repo,
+    )
+    write_pr_fixture(
+        mul_sha,
+        gemini_author_mul,
+        [{"body": claude_approve_mul}],
+        base="stage_test",
+        review_decision="REVIEW_REQUIRED",
+    )
+    res_c4_human_req = run_paf(
+        ["merge-consensus", "--repo", str(repo), "--pr-fixture", str(pr_fixture), "--dry-run"],
+        cwd=repo,
+    )
+    if (
+        res_c3_pause.returncode != 0
+        or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in res_c3_pause.stdout
+        or res_c3_approved.returncode != 0
+        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_approved.stdout
+        or res_c4_human_req.returncode == 0
+    ):
+        print(
+            f"FAIL C3/C4 governance & human-review gates: c3_pause={res_c3_pause.stdout.strip()} "
+            f"c3_approved={res_c3_approved.stdout.strip()} c4_rc={res_c4_human_req.returncode}"
+        )
+        failures += 1
+    else:
+        print("PASS C3/C4 pause governance-file PRs for Leo and honor required human GitHub reviews")
 
     return 1 if failures else 0
 

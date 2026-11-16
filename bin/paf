@@ -118,7 +118,50 @@ def _load_verify_config(repo: Path) -> dict[str, Any]:
         raise FileNotFoundError(
             f"Missing {cfg_path}. Every High-Trust repo requires a `.agent-verify.json` contract."
         )
-    return json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    zone = cfg.get("zone")
+    if zone not in ("autonomous", "guarded"):
+        raise ValueError(
+            f"Invalid or missing 'zone' in {cfg_path}: expected 'autonomous' or 'guarded', got {zone!r}."
+        )
+    return cfg
+
+
+def _resolve_staging_branches(cfg: dict[str, Any]) -> set[str]:
+    raw_list = cfg.get("staging_branches")
+    if isinstance(raw_list, list):
+        return {str(b).strip() for b in raw_list if str(b).strip()}
+    single = str(cfg.get("staging_branch") or "").strip()
+    if single:
+        return {single}
+    return {"staging", "stage_test"}
+
+
+GOVERNANCE_FILE_RE = re.compile(
+    r"(^|/)(CORE\.md|AGENTS\.md|CLAUDE\.md|PERMISSIONS\.md|FEEDBACK\.md|\.agent-verify\.json|"
+    r"run-regression\.py|dune_lint\.py)$|"
+    r"^bin/paf$|"
+    r"(^|/)(\.github/workflows/[^/]+\.ya?ml|eval-tasks/[^/]+\.md|hooks/[^/]+\.sh|"
+    r"githooks/(pre-commit|pre-push|install\.sh|lib/[^/]+\.sh)|"
+    r"scripts/dream\.md|DailyJob/|launchd/|\.claude/skills/|skills/ship/)"
+)
+
+
+def _governance_files_touched(repo: Path, pr_data: dict[str, Any] | None, base_branch: str) -> list[str]:
+    paths: list[str] = []
+    if pr_data is not None and isinstance(pr_data.get("files"), list):
+        for item in pr_data["files"]:
+            if isinstance(item, dict) and item.get("path"):
+                paths.append(str(item["path"]))
+            elif isinstance(item, str) and item:
+                paths.append(item)
+    if not paths and (repo / ".git").exists():
+        for ref in (base_branch, f"origin/{base_branch}"):
+            diff_res = _git(repo, "diff", "--name-only", f"{ref}...HEAD", check=False)
+            if diff_res.returncode == 0 and diff_res.stdout.strip():
+                paths.extend(line.strip() for line in diff_res.stdout.splitlines() if line.strip())
+                break
+    return sorted({p for p in paths if GOVERNANCE_FILE_RE.search(p.lstrip("./"))})
 
 
 def _run_shell_step(repo: Path, stage: str, command: str, timeout_sec: int = 900) -> dict[str, Any]:
@@ -191,7 +234,7 @@ def execute_verify(
 ) -> tuple[bool, dict[str, Any], Path, Path]:
     repo = repo.expanduser().resolve()
     cfg = _load_verify_config(repo)
-    zone = str(cfg.get("zone", "autonomous"))
+    zone = str(cfg["zone"])
     commands_cfg: dict[str, list[str]] = cfg.get("commands") or {}
     dune_cfg = cfg.get("dune_lint") or {}
     dune_enabled = bool(dune_cfg.get("enabled", True))
@@ -822,7 +865,7 @@ def _load_pr_data(repo: Path, pr_ref: str | None, pr_fixture: Path | None = None
             "view",
             str(target),
             "--json",
-            "number,url,state,headRefName,baseRefName,headRefOid,body,comments",
+            "number,url,state,headRefName,baseRefName,headRefOid,body,comments,files,reviewDecision",
         ],
         cwd=repo,
         text=True,
@@ -949,7 +992,11 @@ def _merge_and_verify_pr(
 
 def cmd_check_consensus(args: argparse.Namespace) -> int:
     repo = args.repo.expanduser().resolve()
-    cfg = _load_verify_config(repo)
+    try:
+        cfg = _load_verify_config(repo)
+    except Exception as exc:
+        print(f"paf check-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
     consensus_cfg = cfg.get("consensus") or {}
     max_rounds = _resolve_max_rounds(args.max_rounds, consensus_cfg)
     try:
@@ -982,9 +1029,14 @@ def cmd_check_consensus(args: argparse.Namespace) -> int:
 
 def cmd_merge_consensus(args: argparse.Namespace) -> int:
     repo = args.repo.expanduser().resolve()
-    cfg = _load_verify_config(repo)
-    zone = str(cfg.get("zone", "autonomous"))
+    try:
+        cfg = _load_verify_config(repo)
+    except Exception as exc:
+        print(f"paf merge-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
+    zone = str(cfg["zone"])
     default_branch = str(cfg.get("default_branch", "main"))
+    staging_branches = _resolve_staging_branches(cfg)
     consensus_cfg = cfg.get("consensus") or {}
     max_rounds = _resolve_max_rounds(args.max_rounds, consensus_cfg)
 
@@ -997,6 +1049,15 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
     if str(pr_data.get("state") or "").upper() != "OPEN":
         print(f"paf merge-consensus REFUSED: PR #{pr_data.get('number')} state is {pr_data.get('state')}.", file=sys.stderr)
         return 1
+
+    review_decision = str(pr_data.get("reviewDecision") or "").strip().upper()
+    if review_decision in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+        print(
+            f"paf merge-consensus BLOCKED (human_review_required): GitHub reviewDecision is '{review_decision}' — "
+            "model consensus does not replace required human colleague review.",
+            file=sys.stderr,
+        )
+        return 2
 
     verdict = evaluate_pr_consensus(
         pr_data,
@@ -1015,13 +1076,25 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
     branch = str(pr_data.get("headRefName") or "")
     pr_number = int(pr_data["number"])
     pr_url = str(pr_data.get("url") or f"PR#{pr_number}")
-    is_guarded_main = zone == "guarded" and base_branch == default_branch
+    requires_human_merge_approval = zone == "guarded" and base_branch not in staging_branches
+    gov_files = _governance_files_touched(repo, pr_data, base_branch)
 
-    if is_guarded_main and not args.approved_main:
-        print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (head={head_sha})")
+    if requires_human_merge_approval and not args.approved_main:
+        print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (base={base_branch} head={head_sha})")
         print(
-            f"Dual-model consensus is complete. Once Leo replies 'approve', resume autonomous merge+verify+revert via:\n"
+            f"Dual-model consensus is complete. Once Leo replies 'approve' (and any stricter workspace rule is met), resume via:\n"
             f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-main"
+        )
+        return 0
+
+    if gov_files and not (args.approved_governance or args.approved_main):
+        print(
+            f"PAUSED_FOR_GOVERNANCE_APPROVAL: {pr_url} (head={head_sha}) modifies governance/permission files: "
+            f"{', '.join(gov_files)}"
+        )
+        print(
+            f"Once Leo confirms this rule/permission change, resume via:\n"
+            f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-governance"
         )
         return 0
 
@@ -1119,6 +1192,7 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
             author_family=args.author_family,
             max_rounds=args.max_rounds,
             approved_main=args.approved_main,
+            approved_governance=args.approved_governance,
             max_wait_ci=args.max_wait_ci,
             no_auto_revert=args.no_auto_revert,
             dry_run=False,
@@ -1129,9 +1203,14 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
 
 def cmd_ship(args: argparse.Namespace) -> int:
     repo = args.repo.expanduser().resolve()
-    cfg = _load_verify_config(repo)
-    zone = str(cfg.get("zone", "autonomous"))
+    try:
+        cfg = _load_verify_config(repo)
+    except Exception as exc:
+        print(f"paf ship ERROR: {exc}", file=sys.stderr)
+        return 1
+    zone = str(cfg["zone"])
     default_branch = str(cfg.get("default_branch", "main"))
+    staging_branches = _resolve_staging_branches(cfg)
     base_branch = str(args.base or default_branch)
     require_blind = bool(cfg.get("require_blind_review", True))
     consensus_cfg = cfg.get("consensus") or {}
@@ -1176,7 +1255,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
         else None
     )
 
-    is_guarded_main = zone == "guarded" and base_branch == default_branch
+    requires_human_merge_approval = zone == "guarded" and base_branch not in staging_branches
     author_fam = _normalize_family(args.author_family)
 
     parsed_pr: dict[str, Any] | None = None
@@ -1184,7 +1263,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
         parsed_pr = json.loads(args.pr_fixture.expanduser().resolve().read_text(encoding="utf-8"))
     else:
         existing_pr = subprocess.run(
-            ["gh", "pr", "view", branch, "--json", "number,url,state,headRefOid,body,comments"],
+            ["gh", "pr", "view", branch, "--json", "number,url,state,headRefOid,body,comments,files,reviewDecision"],
             cwd=repo,
             text=True,
             capture_output=True,
@@ -1232,6 +1311,16 @@ def cmd_ship(args: argparse.Namespace) -> int:
             print(f"DRY_RUN_OPEN_FOR_CONSENSUS_READY: zone={zone} base={base_branch} author={author_fam} sha={head_sha}")
             return 0
 
+    if open_pr_info is not None:
+        rev_dec = str(open_pr_info.get("reviewDecision") or "").strip().upper()
+        if rev_dec in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+            print(
+                f"paf ship BLOCKED (human_review_required): GitHub reviewDecision is '{rev_dec}' — "
+                "model consensus does not replace required human colleague review.",
+                file=sys.stderr,
+            )
+            return 2
+
     # Require Blind Adversarial Review OR heterogeneous PR consensus BEFORE merging (unless --open-for-consensus)
     local_review_ok = bool(review and review.get("verdict") == "approve" and review.get("head_sha") == head_sha)
     if require_blind and not args.open_for_consensus and not (local_review_ok or pr_consensus_ok):
@@ -1243,10 +1332,17 @@ def cmd_ship(args: argparse.Namespace) -> int:
         )
         return 2
 
+    gov_files = _governance_files_touched(repo, open_pr_info, base_branch)
+
     if args.dry_run:
-        if is_guarded_main and not args.approved_main:
+        if requires_human_merge_approval and not args.approved_main:
             print(
                 f"PAUSED_FOR_MAIN_APPROVAL (dry-run): zone=guarded base={base_branch} sha={head_sha}"
+            )
+            return 0
+        if gov_files and not (args.approved_governance or args.approved_main):
+            print(
+                f"PAUSED_FOR_GOVERNANCE_APPROVAL (dry-run): sha={head_sha} files={','.join(gov_files)}"
             )
             return 0
         print(
@@ -1336,12 +1432,23 @@ def cmd_ship(args: argparse.Namespace) -> int:
         print(f"OPENED_FOR_CONSENSUS: {pr_url} (pr=#{pr_number} head={head_sha} author={author_fam})")
         return 0
 
-    # Step 4: Guarded zone targeting main pauses for single human `approve`
-    if is_guarded_main and not args.approved_main:
-        print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (head={head_sha[:12]})")
+    # Step 4: Guarded non-staging branches or governance-file edits pause for Leo's single `approve`
+    if requires_human_merge_approval and not args.approved_main:
+        print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (base={base_branch} head={head_sha})")
         print(
-            f"Once Leo replies 'approve', resume autonomous merge+verify+debug loop via:\n"
+            f"Once Leo replies 'approve' (and any stricter workspace rule is met), resume via:\n"
             f"  paf ship --repo {repo} --base {base_branch} --approved-main"
+        )
+        return 0
+
+    if gov_files and not (args.approved_governance or args.approved_main):
+        print(
+            f"PAUSED_FOR_GOVERNANCE_APPROVAL: {pr_url} (head={head_sha}) modifies governance/permission files: "
+            f"{', '.join(gov_files)}"
+        )
+        print(
+            f"Once Leo confirms this rule/permission change, resume via:\n"
+            f"  paf ship --repo {repo} --base {base_branch} --approved-governance"
         )
         return 0
 
@@ -1560,6 +1667,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_pst_c.add_argument("--author-family", default=None)
     s_pst_c.add_argument("--max-rounds", type=int, default=None)
     s_pst_c.add_argument("--approved-main", action="store_true")
+    s_pst_c.add_argument("--approved-governance", action="store_true")
     s_pst_c.add_argument("--max-wait-ci", type=int, default=600)
     s_pst_c.add_argument("--no-auto-revert", action="store_true")
     s_pst_c.set_defaults(func=cmd_post_consensus)
@@ -1571,6 +1679,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_mrg_c.add_argument("--author-family", default=None)
     s_mrg_c.add_argument("--max-rounds", type=int, default=None)
     s_mrg_c.add_argument("--approved-main", action="store_true")
+    s_mrg_c.add_argument("--approved-governance", action="store_true")
     s_mrg_c.add_argument("--max-wait-ci", type=int, default=600)
     s_mrg_c.add_argument("--no-auto-revert", action="store_true")
     s_mrg_c.add_argument("--dry-run", action="store_true")
@@ -1585,6 +1694,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_ship.add_argument("--open-for-consensus", action="store_true")
     s_ship.add_argument("--author-family", default=None)
     s_ship.add_argument("--approved-main", action="store_true")
+    s_ship.add_argument("--approved-governance", action="store_true")
     s_ship.add_argument("--allow-update-pr", action="store_true")
     s_ship.add_argument("--max-wait-ci", type=int, default=600)
     s_ship.add_argument("--no-auto-revert", action="store_true")

@@ -10,16 +10,20 @@ Use this skill after committing changes on a feature branch (never on `main`/`ma
 ## Standing General Rule: Auto-Merge Upon Dual-Model Consensus
 
 1. Every PR goes through **heterogeneous dual-model review** (`claude` <-> `gemini`) directly via SHA-pinned GitHub PR comments (`<!-- paf-consensus: {...} -->`).
-2. **Once heterogeneous consensus (`verdict: "approve"` on the latest `headRefOid`) and GitHub Actions CI pass, merge immediately yourself — NEVER ask Leo to press merge** in `zone: "autonomous"` repos or on `zone: "guarded"` staging-class branches (`staging`, `stage_test`). If a sibling PR landed on `main` first and `paf merge-consensus` fails closed on a merge conflict, the calling agent rebuilds the branch onto `origin/main`, re-verifies tests + CI, and merges.
-3. Escalate to Leo ONLY when:
+2. **Once heterogeneous consensus (`verdict: "approve"` on the latest `headRefOid`) and GitHub Actions CI pass, merge immediately yourself — NEVER ask Leo to press merge** for normal code PRs in `zone: "autonomous"` repos or on `zone: "guarded"` branches explicitly allowlisted in `staging_branches` (`staging`, `stage_test`).
+   - If a sibling PR landed on `main` first and `paf merge-consensus` fails closed on a base conflict, rebuild the branch onto `origin/main` and re-verify tests + CI; because the rebuilt branch has a new `headRefOid`, obtain a fresh SHA-pinned `approve` on the new SHA (e.g. via `git range-diff`) before merging.
+3. Escalate / pause for Leo ONLY when:
    - Consensus exceeds `max_rounds` (default `3`) without approval (`PAUSED_FOR_CONSENSUS_TIEBREAK`),
-   - A product/UX preference trade-off requires his call (`--needs-human-decision`), or
-   - `zone: "guarded"` targets company `main` (`PAUSED_FOR_MAIN_APPROVAL` — single `approve`, after which `--approved-main` completes the merge, verification, and self-heal/revert loop autonomously).
+   - A product/UX preference trade-off requires his call (`--needs-human-decision`),
+   - A PR modifies governance or permission-granting files (`CORE.md`, `AGENTS.md`, `CLAUDE.md`, `PERMISSIONS.md`, `FEEDBACK.md`, `.agent-verify.json`, `bin/paf`, hooks, workflows, `launchd/`, `DailyJob/`, skills) -> pauses at `PAUSED_FOR_GOVERNANCE_APPROVAL` until `--approved-governance`, or
+   - `zone: "guarded"` targets any branch outside `staging_branches` (`main`, `master`, `release/*`) -> pauses at `PAUSED_FOR_MAIN_APPROVAL` until `--approved-main` (and always yields to required human colleague reviews and any stricter workspace `CLAUDE.md` rule).
 
 ## Trust Boundaries & Marker Semantics
 
-- **Write-time & read-time SHA pinning**: `--head-sha <sha>` is mandatory when `--role reviewer`. `paf post-consensus` refuses to post if the PR's `headRefOid` moved while the reviewer was reading, and `evaluate_pr_consensus` ignores markers pinned to stale SHAs or missing a recognized `author` / `reviewer` `model_family` (`claude`, `gemini`, `openai`).
-- **Single-account operator model**: Because both machines authenticate to GitHub under Leo's single owner account, `model_family` is self-declared in the `<!-- paf-consensus: ... -->` marker rather than bound to distinct GitHub usernames.
+- **Write-time & read-time SHA pinning**: `--head-sha <sha>` is mandatory when `--role reviewer`. `paf post-consensus` refuses to post if the PR's `headRefOid` moved while the reviewer was reading, and `evaluate_pr_consensus` ignores markers pinned to stale SHAs or missing a recognized `author` / `reviewer` `model_family` (`claude`, `gemini`, `openai`). `.agent-verify.json` must explicitly declare `"zone": "autonomous" | "guarded"` (missing `zone` fails closed).
+- **Single-account operator model**: Because both machines authenticate to GitHub under Leo's single owner account, `model_family` is self-declared in the `<!-- paf-consensus: ... -->` marker rather than bound to distinct GitHub usernames. An agent must NEVER post a marker claiming a `model_family` other than its own.
+- **Human colleague reviews & workspace rules**: Cross-model consensus never stands in for required human colleague reviews (`reviewDecision: REVIEW_REQUIRED` or `CHANGES_REQUESTED` blocks `paf`), and stricter workspace `CLAUDE.md` rules always win.
+- **Portable `post_merge_check` vs host-bound actions**: `post_merge_check` runs on whichever machine executes the merge and must contain only portable checks. Host-bound steps (daemon reloads like `launchd/install.sh`, VPN-only deploys/probes) stay out of `post_merge_check` and run on the hosting machine after `git pull`.
 - **Marker source**: `paf` reads `<!-- paf-consensus: ... -->` markers from the PR body and issue comments (`gh pr view --json body,comments`). Clicking GitHub's native Pull Request Review "Approve" button does not satisfy `paf` consensus.
 
 ## Commands
@@ -42,6 +46,7 @@ Use this skill after committing changes on a feature branch (never on `main`/`ma
 3. **Check or Resume Merge on an Already-Approved Consensus PR**:
    ```bash
    paf check-consensus --repo . --pr <num>
-   paf merge-consensus --repo . --pr <num>                  # autonomous or guarded staging
-   paf merge-consensus --repo . --pr <num> --approved-main  # guarded main after Leo's approve
+   paf merge-consensus --repo . --pr <num>                        # autonomous or guarded staging
+   paf merge-consensus --repo . --pr <num> --approved-governance  # governance/rule PR after Leo's ok
+   paf merge-consensus --repo . --pr <num> --approved-main        # guarded non-staging after Leo's approve
    ```
