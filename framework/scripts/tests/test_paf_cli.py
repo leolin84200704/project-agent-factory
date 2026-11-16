@@ -889,6 +889,119 @@ def main() -> int:
     else:
         print("PASS truncated or missing PR file list trusts local git diff only when local HEAD is the PR head")
 
+    # 23. Governance gate on the `paf ship` path (Leo, 2026-11-16): consensus alone merges a governance PR; a
+    #     single-model blind receipt, an author-only marker, or a PR that strips `governance_requires_human` still pauses
+    gs_repo = pathlib.Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-b", "main"], cwd=gs_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@example.test"], cwd=gs_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=gs_repo, check=True)
+    (gs_repo / ".agent-verify.json").write_text(
+        json.dumps({"zone": "autonomous", "default_branch": "main", "allow_lint_only": True, "commands": {}}),
+        encoding="utf-8",
+    )
+    (gs_repo / "CORE.md").write_text("rule v1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=gs_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=gs_repo, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "feature/rule"], cwd=gs_repo, check=True, capture_output=True)
+    (gs_repo / "CORE.md").write_text("rule v2\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-am", "rule v2"], cwd=gs_repo, check=True, capture_output=True)
+    gs_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=gs_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+    gs_fix = gs_repo / ".git" / "pr-gs.json"
+
+    def gs_fixture(head: str, body: str, comments: list[dict[str, str]], files: list[str]) -> None:
+        gs_fix.write_text(
+            json.dumps(
+                {
+                    "number": 201,
+                    "url": "https://example.test/pr/201",
+                    "state": "OPEN",
+                    "headRefName": "feature/rule",
+                    "baseRefName": "main",
+                    "headRefOid": head,
+                    "body": body,
+                    "comments": comments,
+                    "files": [{"path": f} for f in files],
+                    "changedFiles": len(files),
+                    "reviewDecision": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def gs_ship() -> subprocess.CompletedProcess[str]:
+        return run_paf(
+            ["ship", "--repo", str(gs_repo), "--base", "main", "--pr-fixture", str(gs_fix), "--dry-run"], cwd=gs_repo
+        )
+
+    gs_author = f'<!-- paf-consensus: {{"role":"author","model_family":"claude","verdict":"open","head_sha":"{gs_sha}"}} -->'
+    gs_approve = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"gemini","verdict":"approve","head_sha":"{gs_sha}","round":1}} -->'
+    )
+    # (a) verified dual-model consensus on head: no governance pause
+    gs_fixture(gs_sha, gs_author, [{"body": gs_approve}], ["CORE.md"])
+    r_gs_cons = gs_ship()
+    # (b) author-only marker: not consensus, must not slip past the gate
+    gs_fixture(gs_sha, gs_author, [], ["CORE.md"])
+    r_gs_author_only = gs_ship()
+    # (c) single-model blind receipt only, no PR markers: pause
+    run_paf(
+        ["record-review", "--repo", str(gs_repo), "--verdict", "approve", "--reviewer", "blind", "--summary", "ok"],
+        cwd=gs_repo,
+    )
+    gs_fixture(gs_sha, "plain body", [], ["CORE.md"])
+    r_gs_blind = gs_ship()
+    # (d) base sets governance_requires_human; the PR strips it in its own tree: still pause despite consensus
+    subprocess.run(["git", "checkout", "main"], cwd=gs_repo, check=True, capture_output=True)
+    (gs_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "zone": "autonomous",
+                "default_branch": "main",
+                "allow_lint_only": True,
+                "governance_requires_human": True,
+                "commands": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "commit", "-am", "require human"], cwd=gs_repo, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "feature/strip"], cwd=gs_repo, check=True, capture_output=True)
+    (gs_repo / ".agent-verify.json").write_text(
+        json.dumps({"zone": "autonomous", "default_branch": "main", "allow_lint_only": True, "commands": {}}),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "commit", "-am", "strip"], cwd=gs_repo, check=True, capture_output=True)
+    strip_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=gs_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+    gs_fixture(
+        strip_sha,
+        gs_author.replace(gs_sha, strip_sha),
+        [{"body": gs_approve.replace(gs_sha, strip_sha)}],
+        [".agent-verify.json"],
+    )
+    r_gs_strip = gs_ship()
+    gs_ok = (
+        "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_gs_cons.stdout
+        and "MERGE_READY" in r_gs_cons.stdout
+        and "MERGE_READY" not in r_gs_author_only.stdout
+        and "PAUSED_FOR_GOVERNANCE_APPROVAL" in r_gs_blind.stdout
+        and "PAUSED_FOR_GOVERNANCE_APPROVAL" in r_gs_strip.stdout
+    )
+    if not gs_ok:
+        print(
+            "FAIL ship-path governance gate: "
+            f"cons={r_gs_cons.stdout.strip()!r}/{r_gs_cons.stderr.strip()[-200:]!r} "
+            f"author_only={r_gs_author_only.stdout.strip()!r}/{r_gs_author_only.stderr.strip()[-200:]!r} "
+            f"blind={r_gs_blind.stdout.strip()!r}/{r_gs_blind.stderr.strip()[-200:]!r} "
+            f"strip={r_gs_strip.stdout.strip()!r}/{r_gs_strip.stderr.strip()[-200:]!r}"
+        )
+        failures += 1
+    else:
+        print("PASS ship-path governance gate: consensus merges; author-only, blind-only and self-stripped flag pause")
+
     return 1 if failures else 0
 
 
