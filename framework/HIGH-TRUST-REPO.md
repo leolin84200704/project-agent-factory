@@ -38,7 +38,7 @@
 
 純文字規範屬於 `ENFORCEMENT-LADDER.md` 的第 7 階，遵守率會隨對話變長與規則變多而下降。所有能用程式判斷的架構約束都必須下推到第 1 至 6 階的編譯器、靜態分析與 CI 閘門。
 
-- **驗證契約固定鍵名與遠端 CI 對齊**。倉庫根目錄配置 `.agent-verify.json` 並啟用 `dune_lint`，搭配 `.github/workflows/ci.yml` 呼叫 `paf verify --repo . --mode ci` 或對等檢查指令。`paf verify` 只會讀取 `commands` 底下的固定鍵名 `lint`、`typecheck`、`unit_test`、`boot_smoke`、`replay` 與 `post_merge_check`，自創未知鍵名會被略過，因此自訂架構檢查腳本 `scripts/check-architecture.*` 必須放進 `commands.lint`。`dune_lint` 負責攔截未處理的浮動 Promise、環境變數寫死預設網址、缺少注入裝飾器的選填建構子參數、程式碼混入中日韓字元與寫死憑證。
+- **驗證契約固定鍵名與遠端 CI 對齊**。倉庫根目錄配置 `.agent-verify.json` 並啟用 `dune_lint`，搭配 `.github/workflows/ci.yml` 在遠端直接執行與 `.agent-verify.json` `commands` 完全對齊的架構檢查、型別檢查、單元測試與啟動測試指令；僅倉庫本身內含 `bin/paf` 時才在遠端呼叫 `python3 bin/paf verify --repo . --mode ci`。`paf verify` 只會讀取 `commands` 底下的固定鍵名 `lint`、`typecheck`、`unit_test`、`boot_smoke`、`replay` 與 `post_merge_check`，自創未知鍵名會被略過，因此自訂架構檢查腳本 `scripts/check-architecture.*` 必須放進 `commands.lint`。`dune_lint` 負責攔截未處理的浮動 Promise、環境變數寫死預設網址、缺少注入裝飾器的選填建構子參數、程式碼混入中日韓字元與寫死憑證。
 - **精確的字元豁免範圍**。若極少數檔案因網域規則必須包含中日韓字元，`dune_lint.cjk_allow_globs` 只能精確列舉該檔案路徑，禁止對整個目錄使用萬用字元豁免。
 - **對稱掃描與禁令清單**。自訂架構檢查必須同時掃描 `src/` 與 `test/` 目錄，禁止跨服務直接匯入、禁止殘留已退役的第三方套件、禁止測試指令帶 `--passWithNoTests` 這類無測試時照常通過的旗標，並禁止在程式碼中使用未釘住版本的浮動模型別名如 `*-latest`。
 
@@ -53,8 +53,8 @@
 
 單一模型同時寫程式碼與審核容易產生盲點，因此交付流程採用盲審加上雙異質模型共識。
 
-1. 在功能分支以明確檔案路徑提交 commit 後，執行 `paf lint-code` 與 `paf verify --repo . --mode pre-push` 產生綁定該 `HEAD` SHA 的驗證產物，再派不帶作者設計理由的唯讀子代理對 diff 與驗證輸出做盲審。若盲審抓出問題，修改後必須重新提交新 commit、重跑 `paf verify --repo . --mode pre-push` 並對新 SHA 重驗盲審，通過後才執行 `paf record-review --repo . --verdict approve` 寫入綁定當前 `HEAD` SHA 的盲審收據。
-2. 執行 `paf ship --repo . --open-for-consensus --author-family <claude|gemini>` 開立或更新 PR，交由另一模型家族透過 `paf watch-prs` 或 `paf post-consensus --pr <num> --role reviewer --family <fam> --head-sha <sha> --verdict <approve|request_changes>` 獨立審查。若開立全新 PR 且啟用 `consensus.require_hmac: true`，開立後同步執行 `paf post-consensus --pr <num> --role author --family <fam> --verdict open --head-sha <sha>` 讓 PR 編號寫入 HMAC 簽章。
+1. 在功能分支以明確檔案路徑提交 commit 後，執行 `paf lint-code` 與 `paf verify --repo . --mode pre-push` 產生綁定該 `HEAD` SHA 的驗證產物，再派不帶作者設計理由的唯讀子代理對 diff 與驗證輸出做盲審。若盲審抓出問題，修改後必須重新提交新 commit、重跑 `paf verify --repo . --mode pre-push` 並對新 SHA 重驗盲審，通過後才執行 `paf record-review --repo . --verdict approve --reviewer blind-subagent --summary "<summary>"` 寫入綁定當前 `HEAD` SHA 的盲審收據。
+2. 執行 `paf ship --repo . --open-for-consensus --author-family <claude|gemini>` 開立或更新 PR，交由另一模型家族透過 `paf watch-prs` 或 `paf post-consensus --repo . --pr <num> --role reviewer --family <fam> --head-sha <sha> --verdict <approve|request_changes>` 獨立審查。若開立全新 PR 且啟用 `consensus.require_hmac: true`，開立後同步執行 `paf post-consensus --repo . --pr <num> --role author --family <fam> --verdict open --head-sha <sha>` 讓 PR 編號寫入 HMAC 簽章。
 3. 盲審與異質模型審查抓到的每一個真實問題，修復時都要同步寫成單元測試或架構檢查規則，轉為永久檢查條件。
 4. 當最新 SHA 取得異質模型 `approve` 共識且 GitHub Actions CI 全綠後，一律透過 `paf merge-consensus --repo . --pr <num>` 或審查端的 `paf post-consensus ... --auto-merge` 執行內部帶 `--match-head-commit` 的原子合併、HMAC 驗簽與 `post_merge_check` 合後驗證。若 PR 觸及 `.agent-verify.json` 或 `.github/workflows/ci.yml` 等治理檔案，流程會停在 `PAUSED_FOR_GOVERNANCE_APPROVAL`，待使用者確認後以 `--approved-governance` 執行合併。
 5. 合併完成後追蹤建置與部署作業，核對線上運行的映像檔 SHA 與啟動日誌，並在真實使用者互動通道完成一次出站推播與進站回覆的雙向驗證，確認線上服務完全正常後才刪除退役的雲端資源。
@@ -70,7 +70,7 @@
 3. **建立 `README.md`、`FEATURE_MAP.md` 與雙向架構檢查**。撰寫精簡的 `README.md` 說明安裝、開發、測試與部署指令。建立 `FEATURE_MAP.md` 登記所有套件入口、路由、工具與資料表。實作 `scripts/check-architecture.*` 雙向核對原始碼、SQL DDL 與 `FEATURE_MAP.md`，設定最低匹配數量下限與跨服務匯入禁令，並實際改錯一個表名或路由測試確認腳本會回傳非零退出碼攔截，驗證後還原。
 4. **配置 `.agent-verify.json` 與遠端 CI**。在根目錄建立 `.agent-verify.json`，明確填寫 `"zone": "autonomous"`、`"default_branch": "main"`、`"require_blind_review": true`、`"consensus": { "require_hmac": true }` 與 `"dune_lint": { "enabled": true }`。在 `commands.lint` 放入 `scripts/check-architecture.*`，在 `commands.typecheck`、`commands.unit_test`、`commands.boot_smoke` 與 `commands.post_merge_check` 填入對應指令，確保無任何 `--passWithNoTests`。同步建立 `.github/workflows/ci.yml` 執行相同檢查。
 5. **補齊行為級測試與完整初始化啟動測試**。為共用基礎層補齊過期時間、負數與零值邊界、字元跳脫與重試分流的單元測試，並為每個服務補上執行完整 `init()` 生命週期與隔離環境變數的啟動冒煙測試。
-6. **首筆 PR 走完驗證、雙模型共識與治理確認**。在功能分支提交初始骨架，執行 `paf lint-code` 與 `paf verify --repo . --mode pre-push`，通過唯讀盲審後執行 `paf record-review --repo . --verdict approve`，再以 `paf ship --repo . --open-for-consensus --author-family <claude|gemini>` 送交異質模型審查。首筆 PR 因包含 `.agent-verify.json` 與 `.github/workflows/ci.yml`，達成異質共識與遠端 CI 綠燈後，`paf merge-consensus` 會停在 `PAUSED_FOR_GOVERNANCE_APPROVAL`，經使用者確認後以 `--approved-governance` 完成首次合併並設定遠端預設分支保護。
+6. **首筆 PR 走完驗證、雙模型共識與治理確認**。在功能分支提交初始骨架，執行 `paf lint-code` 與 `paf verify --repo . --mode pre-push`，通過唯讀盲審後執行 `paf record-review --repo . --verdict approve --reviewer blind-subagent --summary "<summary>"`，再以 `paf ship --repo . --open-for-consensus --author-family <claude|gemini>` 送交異質模型審查。首筆 PR 因包含 `.agent-verify.json` 與 `.github/workflows/ci.yml`，達成異質共識與遠端 CI 綠燈後，`paf merge-consensus` 會停在 `PAUSED_FOR_GOVERNANCE_APPROVAL`，經使用者確認後以 `--approved-governance` 完成首次合併並設定遠端預設分支保護。
 
 ---
 
@@ -114,8 +114,8 @@
 
 ### 階段 5 — 提交、盲審與雙異質模型共識收斂
 
-1. 以明確檔案路徑暫存並提交 commit，禁止執行 `git add -A`。在該 `HEAD` SHA 上執行 `paf verify --repo . --mode pre-push`，再派唯讀子代理在無作者推論脈絡下對完整 diff 與測試輸出進行盲審。若盲審發現問題，修改後重新提交 commit、重跑 `paf verify --repo . --mode pre-push` 並重驗盲審，通過後執行 `paf record-review --repo . --verdict approve` 紀錄綁定該 SHA 的盲審收據。
-2. 執行 `paf ship --repo . --open-for-consensus --author-family <claude|gemini>` 開立或更新 PR，交由異質模型家族透過 `paf watch-prs` 或 `paf post-consensus --role reviewer` 獨立審查。若開立全新 PR 且啟用 HMAC，同步補簽 `paf post-consensus --pr <num> --role author --family <fam> --verdict open --head-sha <sha>`。
+1. 以明確檔案路徑暫存並提交 commit，禁止執行 `git add -A`。在該 `HEAD` SHA 上執行 `paf verify --repo . --mode pre-push`，再派唯讀子代理在無作者推論脈絡下對完整 diff 與測試輸出進行盲審。若盲審發現問題，修改後重新提交 commit、重跑 `paf verify --repo . --mode pre-push` 並重驗盲審，通過後執行 `paf record-review --repo . --verdict approve --reviewer blind-subagent --summary "<summary>"` 紀錄綁定該 SHA 的盲審收據。
+2. 執行 `paf ship --repo . --open-for-consensus --author-family <claude|gemini>` 開立或更新 PR，交由異質模型家族透過 `paf watch-prs` 或 `paf post-consensus --repo . --pr <num> --role reviewer --family <fam> --head-sha <sha> --verdict <approve|request_changes>` 獨立審查。若開立全新 PR 且啟用 HMAC，同步補簽 `paf post-consensus --repo . --pr <num> --role author --family <fam> --verdict open --head-sha <sha>`。
 3. 異質模型若提出 `request_changes`，除了修好程式碼之外，一併將該類問題補進單元測試或靜態檢查規則，提交新 commit 並重跑驗證與異質審查，直到最新 SHA 獲得異質模型 `approve` 且遠端 GitHub Actions CI 全綠。接著執行 `paf merge-consensus --repo . --pr <num>`；若本次 PR 修改了 `.agent-verify.json` 或 `.github/workflows/ci.yml` 等治理檔案而停在 `PAUSED_FOR_GOVERNANCE_APPROVAL`，呈報使用者確認後加帶 `--approved-governance` 完成原子合併與合後驗證。
 
 ### 階段 6 — 部署核對、真實通道雙向驗收與雲端清理
