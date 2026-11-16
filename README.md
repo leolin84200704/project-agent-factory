@@ -35,6 +35,9 @@ BOOTSTRAP.md                 ← 新 instance 初始化指令書
 CONTRIBUTING.md              ← 變更規則（instance 提案 lesson 走 PR）
 framework/
 ├── WORK-LOOP.md             ← 9 步 ticket 流程（泛化版）
+├── HIGH-TRUST-REPO.md       ← High-Trust repo 六項準則、新建骨架與瘦身改造流程
+├── ENFORCEMENT-LADDER.md    ← 7 階強制機制階梯
+├── OPTIMIZATION.md          ← 既有服務加速與舊路由退場流程
 ├── RETRIEVAL.md             ← memory 分層 + 檢索深度協議
 ├── ENGINEERING-LESSONS.md   ← 事故蒸餾的通用工程紀律
 ├── SUBAGENTS.md             ← 子 agent 使用 pattern
