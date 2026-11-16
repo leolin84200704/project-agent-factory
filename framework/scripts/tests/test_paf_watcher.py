@@ -8,6 +8,8 @@ import datetime as dt
 import json
 import os
 import pathlib
+import plistlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -658,20 +660,32 @@ def main() -> int:
         ],
         cwd=repo1,
     )
-    r_plutil = subprocess.run(
-        ["plutil", "-lint", str(plist_path)],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if r_plist.returncode != 0 or not plist_path.is_file() or r_plutil.returncode != 0:
+    parsed_plist = plistlib.loads(plist_path.read_bytes()) if plist_path.is_file() else {}
+    plutil_ok = True
+    if shutil.which("plutil") and plist_path.is_file():
+        r_plutil = subprocess.run(
+            ["plutil", "-lint", str(plist_path)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        plutil_ok = r_plutil.returncode == 0
+    if (
+        r_plist.returncode != 0
+        or not plist_path.is_file()
+        or not plutil_ok
+        or parsed_plist.get("Label") != "com.leo.paf-watcher"
+        or parsed_plist.get("StartInterval") != 45
+        or (parsed_plist.get("EnvironmentVariables") or {}).get("PAF_HOST_ID") != "personal-mac"
+        or "watch-prs" not in (parsed_plist.get("ProgramArguments") or [])
+    ):
         print(
-            f"FAIL 8 launchd plist generation: rc={r_plist.returncode} plutil={r_plutil.returncode} "
-            f"{r_plist.stderr} {r_plutil.stdout} {r_plutil.stderr}"
+            f"FAIL 8 launchd plist generation: rc={r_plist.returncode} plutil_ok={plutil_ok} "
+            f"parsed={parsed_plist} {r_plist.stderr} {r_plist.stdout}"
         )
         failures += 1
     else:
-        print("PASS 8 install-watcher generates valid macOS launchd plist verified by plutil -lint")
+        print("PASS 8 install-watcher generates valid macOS launchd plist verified by plistlib/plutil")
 
     return 1 if failures else 0
 
