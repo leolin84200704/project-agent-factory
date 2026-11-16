@@ -15,7 +15,7 @@ Use this skill after committing changes on a feature branch (never on `main`/`ma
 3. Escalate / pause for Leo ONLY when:
    - Consensus exceeds `max_rounds` (default `3`) without approval (`PAUSED_FOR_CONSENSUS_TIEBREAK`),
    - A product/UX preference trade-off requires his call (`--needs-human-decision`),
-   - A PR modifies governance or permission-granting files (`CORE.md`, `AGENTS.md`, `CLAUDE.md`, `PERMISSIONS.md`, `FEEDBACK.md`, `.agent-verify.json`, `bin/paf`, hooks, workflows, `launchd/`, `DailyJob/`, skills) -> pauses at `PAUSED_FOR_GOVERNANCE_APPROVAL` until `--approved-governance`, or
+   - A PR modifies governance or permission-granting files (`CORE.md`, `AGENTS.md`, `CLAUDE.md`, `PERMISSIONS.md`, `FEEDBACK.md`, `.agent-verify.json`, `bin/paf`, hooks, workflows, `launchd/`, `DailyJob/`, skills) WITHOUT verified dual-model consensus, or the repo sets `"governance_requires_human": true` -> pauses at `PAUSED_FOR_GOVERNANCE_APPROVAL` until `--approved-governance` (with consensus + green CI, governance PRs merge like any other PR; Leo, 2026-11-16), or
    - `zone: "guarded"` targets any branch outside `staging_branches` (`main`, `master`, `release/*`) -> pauses at `PAUSED_FOR_MAIN_APPROVAL` until `--approved-main` (and always yields to required human colleague reviews and any stricter workspace `CLAUDE.md` rule).
 
 ## Trust Boundaries & Marker Semantics
@@ -47,6 +47,6 @@ Use this skill after committing changes on a feature branch (never on `main`/`ma
    ```bash
    paf check-consensus --repo . --pr <num>
    paf merge-consensus --repo . --pr <num>                        # autonomous or guarded staging
-   paf merge-consensus --repo . --pr <num> --approved-governance  # governance/rule PR after Leo's ok
+   paf merge-consensus --repo . --pr <num> --approved-governance  # governance PR without dual-model consensus, after Leo's ok
    paf merge-consensus --repo . --pr <num> --approved-main        # guarded non-staging after Leo's approve
    ```

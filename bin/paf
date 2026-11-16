@@ -169,6 +169,22 @@ GOVERNANCE_FILE_RE = re.compile(
 )
 
 
+def _governance_needs_human(
+    cfg: dict[str, Any], gov_files: list[str], args: argparse.Namespace, consensus_approved: bool
+) -> bool:
+    """Governance/permission-file PRs merge on heterogeneous dual-model consensus alone (Leo, 2026-11-16).
+
+    Leo's explicit approval is still required when the PR has no verified dual-model consensus
+    (for example a single-model blind-review receipt), or when the repo opts back in with
+    `"governance_requires_human": true` in `.agent-verify.json`.
+    """
+    if not gov_files or getattr(args, "approved_governance", False) or getattr(args, "approved_main", False):
+        return False
+    if bool(cfg.get("governance_requires_human", False)):
+        return True
+    return not consensus_approved
+
+
 def _governance_files_touched(repo: Path, pr_data: dict[str, Any] | None, base_branch: str) -> list[str]:
     pr_paths: list[str] = []
     expected_count: int | None = None
@@ -1415,7 +1431,7 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
         )
         return 0
 
-    if gov_files and not (args.approved_governance or args.approved_main):
+    if _governance_needs_human(cfg, gov_files, args, consensus_approved=True):
         print(
             f"PAUSED_FOR_GOVERNANCE_APPROVAL: {pr_url} (head={head_sha}) modifies governance/permission files: "
             f"{', '.join(gov_files)}"
@@ -1791,7 +1807,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
                 f"PAUSED_FOR_MAIN_APPROVAL (dry-run): zone=guarded base={base_branch} sha={head_sha}"
             )
             return 0
-        if gov_files and not (args.approved_governance or args.approved_main):
+        if _governance_needs_human(cfg, gov_files, args, consensus_approved=bool(has_consensus_markers)):
             print(
                 f"PAUSED_FOR_GOVERNANCE_APPROVAL (dry-run): sha={head_sha} files={','.join(gov_files)}"
             )
@@ -1899,7 +1915,8 @@ def cmd_ship(args: argparse.Namespace) -> int:
         print(f"OPENED_FOR_CONSENSUS: {pr_url} (pr=#{pr_number} head={head_sha} author={author_fam})")
         return 0
 
-    # Step 4: Guarded non-staging branches or governance-file edits pause for Leo's single `approve`
+    # Step 4: Guarded non-staging branches pause for Leo's single `approve`; governance-file edits pause only
+    # when there is no verified dual-model consensus (or the repo sets `governance_requires_human`)
     if requires_human_merge_approval and not args.approved_main:
         print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (base={base_branch} head={head_sha})")
         print(
@@ -1908,7 +1925,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
         )
         return 0
 
-    if gov_files and not (args.approved_governance or args.approved_main):
+    if _governance_needs_human(cfg, gov_files, args, consensus_approved=bool(has_consensus_markers)):
         print(
             f"PAUSED_FOR_GOVERNANCE_APPROVAL: {pr_url} (head={head_sha}) modifies governance/permission files: "
             f"{', '.join(gov_files)}"

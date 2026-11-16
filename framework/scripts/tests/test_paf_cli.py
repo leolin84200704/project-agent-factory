@@ -520,8 +520,8 @@ def main() -> int:
     else:
         print("PASS C1 guarded repo pauses on every non-staging base branch and fails closed on missing zone")
 
-    # 18. C3 & C4: Autonomous repo pauses once on governance/permission file edits (`CORE.md`, `.agent-verify.json`, etc.)
-    #     until `--approved-governance`, and blocks when GitHub `reviewDecision` requires human review
+    # 18. C3 & C4: Governance/permission file edits (`CORE.md`, `.agent-verify.json`, etc.) merge on consensus by default;
+    #     with `governance_requires_human` the autonomous repo pauses once until `--approved-governance`, and blocks when GitHub `reviewDecision` requires human review
     auto_repo = pathlib.Path(tempfile.mkdtemp())
     subprocess.run(["git", "init", "-b", "main"], cwd=auto_repo, check=True, capture_output=True)
     (auto_repo / ".agent-verify.json").write_text(
@@ -542,6 +542,32 @@ def main() -> int:
                 "comments": [{"body": claude_approve_mul}],
                 "files": [{"path": "CORE.md"}, {"path": "bin/paf"}],
                 "reviewDecision": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Default (Leo, 2026-11-16): verified dual-model consensus alone merges governance-file PRs, no pause
+    res_c3_default = run_paf(
+        ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
+        cwd=auto_repo,
+    )
+    if (
+        res_c3_default.returncode != 0
+        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_default.stdout
+        or "PAUSED_FOR_GOVERNANCE_APPROVAL" in res_c3_default.stdout
+    ):
+        print(f"FAIL C3a governance PR with consensus should merge by default: {res_c3_default.stdout.strip()}")
+        failures += 1
+    else:
+        print("PASS C3a governance-file PR with verified dual-model consensus merges without Leo's approval")
+    # Opt-in `governance_requires_human` restores the single human pause (also exercised by D3 below)
+    (auto_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "zone": "autonomous",
+                "default_branch": "main",
+                "governance_requires_human": True,
+                "commands": {"unit_test": ["true"]},
             }
         ),
         encoding="utf-8",
@@ -773,7 +799,8 @@ def main() -> int:
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=fb_repo, check=True)
     subprocess.run(["git", "config", "user.name", "Test User"], cwd=fb_repo, check=True)
     (fb_repo / ".agent-verify.json").write_text(
-        json.dumps({"version": 1, "zone": "autonomous", "default_branch": "main"}), encoding="utf-8"
+        json.dumps({"version": 1, "zone": "autonomous", "default_branch": "main", "governance_requires_human": True}),
+        encoding="utf-8",
     )
     subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=fb_repo, check=True, capture_output=True)
