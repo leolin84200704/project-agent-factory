@@ -13,6 +13,7 @@
 3. Grep `{memory_root}/long-term-memory/` 找相關技術知識
 4. **Lesson injection（sparse — 只挑 1~2 條）**：用 ticket 的關鍵字 grep `framework/ENGINEERING-LESSONS.md`（本檔所在 factory repo），挑**最相關的 1~2 條**（不要更多 — 實測 k=1 檢索勝過 k=4，塞多反而害）把原文抄進 STM 的 Ticket Analysis；Step 4 呈報方案時明說遵守了哪條。CLAUDE.md 的 hot-lessons 常駐區塊涵蓋最高風險紀律，此步補的是 task-specific 的其他條目。
 5. **L4 驗證（含父單／姊妹單結案核對）**：從 `{ticket_system}` 取得 ticket 現況（status / comments / links）；若為遷移、拆分或系列子單，必先讀父單與已完成姊妹單的結案結論，排除已被證實為死碼或已退役的範圍。STM 說的一律以 ticket 系統為準；發現不同步，同一 turn 修正 STM。
+6. **Model Triage（強制模型自評與角色分派，參見 `framework/MODEL-BENCHMARK.md`）**：正式進入規劃前，先執行 `paf select-model --title "{ticket_title}" --body "{summary}" --author-family <claude|gemini>`，依風險與範圍評斷出 `tier`（`trivial / standard / complex / critical`），決定這張單由哪個模型做 **規劃（`planner`）**、哪個模型做 **執行（`executor`）**、哪個模型做 **檢測審查（`reviewer`）**，並寫入 STM 的 `### Model Plan`。避免簡單任務誤用慢速高階模型卡住，也避免高風險變更誤用輕量模型漏審。
 
 ## Step 2: Analyze（分析理解）
 1. 從 `{ticket_system}` 取得 ticket 內容
@@ -67,6 +68,7 @@
 1. 執行 `paf verify --repo {repo} --mode pre-push`，產生綁定 `HEAD` SHA 的 Verification Artifact（含 Dune static checks、build、typecheck、行為級 unit test、boot smoke）。新 logic 必附**行為級**測試（mock 掉共用路徑的假綠燈不算）。
 2. **雙異質模型持久化 Session PR 共識閉環（預設標準）**：
    - 作者執行 `paf ship --repo {repo} --consensus --author-family <claude|gemini>` 單趟驅動完整五步閉環：`開 PR -> 直接呼叫另一家族模型（claude <-> gemini），兩個模型各自固定同一個持久化 session（claude --session-id/--resume、agy --conversation）來回討論與修正 -> 對最新 headRefOid 達成 SHA-pinned approve 共識且 CI 全綠後立即原子合併 -> 關閉並清理兩個共識 session -> 跑 post-merge 測試，若有設定 deploy 則執行 deploy 並在 deploy 後再測試一次`。
+   - **每次檢測審查必先自動自評模型（`model_router.py`）**：`paf_watcher.py` 在每一輪啟動審查或作者修正前，都會依實際 git diff、變更檔案路徑與輪次自動呼叫 `select_pr_models()` 評斷風險等級並顯式傳入 `--model` 與 `--effort`（例如標準單第 1 輪用 `sonnet --effort high` / `gemini-4-hydrogen-high`，第 2 輪爭議自動升至 `opus --effort high` / `gemini-4-argon-high`，高風險 DB 或權限變更直上 `opus --effort xhigh` / `gemini-4-carbon-high`）。
    - 審查模型與作者修正回合皆在剔除密鑰與 `GH_TOKEN` 環境變數並以 `0000` `flock` 遮罩隔離 `consensus.key` 的獨立 PR worktree 中執行，僅回傳結構化 JSON，由外層 Python 檢查無憑證外洩後壓上綁定 `base_branch` 與 `pr_number` 的 `HMAC-SHA256` `sig`（單一 GitHub 帳號架構下嚴禁代簽非自身模型家族，亦不使用 GitHub 原生 Review Approve 按鈕）。
    - 若為 `request_changes`，外層調度器喚醒同一個作者持久化 session 修正並通過 `paf verify --mode pre-push` 後推上新 commit，再喚醒同一個審查持久化 session 複驗（上限 `max_rounds`，預設 3 輪；超過輪數死鎖或 `needs_human_decision: true` 時觸發 `PAUSED_FOR_CONSENSUS_TIEBREAK` 並關閉兩個 session）。只有異質家族能簽出有效 `approve`（當另一家族因 API 配額耗盡／逾時拋出 `ReviewerOutageError` 且顯式啟用 `allow_same_family_fallback: true` 時，僅接受帶有與作者不同 `session_id` 的全新空白唯讀 session 所簽出的 `fallback_same_family: true` 備援簽章；缺少執行檔或非配額錯誤一律不降級）。
 

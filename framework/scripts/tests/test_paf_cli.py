@@ -1643,6 +1643,36 @@ sys.exit(1)
     else:
         print("PASS verify lints tracked files only (untracked CJK file ignored, tracked one caught)")
 
+    # 27. `paf select-model` exposes structured JSON and role-filtered CLI routing plans
+    r_sel = run_paf(
+        [
+            "select-model",
+            "--repo",
+            str(repo),
+            "--title",
+            "[VP-19999] Fix null pointer in specimen formatter",
+            "--file",
+            "src/formatter.py",
+            "--diff-lines",
+            "45",
+            "--author-family",
+            "claude",
+            "--json",
+        ],
+        cwd=repo,
+    )
+    sel_json = json.loads(r_sel.stdout) if r_sel.returncode == 0 and r_sel.stdout.strip().startswith("{") else {}
+    if (
+        r_sel.returncode != 0
+        or sel_json.get("tier") != "standard"
+        or sel_json.get("reviewer", {}).get("primary", {}).get("family") != "gemini"
+        or sel_json.get("reviewer", {}).get("primary", {}).get("cli_model") != "gemini-4-hydrogen-high"
+    ):
+        print(f"FAIL select-model subcommand: rc={r_sel.returncode} out={r_sel.stdout!r} err={r_sel.stderr!r}")
+        failures += 1
+    else:
+        print("PASS paf select-model returns deterministic four-role model routing plan")
+
     return 1 if failures else 0
 
 

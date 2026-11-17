@@ -25,8 +25,9 @@ trigger: "work loop {ticket_id}" or "處理 ticket {ticket_id}" or "執行 {tick
   Lessons Learned）。
 - **檢索**：讀各 tier `_index.md` routing table + Grep STM/LTM 目錄；不預載檔案本體。
 - **L4 驗證**：ticket 系統 / GitHub / repo 實況為準，協議見 `framework/RETRIEVAL.md`。
+- **模型自評分派（必做第一步）**：收到 ticket 時先跑 `paf select-model --title "{ticket_title}" --author-family <claude|gemini>`（規範見 `framework/MODEL-BENCHMARK.md`），決定 `planner`、`executor`、`reviewer` 三個角色的模型與 effort，寫進 STM `### Model Plan`。
 - **子 agent**：Step 2 explore、Step 3 debate pair 的 pattern 見 `framework/SUBAGENTS.md`；
-  用 harness 的 Agent 工具（Explore / general-purpose）派發。
+  用 harness 的 Agent 工具（Explore / general-purpose）派發，並依 `Model Plan` 選取對應速度／深度模型，不盲目繼承慢速預設值。
 - **進度追蹤**：可用 harness 的 TaskCreate/TaskUpdate 追 Step 1~9（可選）。
 - **失敗處理**：任何步驟失敗，立即把完整錯誤訊息 + 當時假設寫進 STM `## Failures`，
   分析 root cause；低風險修復後繼續，高風險暫停回報。
