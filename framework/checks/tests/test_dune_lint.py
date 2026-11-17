@@ -161,6 +161,29 @@ def main() -> int:
     else:
         print("PASS actionable remediation message format")
 
+    # 7. tracked_only: a push gate judges tracked files; another session's untracked scratch file must not
+    #    fail it, while the same text in a tracked file still does (and the default still reads both)
+    import subprocess
+
+    root = pathlib.Path(tempfile.mkdtemp())
+    cjk = "x = 1  # \u6e2c\u8a66\n"
+    (root / "tracked_ok.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "tracked_bad.py").write_text(cjk, encoding="utf-8")
+    (root / "scratch.py").write_text(cjk, encoding="utf-8")
+    # no global hooks and no signing: the temp repo must not run this machine's git configuration
+    git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+           "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
+    subprocess.run(git + ["init", "-q"], check=True)
+    subprocess.run(git + ["add", "tracked_ok.py", "tracked_bad.py"], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "init"], check=True)
+    tracked = sorted(f.rel_path for f in dl.lint_repo(root, tracked_only=True))
+    everything = sorted(f.rel_path for f in dl.lint_repo(root))
+    if tracked != ["tracked_bad.py"] or everything != ["scratch.py", "tracked_bad.py"]:
+        print(f"FAIL tracked_only: tracked={tracked} everything={everything}")
+        failures += 1
+    else:
+        print("PASS tracked_only skips untracked files and still reads tracked ones")
+
     return 1 if failures else 0
 
 

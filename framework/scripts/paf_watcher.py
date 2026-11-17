@@ -734,6 +734,9 @@ def build_review_prompt(
         "correctness, edge-case, and test-coverage invariants, and return ONLY the required JSON schema.\n"
         "Rules:\n"
         "- Do NOT attempt to modify files, run git push, or call gh CLI.\n"
+        "- You have NO shell: do not call Bash, a terminal or any command tool, not even for git. A command "
+        "call is denied and ends your turn with nothing returned. The full diff is below; read any other file "
+        "with your file-reading and search tools.\n"
         "- Batch independent Read/Grep calls in parallel so you finish well within the turn budget.\n"
         "- Set verdict='approve' with blocking_count=0 ONLY if the change is safe, tested, and ready to merge.\n"
         "- Set verdict='request_changes' with blocking_count>=1 for concrete defects, security holes, or missing tests.\n"
@@ -1006,6 +1009,19 @@ def run_agy_review(
         if isinstance(envelope.get("structured_output"), dict)
         else envelope.get("response")
     )
+    if not raw_payload:
+        # agy ends the turn with an empty response when a tool call was denied. Say so, instead of failing
+        # later on json.loads("") with "Expecting value".
+        denied = sorted({
+            f"{d.get('action')}:{d.get('display_name')}" for d in (envelope.get("denied_actions") or []) if isinstance(d, dict)
+        })
+        err_empty = RuntimeError(
+            "agy returned an empty review"
+            + (f"; denied tool calls: {', '.join(denied)} ; the reviewer has no shell and must use its file tools" if denied else "")
+        )
+        if reported_sid and not resume_session_id and reported_sid not in pre_ids:
+            err_empty.spawned_session_id = reported_sid  # type: ignore[attr-defined]
+        raise err_empty
     res = _normalize_structured_review(raw_payload, session_id)
     res["session_id_verified"] = bool(reported_sid or resume_session_id)
     res["session_created"] = bool(reported_sid and not resume_session_id and reported_sid not in pre_ids)
