@@ -16,6 +16,7 @@ Commands:
   paf watch-prs        ETag/state-driven cross-model PR consensus reviewer, claim coordinator, and auto-merger
   paf install-watcher  Generate (and optionally load) macOS launchd StartInterval plist for `paf watch-prs`
   paf ship             Autonomous PR -> CI -> Consensus / Blind Review -> atomic merge -> post-merge verify -> auto-revert
+  paf select-model     Assess task/PR complexity and select optimal Gemini 4 / Claude 5 models & efforts per role
   paf audit            Audit agent/product repos for manifest, `.agent-verify.json`, script drift, and index bloat
   paf garden           Run codebase hygiene checks (dune_lint, stale merged branches, unmerged proposals)
 """
@@ -41,6 +42,7 @@ from typing import Any, Callable
 FACTORY_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_SCORING_PATH = FACTORY_ROOT / "framework" / "scripts" / "memory_scoring.py"
 PAF_WATCHER_PATH = FACTORY_ROOT / "framework" / "scripts" / "paf_watcher.py"
+MODEL_ROUTER_PATH = FACTORY_ROOT / "framework" / "scripts" / "model_router.py"
 DUNE_LINT_PATH = FACTORY_ROOT / "framework" / "checks" / "dune_lint.py"
 GIT_BIN = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
 RESTRICTED_PRIVATE_REPO = "mind" + "-" + "state"
@@ -76,6 +78,10 @@ def _load_module(name: str, path: Path) -> Any:
 
 def _watcher_mod() -> Any:
     return _load_module("paf_watcher", PAF_WATCHER_PATH)
+
+
+def _router_mod() -> Any:
+    return _load_module("model_router", MODEL_ROUTER_PATH)
 
 
 def _resolve_session_id(cli_session_id: str | None = None) -> str:
@@ -1275,7 +1281,7 @@ def _load_pr_data(repo: Path, pr_ref: str | None, pr_fixture: Path | None = None
             "view",
             str(target),
             "--json",
-            "number,url,state,headRefName,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
+            "number,url,state,title,headRefName,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
         ],
         cwd=repo,
         text=True,
@@ -2008,7 +2014,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
                 "view",
                 branch,
                 "--json",
-                "number,url,state,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
+                "number,url,state,title,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
             ],
             cwd=repo,
             text=True,
@@ -2275,7 +2281,9 @@ def cmd_ship(args: argparse.Namespace) -> int:
                 state_dir=getattr(args, "state_dir", None),
                 key_file=getattr(args, "key_file", None),
                 claude_model=getattr(args, "claude_model", None),
+                claude_effort=getattr(args, "claude_effort", None),
                 agy_model=getattr(args, "agy_model", None),
+                agy_effort=getattr(args, "agy_effort", None),
                 allow_same_family_fallback=allow_fb,
                 max_rounds=max_rounds,
                 review_timeout_sec=int(getattr(args, "review_timeout", 660)),
@@ -2377,7 +2385,9 @@ def cmd_drive_consensus(args: argparse.Namespace) -> int:
                 state_dir=args.state_dir,
                 key_file=args.key_file,
                 claude_model=args.claude_model,
+                claude_effort=getattr(args, "claude_effort", None),
                 agy_model=args.agy_model,
+                agy_effort=getattr(args, "agy_effort", None),
                 allow_same_family_fallback=allow_fb,
                 max_rounds=args.max_rounds,
                 review_timeout_sec=args.review_timeout,
@@ -2584,7 +2594,9 @@ def cmd_watch_prs(args: argparse.Namespace) -> int:
                     state_dir=args.state_dir,
                     key_file=args.key_file,
                     claude_model=args.claude_model,
+                    claude_effort=getattr(args, "claude_effort", None),
                     agy_model=args.agy_model,
+                    agy_effort=getattr(args, "agy_effort", None),
                     allow_same_family_fallback=allow_fb,
                     review_timeout_sec=args.review_timeout,
                 )
@@ -2655,6 +2667,10 @@ def cmd_install_watcher(args: argparse.Namespace) -> int:
         return 1
     print(f"INSTALLED_AND_LOADED_WATCHER: {out_path} (gui/{uid}/{args.label})")
     return 0
+
+
+def cmd_select_model(args: argparse.Namespace) -> int:
+    return int(_router_mod().run_from_namespace(args))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2770,7 +2786,9 @@ def build_parser() -> argparse.ArgumentParser:
     s_ship.add_argument("--state-dir", type=Path, default=None)
     s_ship.add_argument("--key-file", type=Path, default=None)
     s_ship.add_argument("--claude-model", default=None)
+    s_ship.add_argument("--claude-effort", default=None)
     s_ship.add_argument("--agy-model", default=None)
+    s_ship.add_argument("--agy-effort", default=None)
     s_ship.add_argument("--max-rounds", type=int, default=None)
     s_ship.add_argument("--review-timeout", type=int, default=660)
     s_ship.add_argument("--author-timeout", type=int, default=1200)
@@ -2797,7 +2815,9 @@ def build_parser() -> argparse.ArgumentParser:
     s_drv.add_argument("--state-dir", type=Path, default=None)
     s_drv.add_argument("--key-file", type=Path, default=None)
     s_drv.add_argument("--claude-model", default=None)
+    s_drv.add_argument("--claude-effort", default=None)
     s_drv.add_argument("--agy-model", default=None)
+    s_drv.add_argument("--agy-effort", default=None)
     s_drv.add_argument("--max-rounds", type=int, default=None)
     s_drv.add_argument("--review-timeout", type=int, default=660)
     s_drv.add_argument("--author-timeout", type=int, default=1200)
@@ -2822,7 +2842,9 @@ def build_parser() -> argparse.ArgumentParser:
     s_watch.add_argument("--state-dir", type=Path, default=None)
     s_watch.add_argument("--key-file", type=Path, default=None)
     s_watch.add_argument("--claude-model", default=None)
+    s_watch.add_argument("--claude-effort", default=None)
     s_watch.add_argument("--agy-model", default=None)
+    s_watch.add_argument("--agy-effort", default=None)
     s_watch.add_argument("--allow-same-family-fallback", action="store_true")
     s_watch.add_argument("--review-timeout", type=int, default=660)
     s_watch.add_argument("--interval", type=int, default=45)
@@ -2842,6 +2864,13 @@ def build_parser() -> argparse.ArgumentParser:
     s_inst.add_argument("--plist-out", type=Path, default=None)
     s_inst.add_argument("--dry-run", action="store_true")
     s_inst.set_defaults(func=cmd_install_watcher)
+
+    s_sel = sub.add_parser(
+        "select-model",
+        help="assess task/PR complexity and select Gemini 4 / Claude 5 models per role",
+    )
+    _router_mod().populate_arg_parser(s_sel)
+    s_sel.set_defaults(func=cmd_select_model)
 
     s_aud = sub.add_parser("audit", help="audit agent and product repos across workspace")
     s_aud.add_argument(

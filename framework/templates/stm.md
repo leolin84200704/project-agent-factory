@@ -25,6 +25,12 @@ summary: "{ticket 簡述}"
 # {ticket_id} - Work Loop Record
 
 ## Ticket Analysis
+### Model Plan (`paf select-model`)
+- Tier: {trivial | standard | complex | critical}
+- Planner: {model + effort}
+- Executor: {model + effort}
+- Reviewer: {heterogeneous model + effort}
+
 ## Approaches Considered
 ## Decisions Made
 ## Code Changes

@@ -953,6 +953,7 @@ def run_agy_review(
     worktree: Path,
     prompt: str,
     model: str | None = None,
+    effort: str | None = None,
     resume_session_id: str | None = None,
     timeout_sec: int = 660,
 ) -> dict[str, Any]:
@@ -973,6 +974,8 @@ def run_agy_review(
         cmd.extend(["--conversation", resume_session_id])
     if model:
         cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["--effort", effort])
     cmd.append(f"-p={eff_prompt}")
 
     try:
@@ -1034,6 +1037,7 @@ def run_claude_review(
     worktree: Path,
     prompt: str,
     model: str | None = None,
+    effort: str | None = None,
     key_file: Path | None = None,
     init_session_id: str | None = None,
     resume_session_id: str | None = None,
@@ -1069,6 +1073,8 @@ def run_claude_review(
         cmd.extend(["--session-id", init_session_id])
     if model:
         cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["--effort", effort])
 
     try:
         proc = subprocess.run(
@@ -1107,6 +1113,7 @@ def run_agy_author_turn(
     worktree: Path,
     prompt: str,
     model: str | None = None,
+    effort: str | None = None,
     resume_session_id: str | None = None,
     timeout_sec: int = 1200,
 ) -> dict[str, Any]:
@@ -1129,6 +1136,8 @@ def run_agy_author_turn(
         cmd.extend(["--conversation", resume_session_id])
     if model:
         cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["--effort", effort])
     cmd.append(f"-p={eff_prompt}")
 
     try:
@@ -1176,6 +1185,7 @@ def run_claude_author_turn(
     worktree: Path,
     prompt: str,
     model: str | None = None,
+    effort: str | None = None,
     key_file: Path | None = None,
     init_session_id: str | None = None,
     resume_session_id: str | None = None,
@@ -1211,6 +1221,8 @@ def run_claude_author_turn(
         cmd.extend(["--session-id", init_session_id])
     if model:
         cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["--effort", effort])
 
     try:
         proc = subprocess.run(
@@ -1574,7 +1586,7 @@ class GitHubBus:
                 "view",
                 str(pr_number),
                 "--json",
-                "number,url,state,headRefName,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
+                "number,url,state,title,headRefName,baseRefName,headRefOid,body,comments,files,changedFiles,reviewDecision",
             ],
             cwd=self.repo_path,
             env=_clean_git_env(),
@@ -1993,6 +2005,46 @@ def _load_paf_module() -> Any:
     return mod
 
 
+def _load_router_module() -> Any:
+    import importlib.util
+
+    if "model_router" in sys.modules:
+        return sys.modules["model_router"]
+    router_path = Path(__file__).resolve().with_name("model_router.py")
+    spec = importlib.util.spec_from_file_location("model_router", router_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load {router_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["model_router"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _resolve_cli_model_and_effort(
+    family: str,
+    role_spec: dict[str, Any] | None,
+    *,
+    claude_model: str | None = None,
+    claude_effort: str | None = None,
+    agy_model: str | None = None,
+    agy_effort: str | None = None,
+) -> tuple[str | None, str | None]:
+    spec = role_spec or {}
+    if family == "claude":
+        raw_m = (claude_model or "").strip()
+        eff_model = raw_m if raw_m and raw_m.lower() != "auto" else str(spec.get("cli_model") or "")
+        raw_e = (claude_effort or "").strip()
+        eff_effort = raw_e if raw_e and raw_e.lower() != "auto" else str(spec.get("effort") or "")
+        return (eff_model or None), (eff_effort or None)
+    if family == "gemini":
+        raw_m = (agy_model or "").strip()
+        eff_model = raw_m if raw_m and raw_m.lower() != "auto" else str(spec.get("cli_model") or "")
+        raw_e = (agy_effort or "").strip()
+        eff_effort = raw_e if raw_e and raw_e.lower() != "auto" else ""
+        return (eff_model or None), (eff_effort or None)
+    return None, None
+
+
 FORBIDDEN_AUTO_EDIT_RE = re.compile(
     r"^(?:"
     r"(?:.+/)?\.agent-verify\.json"
@@ -2232,7 +2284,9 @@ def run_consensus_dialogue(
     claude_bin: str | None = None,
     agy_bin: str | None = None,
     claude_model: str | None = None,
+    claude_effort: str | None = None,
     agy_model: str | None = None,
+    agy_effort: str | None = None,
     allow_same_family_fallback: bool | None = None,
     max_rounds: int | None = None,
     review_timeout_sec: int = 660,
@@ -2382,6 +2436,7 @@ def run_consensus_dialogue(
         last_author_reply = ""
         no_edit_rebuttal_used = False
         rounds_run = 0
+        last_routing_summary: dict[str, Any] = {}
 
         try:
             for round_idx in range(1, eff_max_rounds + 1):
@@ -2429,6 +2484,18 @@ def run_consensus_dialogue(
                 if not diff_patch.strip():
                     raise RuntimeError(f"Empty diff against '{base_branch}' for PR #{pr_number} at {head_sha}.")
 
+                routing_plan = _load_router_module().select_pr_models(
+                    repo=repo,
+                    pr_data=pr_data,
+                    diff_patch=diff_patch,
+                    author_family=eff_author_fam,
+                    round_num=round_idx,
+                )
+                last_routing_summary = {
+                    "tier": routing_plan["tier"],
+                    "reasons": list(routing_plan["reasons"]),
+                }
+
                 if reviewer_session_started:
                     delta_patch = _collect_delta_diff(reviewer_wt, prev_reviewed_sha, head_sha)
                     rev_prompt = build_followup_review_prompt(
@@ -2451,6 +2518,19 @@ def run_consensus_dialogue(
                     )
 
                 def _invoke_reviewer(fam: str, resume_sid: str | None) -> dict[str, Any]:
+                    rev_model, rev_effort = _resolve_cli_model_and_effort(
+                        fam,
+                        routing_plan["reviewer"].get(fam),
+                        claude_model=claude_model,
+                        claude_effort=claude_effort,
+                        agy_model=agy_model,
+                        agy_effort=agy_effort,
+                    )
+                    sys.stderr.write(
+                        f"[paf model-router] {slug}#{pr_number} round={round_idx} tier={routing_plan['tier']} "
+                        f"role=reviewer family={fam} model={rev_model or 'default'} "
+                        f"effort={rev_effort or 'encoded'} reasons={'; '.join(routing_plan['reasons'])}\n"
+                    )
                     with _shield_key_file(resolved_key):
                         if fam == "gemini":
                             try:
@@ -2458,7 +2538,8 @@ def run_consensus_dialogue(
                                     agy_bin=eff_agy_bin,
                                     worktree=reviewer_wt,
                                     prompt=rev_prompt,
-                                    model=agy_model,
+                                    model=rev_model,
+                                    effort=rev_effort,
                                     resume_session_id=resume_sid,
                                     timeout_sec=review_timeout_sec,
                                 )
@@ -2477,7 +2558,8 @@ def run_consensus_dialogue(
                             claude_bin=eff_claude_bin,
                             worktree=reviewer_wt,
                             prompt=rev_prompt,
-                            model=claude_model,
+                            model=rev_model,
+                            effort=rev_effort,
                             key_file=resolved_key,
                             init_session_id=init_sid,
                             resume_session_id=resume_sid,
@@ -2614,6 +2696,19 @@ def run_consensus_dialogue(
 
                 def _invoke_author(prompt_text: str) -> dict[str, Any]:
                     nonlocal author_session_started
+                    auth_model, auth_effort = _resolve_cli_model_and_effort(
+                        eff_author_fam,
+                        routing_plan["executor"].get(eff_author_fam),
+                        claude_model=claude_model,
+                        claude_effort=claude_effort,
+                        agy_model=agy_model,
+                        agy_effort=agy_effort,
+                    )
+                    sys.stderr.write(
+                        f"[paf model-router] {slug}#{pr_number} round={round_idx} tier={routing_plan['tier']} "
+                        f"role=executor family={eff_author_fam} model={auth_model or 'default'} "
+                        f"effort={auth_effort or 'encoded'} reasons={'; '.join(routing_plan['reasons'])}\n"
+                    )
                     with _shield_key_file(resolved_key):
                         if eff_author_fam == "gemini":
                             try:
@@ -2621,7 +2716,8 @@ def run_consensus_dialogue(
                                     agy_bin=eff_agy_bin,
                                     worktree=author_wt,
                                     prompt=prompt_text,
-                                    model=agy_model,
+                                    model=auth_model,
+                                    effort=auth_effort,
                                     resume_session_id=(session_ctx["author_session_id"] if author_session_started else None),
                                     timeout_sec=author_timeout_sec,
                                 )
@@ -2651,7 +2747,8 @@ def run_consensus_dialogue(
                             claude_bin=eff_claude_bin,
                             worktree=author_wt,
                             prompt=prompt_text,
-                            model=claude_model,
+                            model=auth_model,
+                            effort=auth_effort,
                             key_file=resolved_key,
                             init_session_id=init_sid,
                             resume_session_id=(session_ctx["author_session_id"] if author_session_started else None),
@@ -2798,6 +2895,7 @@ def run_consensus_dialogue(
                     "author_session_id": session_ctx["author_session_id"],
                     "reviewer_session_id": session_ctx["reviewer_session_id"],
                     "sessions_closed": bool(close_rec.get("closed")),
+                    "model_routing": last_routing_summary,
                 }
             if merge_reason == "paused_tiebreak":
                 return {
@@ -2851,7 +2949,9 @@ def watch_repo_once(
     claude_bin: str | None = None,
     agy_bin: str | None = None,
     claude_model: str | None = None,
+    claude_effort: str | None = None,
     agy_model: str | None = None,
+    agy_effort: str | None = None,
     allow_same_family_fallback: bool | None = None,
     claim_ttl_sec: int = 1200,
     claim_settle_sec: float = 2.0,
@@ -3122,6 +3222,13 @@ def watch_repo_once(
                             continue
                         pr_data = refreshed_pr
 
+                    routing_plan = _load_router_module().select_pr_models(
+                        repo=repo,
+                        pr_data=pr_data,
+                        diff_patch=diff_patch,
+                        author_family=author_family,
+                        round_num=max(1, next_round),
+                    )
                     prompt = build_review_prompt(
                         repo_slug=slug,
                         pr_data=pr_data,
@@ -3175,13 +3282,27 @@ def watch_repo_once(
                                         continue
                                     pr_data = refreshed_fb
                                 claimed_fams.add(cand_fam)
+                            rev_model, rev_effort = _resolve_cli_model_and_effort(
+                                cand_fam,
+                                routing_plan["reviewer"].get(cand_fam),
+                                claude_model=claude_model,
+                                claude_effort=claude_effort,
+                                agy_model=agy_model,
+                                agy_effort=agy_effort,
+                            )
+                            sys.stderr.write(
+                                f"[paf model-router] {slug}#{pr_num} round={max(1, next_round)} tier={routing_plan['tier']} "
+                                f"role=reviewer family={cand_fam} model={rev_model or 'default'} "
+                                f"effort={rev_effort or 'encoded'} reasons={'; '.join(routing_plan['reasons'])}\n"
+                            )
                             try:
                                 if cand_fam == "gemini":
                                     review_result = run_agy_review(
                                         agy_bin=resolved_agy,
                                         worktree=wt,
                                         prompt=prompt,
-                                        model=agy_model,
+                                        model=rev_model,
+                                        effort=rev_effort,
                                         timeout_sec=review_timeout_sec,
                                     )
                                 elif cand_fam == "claude":
@@ -3189,7 +3310,8 @@ def watch_repo_once(
                                         claude_bin=resolved_claude,
                                         worktree=wt,
                                         prompt=prompt,
-                                        model=claude_model,
+                                        model=rev_model,
+                                        effort=rev_effort,
                                         key_file=resolved_key,
                                         timeout_sec=review_timeout_sec,
                                     )

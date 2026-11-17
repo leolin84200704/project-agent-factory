@@ -26,9 +26,15 @@ What `paf verify` enforces automatically:
 3. **Fail-Loud Guarantee**: If zero checks match or execute, `paf verify` fails loudly rather than passing silently.
 4. **Artifact Output**: Writes `<git-common-dir>/paf-verify-<short_sha>-pre-push.{json,md}` pinned to `HEAD`.
 
-## Step 2: Spawn Blind Adversarial Reviewer
+## Step 2: Self-Assess Diff Risk & Spawn Blind Adversarial Reviewer
 
-To prevent reward hacking and author confirmation bias, spawn an independent read-only `research` subagent:
+Before invoking any review model or subagent, self-assess the branch complexity and select the reviewer model explicitly (`framework/MODEL-BENCHMARK.md`):
+
+```bash
+paf select-model --repo . --diff-base main --author-family <claude|gemini> --role reviewer
+```
+
+To prevent reward hacking and author confirmation bias, spawn an independent read-only `research` subagent matched to the assessed tier (`flash` / `sonnet` for `trivial`/`standard`; `pro` / `opus` for `complex`/`critical`):
 - **Inputs allowed**: `git diff <base>...HEAD`, changed file paths, and `paf verify` output.
 - **Inputs forbidden**: Your reasoning, justification, or design narrative.
 - **Mandate**: Attempt to break the patch — look for tautological mocks, untested failure branches, cross-environment defaults, silent data loss, or boundary violations. Return `approve` or `request_changes` with concrete findings.

@@ -91,6 +91,9 @@
     - **安全邊界 2（衝突重建必須重簽新 SHA）**：若前一筆剛合入 `main` 的 PR 造成衝突使 `gh pr merge` 失敗（`paf` fail-closed 停下），由 Agent 從新 `main` 重建分支並重跑測試與 CI；重建後產生了新的 `headRefOid`，**必須由另一家族模型對新 SHA 補簽一次 `approve`**（可用 `git range-diff` 快速核對衝突解法）才能合併，絕不繞過 SHA 鎖定直接 merge 未簽核的新 commit。
     - **安全邊界 3（公司／團隊倉庫 `zone: "guarded"` 白名單與人類審核）**：僅當目標分支屬於 `.agent-verify.json` 的 `staging_branches` 白名單（預設 `staging`、`stage_test`）時才在共識與測試全綠後自動合併（含若有 staging deploy 則部署後再測）；**其餘所有目標分支（`main`、`master`、`release/*` 等）一律停在 `PAUSED_FOR_MAIN_APPROVAL` 等 Leo 給 `approve`**。模型共識**絕不取代公司要求的人類同事 Code Review**（設有分支保護審查規則時 GitHub `reviewDecision` 為 `REVIEW_REQUIRED` 或 `CHANGES_REQUESTED` 會直接阻斷 `paf`；未開 GitHub 保護的倉庫則依各工作區 `CLAUDE.md` 更嚴規則為準，例如 LIS 工作區規定 release PR 由 Leo 本人按 merge）。
     - **安全邊界 4（綁定特定機器的部署與合後動作）**：`.agent-verify.json` 的 `post_merge_check` 會在執行 merge 的那台機器上跑，只放跨機可攜測試；重載常駐 daemon 或特定宿主機部署則搭配 `commands.deploy`、`commands.post_deploy_check` 與 `deploy_host` 指定宿主機執行（或由宿主端 pull 後執行）。
+- **任務進件與檢測審查強制自評模型（Leo 定版 2026-11-16）**：
+  - 每次收到新 ticket 或新任務時，第一步先執行 `paf select-model`（依據 `framework/MODEL-BENCHMARK.md` 與 `framework/scripts/model_router.py`），按範圍與風險分出 `trivial / standard / complex / critical` 四級，明確決定哪一個模型做 **規劃（`planner`）**、哪一個模型做 **執行（`executor`）**、哪一個模型做 **檢測審查（`reviewer`）**。
+  - 每次呼叫模型進行檢測評斷、盲審 subagent 或雙模型 PR 共識審查時，都必須先依實際 diff 與風險自評選模並顯式傳入 `--model` 與 `--effort`（`paf ship --consensus`、`paf drive-consensus` 與 `paf watch-prs` 已內建每輪自動評斷與爭議升階），禁止不帶參數直接繼承互動環境的高延遲預設模型。
 - **PR 分支更新與鎖定 SHA**：日常單輪交付維持一個 PR 一個 head；進入雙模型 PR 共識討論時，允許在同一支未合併 PR 上推共識修正 commit（`paf ship --open-for-consensus`），但任何舊 SHA 的簽章立即失效，最終 merge 一律帶 `--match-head-commit <verified_sha>` 鎖定雙方共識簽核且 CI 全綠的精確 SHA（2026-08-18~19 實測：不鎖 head 曾導致 GitHub 合併舊 SHA）。
 - 個別 repo 的例外或更嚴規則，寫在該 workspace 的 CLAUDE.md 與 `.agent-verify.json`（以較嚴者為準）
 
@@ -130,6 +133,7 @@ Factory clone 位置依機器而異，**依序探測**：`~/src/project-agent-fa
 - 動 DB / 部署 / prod 相關工作 → 先讀 `framework/ENGINEERING-LESSONS.md`（歷史事故蒸餾的通用紀律）
 - 讓既有服務變快 / 拿掉一層 / 退役舊路由 → `framework/OPTIMIZATION.md`（phase 順序與判準）
 - 建立新產品 repo 或將既有 repo 瘦身改造為 High-Trust Environment 時，先讀 `framework/HIGH-TRUST-REPO.md`
+- 查詢 Gemini 4 與 Claude 5 評分、耗時與四角色自動選模規則 → `framework/MODEL-BENCHMARK.md`（CLI：`paf select-model`）
 - 替 Leo 起草文字、或 Leo 說文字「不像人話」→ `framework/WRITING-VOICE.md`（agent 與 Leo 文字的實測比較、例句）
 - 初始化新工作/專案的 agent → `$FACTORY/BOOTSTRAP.md`
 
