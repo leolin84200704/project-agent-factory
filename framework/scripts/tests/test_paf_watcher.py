@@ -46,6 +46,16 @@ for _k in _SCRUBBED_CALLER_ENV:
     os.environ.pop(_k, None)
 
 
+def _agy_settings_are_read_only_git(args: list[str]) -> bool:
+    """The reviewer gets session-only settings, and every grant in them is a read-only git prefix."""
+    if "--settings" not in args:
+        return False
+    allow = json.loads(args[args.index("--settings") + 1])["permissions"]["allow"]
+    reads = ("diff", "log", "show", "status", "rev-parse", "merge-base", "ls-files", "blame", "cat-file", "range-diff")
+    ok_grants = {f"{kind}(git {sub})" for sub in reads for kind in ("command", "unsandboxed")}
+    return bool(allow) and set(allow) <= ok_grants and "command(git diff)" in allow and "unsandboxed(git diff)" in allow
+
+
 def run_paf(
     args: list[str],
     cwd: pathlib.Path,
@@ -647,6 +657,7 @@ def main() -> int:
         or "PAF_CONSENSUS_KEY_FILE" in agy_seen_env
         or "CLAUDECODE" in agy_seen_env
         or "--sandbox" not in agy_seen_args
+        or not _agy_settings_are_read_only_git(agy_seen_args)
         or not any(a.startswith("-p=") for a in agy_seen_args)
         or act_b_304.get("not_modified") is not True
         or detail_after != detail_before
@@ -1605,6 +1616,28 @@ print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": 
         failures += 1
     else:
         print("PASS 12 interlocks run_consensus_dialogue with watch-prs, refreshes verify artifact SHA, blocks protected edits, and enforces session_id")
+
+    # 13. A reviewer whose tool call was denied returns an empty response: that is reported with the denied
+    #     calls named, not as a JSON parse error (2026-11-16: agy without allow rules on the work Mac).
+    deny_bin = _mkdtemp("paf-agy-denied-") / "agy"
+    deny_bin.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print(json.dumps({'conversation_id': 'agy-conv-denied', 'status': 'SUCCESS', 'response': '',\n"
+        "                  'denied_actions': [{'action': 'command', 'display_name': 'Bash'}]}))\n",
+        encoding="utf-8",
+    )
+    deny_bin.chmod(0o755)
+    denied_msg = ""
+    try:
+        paf_watcher.run_agy_review(agy_bin=str(deny_bin), worktree=_mkdtemp("paf-agy-denied-wt-"), prompt="review", timeout_sec=30)
+    except RuntimeError as exc:
+        denied_msg = str(exc)
+    if "empty review" not in denied_msg or "command:Bash" not in denied_msg or isinstance(denied_msg, bytes):
+        print(f"FAIL empty agy review is reported with its denied tool calls: got {denied_msg!r}")
+        failures += 1
+    else:
+        print("PASS 13 empty agy review names the denied tool calls instead of a JSON parse error")
 
     return 1 if failures else 0
 

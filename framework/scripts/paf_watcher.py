@@ -734,6 +734,8 @@ def build_review_prompt(
         "correctness, edge-case, and test-coverage invariants, and return ONLY the required JSON schema.\n"
         "Rules:\n"
         "- Do NOT attempt to modify files, run git push, or call gh CLI.\n"
+        "- The diff is below and the files are in your working directory. The only shell commands available are "
+        "read-only git (diff, log, show, status, blame); any other command is denied and ends your turn.\n"
         "- Batch independent Read/Grep calls in parallel so you finish well within the turn budget.\n"
         "- Set verdict='approve' with blocking_count=0 ONLY if the change is safe, tested, and ready to merge.\n"
         "- Set verdict='request_changes' with blocking_count>=1 for concrete defects, security holes, or missing tests.\n"
@@ -944,6 +946,24 @@ def _build_claude_confinement_settings(
     return allow_rules, settings_json
 
 
+# What the Gemini reviewer may run in its shell: read-only git, nothing else. Its file-reading tools already
+# work inside the worktree without a grant. Each prefix needs two grants: `command(...)` to run it at all, and
+# `unsandboxed(...)` because under --sandbox git cannot reach the main checkout's .git from a worktree.
+# Measured on agy 1.5.9 (2026-11-16): an allowed prefix chained with `&&` to another command is denied whole.
+AGY_REVIEW_GIT_READS = (
+    "git diff", "git log", "git show", "git status", "git rev-parse", "git merge-base",
+    "git ls-files", "git blame", "git cat-file", "git range-diff",
+)
+
+
+def _build_agy_review_settings() -> str:
+    """Session-only settings for the reviewer (`agy --settings`, never saved). Without them a machine whose
+    agy settings hold no allow rule denies the reviewer's first shell command, and agy then returns an empty
+    response instead of a review (2026-11-16, the work Mac)."""
+    allow = [f"{kind}({prefix})" for prefix in AGY_REVIEW_GIT_READS for kind in ("command", "unsandboxed")]
+    return json.dumps({"permissions": {"allow": allow}}, separators=(",", ":"))
+
+
 def run_agy_review(
     *,
     agy_bin: str,
@@ -965,6 +985,8 @@ def run_agy_review(
         REVIEW_JSON_SCHEMA_STR,
         "--disable-slash-commands",
         "--sandbox",
+        "--settings",
+        _build_agy_review_settings(),
     ]
     if resume_session_id:
         cmd.extend(["--conversation", resume_session_id])
@@ -1006,6 +1028,19 @@ def run_agy_review(
         if isinstance(envelope.get("structured_output"), dict)
         else envelope.get("response")
     )
+    if not raw_payload:
+        # agy ends the turn with an empty response when a tool call was denied. Say so, instead of failing
+        # later on json.loads("") with "Expecting value".
+        denied = sorted({
+            f"{d.get('action')}:{d.get('display_name')}" for d in (envelope.get("denied_actions") or []) if isinstance(d, dict)
+        })
+        err_empty = RuntimeError(
+            "agy returned an empty review"
+            + (f"; denied tool calls: {', '.join(denied)} (see AGY_REVIEW_GIT_READS)" if denied else "")
+        )
+        if reported_sid and not resume_session_id and reported_sid not in pre_ids:
+            err_empty.spawned_session_id = reported_sid  # type: ignore[attr-defined]
+        raise err_empty
     res = _normalize_structured_review(raw_payload, session_id)
     res["session_id_verified"] = bool(reported_sid or resume_session_id)
     res["session_created"] = bool(reported_sid and not resume_session_id and reported_sid not in pre_ids)
