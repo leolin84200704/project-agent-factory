@@ -36,6 +36,15 @@ def _cleanup_temp_dirs() -> None:
 
 _HERMETIC_NO_KEY = _mkdtemp("paf-hermetic-nokey-") / "absent.key"
 
+# The caller's own session must not leak into the tests: run from inside a Claude Code session (CLAUDECODE=1),
+# paf infers the caller is `claude` and refuses to sign as the other family, so the signing cases returned
+# nothing and the suite crashed. Same list as test_paf_cli.py. Removed from this process as well, because
+# some cases call the watcher module directly.
+_SCRUBBED_CALLER_ENV = ("PAF_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDECODE", "AGY_CONVERSATION_ID",
+                        "PAF_AUTHOR_FAMILY", "PAF_CONSENSUS_KEY")
+for _k in _SCRUBBED_CALLER_ENV:
+    os.environ.pop(_k, None)
+
 
 def run_paf(
     args: list[str],

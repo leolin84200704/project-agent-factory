@@ -384,7 +384,8 @@ def execute_verify(
         if dune_enabled:
             t0 = time.monotonic()
             dl = _load_module("dune_lint", DUNE_LINT_PATH)
-            findings = dl.lint_repo(repo)
+            # Tracked files only: the gate judges what is pushed, not what another session left in the tree.
+            findings = dl.lint_repo(repo, tracked_only=True)
             dur = round(time.monotonic() - t0, 2)
             out = (
                 "\n".join(f.format() for f in findings[:25])
