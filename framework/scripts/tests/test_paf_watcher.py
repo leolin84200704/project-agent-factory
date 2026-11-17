@@ -36,6 +36,15 @@ def _cleanup_temp_dirs() -> None:
 
 _HERMETIC_NO_KEY = _mkdtemp("paf-hermetic-nokey-") / "absent.key"
 
+# The caller's own session must not leak into the tests: run from inside a Claude Code session (CLAUDECODE=1),
+# paf infers the caller is `claude` and refuses to sign as the other family, so the signing cases returned
+# nothing and the suite crashed. Same list as test_paf_cli.py. Removed from this process as well, because
+# some cases call the watcher module directly.
+_SCRUBBED_CALLER_ENV = ("PAF_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDECODE", "AGY_CONVERSATION_ID",
+                        "PAF_AUTHOR_FAMILY", "PAF_CONSENSUS_KEY")
+for _k in _SCRUBBED_CALLER_ENV:
+    os.environ.pop(_k, None)
+
 
 def run_paf(
     args: list[str],
@@ -567,18 +576,24 @@ def main() -> int:
     )
 
     # Tick A: personal-mac reviews PR #42 as `gemini` via `fake_agy`, stamps HMAC, posts review, does NOT merge (author_host=work-mac)
-    act_a = paf_watcher.watch_repo_once(
-        repo=repo1,
-        repo_slug="leolin84200704/demo",
-        host_id="personal-mac",
-        families=("claude", "gemini"),
-        state_dir=state_dir,
-        key_file=key_file,
-        bus=bus,
-        claude_bin=str(fake_claude),
-        agy_bin=str(fake_agy),
-        claim_settle_sec=0.0,
-    )
+    # The reviewer must not inherit the caller's session marker. Set it for this tick only, so the check
+    # below ("CLAUDECODE" not in the environment agy saw) tests the scrub on every machine, CI included.
+    os.environ["CLAUDECODE"] = "1"
+    try:
+        act_a = paf_watcher.watch_repo_once(
+            repo=repo1,
+            repo_slug="leolin84200704/demo",
+            host_id="personal-mac",
+            families=("claude", "gemini"),
+            state_dir=state_dir,
+            key_file=key_file,
+            bus=bus,
+            claude_bin=str(fake_claude),
+            agy_bin=str(fake_agy),
+            claim_settle_sec=0.0,
+        )
+    finally:
+        os.environ.pop("CLAUDECODE", None)
     agy_seen_env = json.loads(env_dump.read_text(encoding="utf-8")) if env_dump.is_file() else {}
     agy_seen_args = json.loads(args_dump.read_text(encoding="utf-8")) if args_dump.is_file() else []
 
@@ -632,6 +647,9 @@ def main() -> int:
         or "PAF_CONSENSUS_KEY_FILE" in agy_seen_env
         or "CLAUDECODE" in agy_seen_env
         or "--sandbox" not in agy_seen_args
+        or "--settings" in agy_seen_args                      # the reviewer is given no grant of its own
+        or "--dangerously-skip-permissions" in agy_seen_args
+        or "You have NO shell" not in " ".join(agy_seen_args)
         or not any(a.startswith("-p=") for a in agy_seen_args)
         or act_b_304.get("not_modified") is not True
         or detail_after != detail_before
@@ -1590,6 +1608,28 @@ print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": 
         failures += 1
     else:
         print("PASS 12 interlocks run_consensus_dialogue with watch-prs, refreshes verify artifact SHA, blocks protected edits, and enforces session_id")
+
+    # 13. A reviewer whose tool call was denied returns an empty response: that is reported with the denied
+    #     calls named, not as a JSON parse error (2026-11-16: agy without allow rules on the work Mac).
+    deny_bin = _mkdtemp("paf-agy-denied-") / "agy"
+    deny_bin.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print(json.dumps({'conversation_id': 'agy-conv-denied', 'status': 'SUCCESS', 'response': '',\n"
+        "                  'denied_actions': [{'action': 'command', 'display_name': 'Bash'}]}))\n",
+        encoding="utf-8",
+    )
+    deny_bin.chmod(0o755)
+    denied_msg = ""
+    try:
+        paf_watcher.run_agy_review(agy_bin=str(deny_bin), worktree=_mkdtemp("paf-agy-denied-wt-"), prompt="review", timeout_sec=30)
+    except RuntimeError as exc:
+        denied_msg = str(exc)
+    if "empty review" not in denied_msg or "command:Bash" not in denied_msg:
+        print(f"FAIL empty agy review is reported with its denied tool calls: got {denied_msg!r}")
+        failures += 1
+    else:
+        print("PASS 13 empty agy review names the denied tool calls instead of a JSON parse error")
 
     return 1 if failures else 0
 

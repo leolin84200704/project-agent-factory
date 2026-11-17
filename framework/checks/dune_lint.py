@@ -285,7 +285,10 @@ def _clean_git_env() -> dict[str, str]:
     return env
 
 
-def _iter_repo_files(repo_root: Path, changed_only: bool = False) -> list[Path]:
+def _iter_repo_files(repo_root: Path, changed_only: bool = False, tracked_only: bool = False) -> list[Path]:
+    """Files to lint. `tracked_only` leaves out untracked files: a push gate judges what is being pushed,
+    and in a checkout shared by several sessions and scheduled jobs someone else's scratch file must not
+    fail everyone's push. Without git there is nothing to tell tracked from untracked, so every file counts."""
     git_env = _clean_git_env()
     if changed_only and (repo_root / ".git").exists():
         try:
@@ -319,7 +322,7 @@ def _iter_repo_files(repo_root: Path, changed_only: bool = False) -> list[Path]:
     if (repo_root / ".git").exists():
         try:
             proc = subprocess.run(
-                ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+                ["git", "ls-files", "--cached"] + ([] if tracked_only else ["--others", "--exclude-standard"]),
                 cwd=repo_root,
                 env=git_env,
                 capture_output=True,
@@ -471,11 +474,11 @@ def lint_file(repo_root: Path, file_path: Path, cfg: dict) -> list[Finding]:
     return findings
 
 
-def lint_repo(repo_root: Path, changed_only: bool = False) -> list[Finding]:
+def lint_repo(repo_root: Path, changed_only: bool = False, tracked_only: bool = False) -> list[Finding]:
     repo_root = repo_root.expanduser().resolve()
     cfg = _load_lint_config(repo_root)
     findings: list[Finding] = []
-    for fpath in _iter_repo_files(repo_root, changed_only=changed_only):
+    for fpath in _iter_repo_files(repo_root, changed_only=changed_only, tracked_only=tracked_only):
         findings.extend(lint_file(repo_root, fpath, cfg))
     return findings
 
