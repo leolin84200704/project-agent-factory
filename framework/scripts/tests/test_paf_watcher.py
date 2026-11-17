@@ -576,18 +576,24 @@ def main() -> int:
     )
 
     # Tick A: personal-mac reviews PR #42 as `gemini` via `fake_agy`, stamps HMAC, posts review, does NOT merge (author_host=work-mac)
-    act_a = paf_watcher.watch_repo_once(
-        repo=repo1,
-        repo_slug="leolin84200704/demo",
-        host_id="personal-mac",
-        families=("claude", "gemini"),
-        state_dir=state_dir,
-        key_file=key_file,
-        bus=bus,
-        claude_bin=str(fake_claude),
-        agy_bin=str(fake_agy),
-        claim_settle_sec=0.0,
-    )
+    # The reviewer must not inherit the caller's session marker. Set it for this tick only, so the check
+    # below ("CLAUDECODE" not in the environment agy saw) tests the scrub on every machine, CI included.
+    os.environ["CLAUDECODE"] = "1"
+    try:
+        act_a = paf_watcher.watch_repo_once(
+            repo=repo1,
+            repo_slug="leolin84200704/demo",
+            host_id="personal-mac",
+            families=("claude", "gemini"),
+            state_dir=state_dir,
+            key_file=key_file,
+            bus=bus,
+            claude_bin=str(fake_claude),
+            agy_bin=str(fake_agy),
+            claim_settle_sec=0.0,
+        )
+    finally:
+        os.environ.pop("CLAUDECODE", None)
     agy_seen_env = json.loads(env_dump.read_text(encoding="utf-8")) if env_dump.is_file() else {}
     agy_seen_args = json.loads(args_dump.read_text(encoding="utf-8")) if args_dump.is_file() else []
 

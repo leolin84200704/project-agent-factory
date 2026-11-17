@@ -1619,6 +1619,30 @@ sys.exit(1)
     else:
         print("PASS ship-path governance gate: consensus merges; author-only, blind-only and self-stripped flag pause")
 
+    # 26. `paf verify` lints tracked files only: an untracked file with CJK text, left in the tree by another
+    #     session, does not fail the gate; the same file once tracked does.
+    repo_t = init_temp_git_repo()
+    subprocess.run(["git", "add", "-A"], cwd=repo_t, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "init"],
+                   cwd=repo_t, check=True, capture_output=True)
+    (repo_t / "scratch.py").write_text("x = 1  # \u6e2c\u8a66\n", encoding="utf-8")
+    r_untracked = run_paf(["verify", "--repo", str(repo_t), "--mode", "pre-push"], cwd=repo_t)
+    subprocess.run(["git", "add", "scratch.py"], cwd=repo_t, check=True, capture_output=True)
+    r_tracked = run_paf(["verify", "--repo", str(repo_t), "--mode", "pre-push"], cwd=repo_t)
+    if (
+        "[PASS] dune_lint" not in r_untracked.stdout + r_untracked.stderr
+        or "[FAIL] dune_lint" not in r_tracked.stdout + r_tracked.stderr
+        or r_tracked.returncode == 0
+    ):
+        print(
+            "FAIL verify tracked-only lint: "
+            f"untracked rc={r_untracked.returncode} {(r_untracked.stdout + r_untracked.stderr)[-200:]!r} "
+            f"tracked rc={r_tracked.returncode} {(r_tracked.stdout + r_tracked.stderr)[-200:]!r}"
+        )
+        failures += 1
+    else:
+        print("PASS verify lints tracked files only (untracked CJK file ignored, tracked one caught)")
+
     return 1 if failures else 0
 
 

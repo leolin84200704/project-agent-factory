@@ -170,7 +170,9 @@ def main() -> int:
     (root / "tracked_ok.py").write_text("x = 1\n", encoding="utf-8")
     (root / "tracked_bad.py").write_text(cjk, encoding="utf-8")
     (root / "scratch.py").write_text(cjk, encoding="utf-8")
-    git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    # no global hooks and no signing: the temp repo must not run this machine's git configuration
+    git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+           "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"]
     subprocess.run(git + ["init", "-q"], check=True)
     subprocess.run(git + ["add", "tracked_ok.py", "tracked_bad.py"], check=True)
     subprocess.run(git + ["commit", "-q", "-m", "init"], check=True)
