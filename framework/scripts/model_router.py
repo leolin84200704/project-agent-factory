@@ -14,6 +14,7 @@ and selects explicit `--model` and `--effort` flags for:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 import re
@@ -253,7 +254,7 @@ COMPLEX_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
-TRIVIAL_DOC_EXTS = {".md", ".txt", ".rst", ".adoc", ".csv"}
+TRIVIAL_DOC_EXTS = {".md", ".txt", ".rst", ".adoc"}
 
 FAMILY_ALIASES = {
     "claude": "claude",
@@ -297,7 +298,8 @@ def _is_prose_doc_path(raw_target: str) -> bool:
 def _extract_changed_patch_lines(diff_patch: str) -> tuple[int, str]:
     if not diff_patch:
         return 0, ""
-    changed_lines: list[str] = []
+    head_lines: list[str] = []
+    tail_lines: deque[str] = deque(maxlen=200)
     count = 0
     current_is_prose_doc = False
     pending_old_path = ""
@@ -331,9 +333,13 @@ def _extract_changed_patch_lines(diff_patch: str) -> tuple[int, str]:
             continue
         if line.startswith(("+", "-")):
             count += 1
-            if not current_is_prose_doc and len(changed_lines) < 400:
-                changed_lines.append(line[1:])
-    return count, "\n".join(changed_lines)
+            if not current_is_prose_doc:
+                body_line = line[1:]
+                if len(head_lines) < 300:
+                    head_lines.append(body_line)
+                else:
+                    tail_lines.append(body_line)
+    return count, "\n".join(head_lines + list(tail_lines))
 
 
 def _compute_intrinsic_tier(
@@ -642,6 +648,9 @@ def collect_git_diff_signals(repo: Path, diff_base: str | None) -> tuple[list[st
         patch = patch_p.stdout if patch_p.returncode == 0 else ""
         line_cnt, _ = _extract_changed_patch_lines(patch)
         return files, line_cnt, patch, subject
+    sys.stderr.write(
+        f"[paf select-model] warning: git base ref {diff_base!r} could not be resolved in {repo}; run `git fetch` first.\n"
+    )
     return [], 0, "", subject
 
 

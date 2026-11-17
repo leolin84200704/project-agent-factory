@@ -746,20 +746,26 @@ def main() -> int:
     else:
         print("PASS 13 `_resolve_cli_model_and_effort` honors explicit flags, pairs model-matched effort, and rejects bad effort")
 
-    # 14. Lazy `bin/paf` parser isolation + live installed CLI flag/model smoke check
+    # 14. Lazy `bin/paf` parser isolation (`model_router` key + dest parity) + live installed CLI smoke check
     lazy_check = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import importlib.machinery, importlib.util, sys; "
+                "import argparse, importlib.machinery, importlib.util, sys; "
                 f"p = {str(PAF_BIN)!r}; "
                 "loader = importlib.machinery.SourceFileLoader('paf_lazy_chk', p); "
                 "spec = importlib.util.spec_from_loader('paf_lazy_chk', loader); "
                 "mod = importlib.util.module_from_spec(spec); "
                 "loader.exec_module(mod); "
-                "mod.build_parser(); "
-                "raise SystemExit(0 if 'paf_model_router' not in sys.modules else 1)"
+                "parser = mod.build_parser(); "
+                "lazy_ok = ('model_router' not in sys.modules); "
+                "rm = mod._router_mod(); "
+                "loaded_ok = ('model_router' in sys.modules); "
+                "sub_action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)); "
+                "paf_dests = {a.dest for a in sub_action.choices['select-model']._actions if a.dest != 'func'}; "
+                "mr_dests = {a.dest for a in rm.build_arg_parser()._actions}; "
+                "raise SystemExit(0 if (lazy_ok and loaded_ok and paf_dests == mr_dests) else 1)"
             ),
         ],
         capture_output=True,
@@ -791,7 +797,157 @@ def main() -> int:
         print(f"FAIL 14 lazy parser & live CLI smoke: lazy_rc={lazy_check.returncode} stderr={lazy_check.stderr} cli_errs={live_cli_errors}")
         failures += 1
     else:
-        print("PASS 14 `bin/paf` builds parser lazily without importing `model_router` and live `claude`/`agy` CLIs match catalog")
+        print("PASS 14 `bin/paf` builds parser lazily (`model_router` unimported, arg dests in sync) and live CLIs match catalog")
+
+    # 15. Re-driven `run_consensus_dialogue` preserves contested round escalation + tail sample + CSV + bad diff-base warning
+    redrive_repo = _mkdtemp("paf-mr-redrive-repo-")
+    subprocess.run(["git", "init", "-b", "main"], cwd=redrive_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=redrive_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=redrive_repo, check=True)
+    (redrive_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "consensus": {"require_hmac": True, "max_rounds": 3},
+                "commands": {"unit_test": ["true"], "post_merge_check": ["true"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (redrive_repo / "service.py").write_text("VALUE = 10\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=redrive_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=redrive_repo, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "feat/redrive"], cwd=redrive_repo, check=True, capture_output=True)
+    (redrive_repo / "service.py").write_text("VALUE = 20\n", encoding="utf-8")
+    subprocess.run(["git", "add", "service.py"], cwd=redrive_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "feat: set 20"], cwd=redrive_repo, check=True, capture_output=True)
+    rd_sha1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=redrive_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+
+    redrive_log = mock_bin / "redrive_calls.jsonl"
+    redrive_claude = mock_bin / "redrive_claude"
+    redrive_claude.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        f"log_p = pathlib.Path({str(redrive_log)!r})\n"
+        "m = args[args.index('--model') + 1] if '--model' in args else ''\n"
+        "e = args[args.index('--effort') + 1] if '--effort' in args else ''\n"
+        "sid = args[args.index('--resume') + 1] if '--resume' in args else args[args.index('--session-id') + 1]\n"
+        "with log_p.open('a') as fh:\n"
+        "    fh.write(json.dumps({'model': m, 'effort': e}) + '\\n')\n"
+        "out = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'Approved on re-drive.'}\n"
+        "print(json.dumps({'session_id': sid, 'is_error': False, 'structured_output': out}))\n",
+        encoding="utf-8",
+    )
+    redrive_claude.chmod(0o755)
+
+    # Seed PR #61 with an existing Round 1 `request_changes` marker on the SAME head (`rd_sha1`)
+    m_rd_auth = {
+        "v": 1,
+        "role": "author",
+        "model_family": "gemini",
+        "verdict": "open",
+        "head_sha": rd_sha1,
+        "host": "personal-mac",
+        "base_branch": "main",
+        "pr_number": 61,
+        "session_id": "caller-rd-61",
+    }
+    pw.sign_marker_in_place(m_rd_auth, secret, key_file=key_file, require_hmac=True)
+    m_rd_rev1 = {
+        "v": 1,
+        "role": "reviewer",
+        "model_family": "claude",
+        "verdict": "request_changes",
+        "head_sha": rd_sha1,
+        "round": 1,
+        "blocking_count": 1,
+        "needs_human_decision": False,
+        "session_id": "prior-claude-rev-1",
+        "host": "personal-mac",
+        "base_branch": "main",
+        "pr_number": 61,
+    }
+    pw.sign_marker_in_place(m_rd_rev1, secret, key_file=key_file, require_hmac=True)
+    bus_rd = pw.InMemoryGitHubBus(
+        repo_path=redrive_repo,
+        prs={
+            61: {
+                "number": 61,
+                "url": "https://example.test/pr/61",
+                "state": "OPEN",
+                "title": "Set value 20",
+                "headRefName": "feat/redrive",
+                "baseRefName": "main",
+                "headRefOid": rd_sha1,
+                "body": f"Small change\n\n<!-- paf-consensus: {json.dumps(m_rd_auth, separators=(',', ':'))} -->",
+                "comments": [
+                    {
+                        "id": "c-rd-1",
+                        "body": f"Needs fix.\n\n<!-- paf-consensus: {json.dumps(m_rd_rev1, separators=(',', ':'))} -->",
+                    }
+                ],
+                "files": [{"path": "service.py"}],
+                "reviewDecision": "",
+            }
+        },
+        key_file=key_file,
+    )
+    old_home_rd = os.environ.get("HOME")
+    os.environ["HOME"] = str(fake_home)
+    try:
+        rd_res = pw.run_consensus_dialogue(
+            repo=redrive_repo,
+            pr_number=61,
+            repo_slug="leolin84200704/redrive",
+            author_family="gemini",
+            caller_session_id="caller-rd-61",
+            host_id="personal-mac",
+            state_dir=_mkdtemp("paf-mr-rd-st-"),
+            key_file=key_file,
+            bus=bus_rd,
+            claude_bin=str(redrive_claude),
+            agy_bin=str(dlg_agy_bin),
+        )
+    finally:
+        if old_home_rd is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home_rd
+
+    rd_calls = [json.loads(ln) for ln in redrive_log.read_text().splitlines()] if redrive_log.is_file() else []
+    csv_plan = mr.select_task_models(title="Update seed mapping", changed_files=["data/seeds.csv"], diff_lines=12)
+    tail_patch = (
+        "--- a/src/batch.py\n+++ b/src/batch.py\n@@ -1 +1,450 @@\n"
+        + "".join(f"+x_{i} = {i}\n" for i in range(445))
+        + "+ALTER TABLE ledger DROP COLUMN balance_cents;\n"
+    )
+    tail_plan = mr.select_task_models(title="Update batch script", changed_files=["src/batch.py"], diff_patch=tail_patch)
+    warn_diff = subprocess.run(
+        [sys.executable, str(PAF_BIN), "select-model", "--repo", str(redrive_repo), "--diff-base", "nonexistent-branch-xyz"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if (
+        rd_res.get("status") != "merged"
+        or rd_calls != [{"model": "opus", "effort": "high"}]
+        or csv_plan["tier"] != "standard"
+        or tail_plan["tier"] != "critical"
+        or "warning: git base ref" not in warn_diff.stderr
+    ):
+        print(
+            f"FAIL 15 re-driven dialogue escalation & polish guards:\n"
+            f"  rd_res={rd_res} rd_calls={rd_calls}\n"
+            f"  csv_tier={csv_plan['tier']} tail_tier={tail_plan['tier']} warn_stderr={warn_diff.stderr!r}"
+        )
+        failures += 1
+    else:
+        print("PASS 15 re-driven `run_consensus_dialogue` escalates round=2 to `opus/high`, samples diff tail, treats CSV as code/data, and warns on missing `--diff-base`")
 
     return 1 if failures else 0
 

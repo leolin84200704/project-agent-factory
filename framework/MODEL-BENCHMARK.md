@@ -114,7 +114,7 @@
 | **`critical`** | DB migration / `ALTER` / `DROP`、`auth` / `security` / `crypto` / `billing` / `HMAC`、`PERMISSIONS.md`、`pre-tool-guard.py`、線上事故（`--incident`）、檔案數 `> 20`、變更行數 `> 1200`、點數 `>= 8`、或共識進入第 3 輪以上 | 10–25 分鐘 | `haiku (low)` / `hydrogen-low` | `fable (high)` / `carbon-high` | `opus (xhigh)` / `argon-high` | `opus (xhigh)`（或 `fable`） / `carbon-high` |
 | **`complex`** | 修改治理或核心引擎檔（`CORE.md`、`AGENTS.md`、`.agent-verify.json`、`bin/paf`、`paf_watcher.py`、hooks、workflows、skills）、跨倉或並發狀態機、檔案數 `9–20`、變更行數 `401–1200`、點數 `5–7`、或共識進入第 2 輪 | 5–12 分鐘 | `haiku (low)` / `hydrogen-low` | `opus (high)` / `argon-high` | `opus (high)` / `hydrogen-xhigh` | `opus (high)` / `argon-high` |
 | **`standard`** | 一般業務邏輯新增、單一服務 bug 修復、測試與腳本更新（未命中高風險路徑，檔案數 `<= 8` 且變更行數 `<= 400`） | 2–5 分鐘 | `haiku (low)` / `hydrogen-low` | `sonnet (high)` / `hydrogen-high` | `sonnet (high)` / `hydrogen-high` | `sonnet (high)` / `hydrogen-high` |
-| **`trivial`** | 純文件或說明檔（`.md` / `.txt` / `.rst` / `.adoc` / `.csv`）且檔案數 `<= 3`、變更行數 `<= 120`；或點數 `<= 1` 的純文案微調 | 0.5–2 分鐘 | `haiku (low)` / `hydrogen-low` | 與 Executor 合併（`sonnet-low` / `hydrogen-low`） | `sonnet (low)` / `hydrogen-medium` | `sonnet (medium)` / `hydrogen-high` |
+| **`trivial`** | 純文件或說明檔（`.md` / `.txt` / `.rst` / `.adoc`）且檔案數 `<= 3`、變更行數 `<= 120`；或點數 `<= 1` 的純文案微調 | 0.5–2 分鐘 | `haiku (low)` / `hydrogen-low` | 與 Executor 合併（`sonnet-low` / `hydrogen-low`） | `sonnet (low)` / `hydrogen-medium` | `sonnet (medium)` / `hydrogen-high` |
 
 > 審查者永遠優先選取與作者相反的模型家族（`claude` 作者配 `gemini` 審查者；`gemini` 作者配 `claude` 審查者）。當異質家族發生 API 配額耗盡或逾時而觸發全新空白 session 同家族備援時，路由引擎也會自動套用該家族同等級的審查模型與 effort。
 
@@ -130,7 +130,7 @@
    paf select-model --repo . --diff-base main --author-family gemini --role reviewer --json
    ```
 3. **`paf ship --consensus`、`paf drive-consensus` 與 `paf watch-prs` 自動執行**：
-   - 未指定 `--claude-model` / `--agy-model`（或設為 `auto`）時，`paf_watcher.py` 每一輪都會呼叫 `model_router.select_pr_models()`，讀取 PR 標題、描述、變更檔案清單、實際 diff 行數與當前 `round`，自動為審查端與作者修正端選取模型與 `--effort`，並在 stderr 印出 `[paf model-router]` 稽核紀錄。
+   - 未指定 `--claude-model` / `--agy-model`（或設為 `auto`）時，`paf_watcher.py` 每一輪都會呼叫 `model_router.select_pr_models()`，讀取 PR 標題、描述、變更檔案清單、實際 diff 行數與當前有效 `round`（跨呼叫與跨 commit 累計），自動為審查端與作者修正端選取模型與 `--effort`，並在 stderr 印出 `[paf model-router]` 稽核紀錄。若操作者顯式傳入 `--claude-model` 而未指定 `--claude-effort`，`haiku` 預設配對 `--effort low`，其餘模型名稱預設配對 `--effort high`。
    - 若第 1 輪 `standard` 審查提出 `request_changes` 進入第 2 輪，路由器會自動把第 2 輪升階到 `complex`（`opus --effort high` / `gemini-4-argon-high`），第 3 輪升階到 `critical`（`opus --effort xhigh` / `gemini-4-carbon-high`），在同一條持久化 session 上集中火力收斂爭議。
 4. **個別倉庫自訂上下限與安全不降級保護（`.agent-verify.json` 選填設定）**：
    倉庫可在 `.agent-verify.json`（或 `consensus.model_routing`）加入 `model_routing` 設定最低／最高等級、啟用 `fable` 最高階審查、或指定個別角色的 catalog key 覆寫（`overrides`）：

@@ -2488,6 +2488,7 @@ def run_consensus_dialogue(
         last_author_reply = ""
         no_edit_rebuttal_used = False
         rounds_run = 0
+        prev_eff_round = 0
         last_routing_summary: dict[str, Any] = {}
 
         try:
@@ -2530,6 +2531,23 @@ def run_consensus_dialogue(
                     }
 
                 rounds_run = round_idx
+                cur_markers = paf_mod._extract_consensus_markers(pr_data)
+                prior_reviewed_shas = {
+                    str(m.get("head_sha") or "").strip().lower()[:12]
+                    for m in cur_markers
+                    if str(m.get("role") or "").strip().lower() != "author"
+                    and str(m.get("verdict") or "").strip().lower() in ("approve", "request_changes")
+                    and HEX_SHA_RE.match(str(m.get("head_sha") or "").strip().lower())
+                    and not sha_matches(m.get("head_sha"), head_sha)
+                }
+                eff_round = max(
+                    prev_eff_round + 1,
+                    round_idx,
+                    int(eval_now.get("max_round") or 0) + 1,
+                    len(prior_reviewed_shas) + 1,
+                )
+                prev_eff_round = eff_round
+
                 if not _ensure_pr_worktree(repo, reviewer_wt, head_sha, head_branch):
                     raise RuntimeError(f"Failed preparing reviewer worktree for PR #{pr_number} at {head_sha}.")
                 diff_stat, diff_patch = _collect_diff_context(reviewer_wt, base_branch, head_sha)
@@ -2541,7 +2559,7 @@ def run_consensus_dialogue(
                     pr_data=pr_data,
                     diff_patch=diff_patch,
                     author_family=eff_author_fam,
-                    round_num=round_idx,
+                    round_num=eff_round,
                 )
                 last_routing_summary = {
                     "tier": routing_plan["tier"],
@@ -2558,7 +2576,7 @@ def run_consensus_dialogue(
                         diff_stat=diff_stat,
                         delta_patch=delta_patch,
                         author_reply=last_author_reply,
-                        round_num=round_idx,
+                        round_num=eff_round,
                     )
                 else:
                     rev_prompt = build_review_prompt(
@@ -2566,7 +2584,7 @@ def run_consensus_dialogue(
                         pr_data=pr_data,
                         diff_stat=diff_stat,
                         diff_patch=diff_patch,
-                        round_num=round_idx,
+                        round_num=eff_round,
                     )
 
                 def _invoke_reviewer(fam: str, resume_sid: str | None) -> dict[str, Any]:
@@ -2579,7 +2597,7 @@ def run_consensus_dialogue(
                         agy_effort=agy_effort,
                     )
                     sys.stderr.write(
-                        f"[paf model-router] {slug}#{pr_number} round={round_idx} "
+                        f"[paf model-router] {slug}#{pr_number} round={eff_round} "
                         f"tier={routing_plan.get('reviewer_tier', routing_plan['tier'])} "
                         f"role=reviewer family={fam} model={rev_model or 'default'} "
                         f"effort={rev_effort or 'encoded'} reasons={'; '.join(routing_plan['reasons'])}\n"
@@ -2683,7 +2701,7 @@ def run_consensus_dialogue(
                     "model_family": active_reviewer_fam,
                     "verdict": rev_res["verdict"],
                     "head_sha": head_sha.lower(),
-                    "round": round_idx,
+                    "round": eff_round,
                     "blocking_count": rev_res["blocking_count"],
                     "needs_human_decision": rev_res["needs_human_decision"],
                     "session_id": session_ctx["reviewer_session_id"],
@@ -2743,7 +2761,7 @@ def run_consensus_dialogue(
                     pr_data=pr_data,
                     diff_stat=diff_stat,
                     reviewer_prose=rev_res["prose"],
-                    round_num=round_idx,
+                    round_num=eff_round,
                     is_resume=author_session_started,
                 )
 
@@ -2758,7 +2776,7 @@ def run_consensus_dialogue(
                         agy_effort=agy_effort,
                     )
                     sys.stderr.write(
-                        f"[paf model-router] {slug}#{pr_number} round={round_idx} tier={routing_plan['tier']} "
+                        f"[paf model-router] {slug}#{pr_number} round={eff_round} tier={routing_plan['tier']} "
                         f"role=executor family={eff_author_fam} model={auth_model or 'default'} "
                         f"effort={auth_effort or 'encoded'} reasons={'; '.join(routing_plan['reasons'])}\n"
                     )
