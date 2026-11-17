@@ -4,7 +4,7 @@
 
 這份規範整理 Google Gemini（`agy` CLI）與 Anthropic Claude Code（`claude` CLI）現役模型的能力評分、回應時間與自動選模規則。
 
-兩家模型都支援可調式思考深度（`agy` 模型代碼內建 `low / medium / high / xhigh`；`claude` CLI 透過 `--effort low / medium / high / xhigh / max` 指定）。同一個模型在低思考與高思考下的執行時間相差 5 到 10 倍。過去互動環境常停在 `gemini-4-carbon-high` 或 `~/.claude/settings.json` 的 `opus[1m]` 加 `effortLevel: "xhigh"`，若子程序沒有顯式傳入 `--model` 與 `--effort`，連改幾行文件都會等上數分鐘。因此所有任務分派與檢測審查都必須先經過自我評斷並顯式指定模型參數。
+兩家模型都支援可調式思考深度（`agy` 模型代碼內建 `low / medium / high / xhigh` 預設檔位，同時也接受 `--effort low|medium|high|xhigh|max` 覆寫；`claude` CLI 透過 `--effort low / medium / high / xhigh / max` 指定）。同一個模型在低思考與高思考下的執行時間相差 5 到 10 倍。過去互動環境常停在 `gemini-4-carbon-high` 或 `~/.claude/settings.json` 的 `opus[1m]` 加 `effortLevel: "xhigh"`，若子程序沒有顯式傳入 `--model` 與 `--effort`，連改幾行文件都會等上數分鐘。因此所有任務分派與檢測審查都必須先經過自我評斷並顯式指定模型參數。
 
 ---
 
@@ -114,7 +114,7 @@
 | **`critical`** | DB migration / `ALTER` / `DROP`、`auth` / `security` / `crypto` / `billing` / `HMAC`、`PERMISSIONS.md`、`pre-tool-guard.py`、線上事故（`--incident`）、檔案數 `> 20`、變更行數 `> 1200`、點數 `>= 8`、或共識進入第 3 輪以上 | 10–25 分鐘 | `haiku (low)` / `hydrogen-low` | `fable (high)` / `carbon-high` | `opus (xhigh)` / `argon-high` | `opus (xhigh)`（或 `fable`） / `carbon-high` |
 | **`complex`** | 修改治理或核心引擎檔（`CORE.md`、`AGENTS.md`、`.agent-verify.json`、`bin/paf`、`paf_watcher.py`、hooks、workflows、skills）、跨倉或並發狀態機、檔案數 `9–20`、變更行數 `401–1200`、點數 `5–7`、或共識進入第 2 輪 | 5–12 分鐘 | `haiku (low)` / `hydrogen-low` | `opus (high)` / `argon-high` | `opus (high)` / `hydrogen-xhigh` | `opus (high)` / `argon-high` |
 | **`standard`** | 一般業務邏輯新增、單一服務 bug 修復、測試與腳本更新（未命中高風險路徑，檔案數 `<= 8` 且變更行數 `<= 400`） | 2–5 分鐘 | `haiku (low)` / `hydrogen-low` | `sonnet (high)` / `hydrogen-high` | `sonnet (high)` / `hydrogen-high` | `sonnet (high)` / `hydrogen-high` |
-| **`trivial`** | 純文件或說明檔（`.md` / `.txt` / `.rst` / `.csv`）且檔案數 `<= 3`、變更行數 `<= 120`；或點數 `<= 1` 的純文案微調 | 0.5–2 分鐘 | `haiku (low)` / `hydrogen-low` | 與 Executor 合併（`sonnet-low` / `hydrogen-low`） | `sonnet (low)` / `hydrogen-medium` | `sonnet (medium)` / `hydrogen-high` |
+| **`trivial`** | 純文件或說明檔（`.md` / `.txt` / `.rst` / `.adoc` / `.csv`）且檔案數 `<= 3`、變更行數 `<= 120`；或點數 `<= 1` 的純文案微調 | 0.5–2 分鐘 | `haiku (low)` / `hydrogen-low` | 與 Executor 合併（`sonnet-low` / `hydrogen-low`） | `sonnet (low)` / `hydrogen-medium` | `sonnet (medium)` / `hydrogen-high` |
 
 > 審查者永遠優先選取與作者相反的模型家族（`claude` 作者配 `gemini` 審查者；`gemini` 作者配 `claude` 審查者）。當異質家族發生 API 配額耗盡或逾時而觸發全新空白 session 同家族備援時，路由引擎也會自動套用該家族同等級的審查模型與 effort。
 
@@ -132,12 +132,19 @@
 3. **`paf ship --consensus`、`paf drive-consensus` 與 `paf watch-prs` 自動執行**：
    - 未指定 `--claude-model` / `--agy-model`（或設為 `auto`）時，`paf_watcher.py` 每一輪都會呼叫 `model_router.select_pr_models()`，讀取 PR 標題、描述、變更檔案清單、實際 diff 行數與當前 `round`，自動為審查端與作者修正端選取模型與 `--effort`，並在 stderr 印出 `[paf model-router]` 稽核紀錄。
    - 若第 1 輪 `standard` 審查提出 `request_changes` 進入第 2 輪，路由器會自動把第 2 輪升階到 `complex`（`opus --effort high` / `gemini-4-argon-high`），第 3 輪升階到 `critical`（`opus --effort xhigh` / `gemini-4-carbon-high`），在同一條持久化 session 上集中火力收斂爭議。
-4. **個別倉庫自訂上下限（`.agent-verify.json` 選填設定）**：
-   倉庫可在 `.agent-verify.json` 加入 `model_routing` 調整最低／最高等級或啟用 `fable` 最高階審查：
+4. **個別倉庫自訂上下限與安全不降級保護（`.agent-verify.json` 選填設定）**：
+   倉庫可在 `.agent-verify.json`（或 `consensus.model_routing`）加入 `model_routing` 設定最低／最高等級、啟用 `fable` 最高階審查、或指定個別角色的 catalog key 覆寫（`overrides`）：
    ```json
    "model_routing": {
      "min_tier": "standard",
      "max_tier": "critical",
-     "allow_apex_reviewer": false
+     "allow_apex_reviewer": false,
+     "overrides": {
+       "planner_claude": "claude_opus_high",
+       "reviewer_claude": "claude_opus_xhigh"
+     }
    }
    ```
+   **雙重防降級保護**：
+   - 在 PR 審查與 `paf select-model --diff-base` 路徑中，`load_repo_routing_config` 一律從基底分支（`git show origin/<base>:.agent-verify.json` 或 `<base>:.agent-verify.json`）讀取設定，絕不讀取待審 PR 分支上的 `.agent-verify.json`。
+   - `reviewer` 角色強制套用不降級規則：`max_tier` 不會調降 `reviewer_tier`，且 `overrides` 中的 `reviewer_claude` / `reviewer_gemini` 僅接受同家族且 `scores.review` 不低於該風險等級預設值的模型，防止任何設定將高風險 PR 降級給弱審查模型。

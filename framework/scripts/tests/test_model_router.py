@@ -556,6 +556,243 @@ def main() -> int:
     else:
         print("PASS 9 pure README mentioning HMAC/Stripe stays `trivial` while `PERMISSIONS.md` escalates to `critical`")
 
+    # 10. Base-branch config isolation & non-lowering `reviewer` invariant (BLOCKING 1 regression)
+    tamper_repo = _mkdtemp("paf-mr-tamper-repo-")
+    subprocess.run(["git", "init", "-b", "main"], cwd=tamper_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tamper_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tamper_repo, check=True)
+    (tamper_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "consensus": {"model_routing": {"min_tier": "standard"}},
+                "commands": {"unit_test": ["true"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tamper_repo / "app.py").write_text("X = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tamper_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tamper_repo, check=True, capture_output=True)
+
+    subprocess.run(["git", "checkout", "-b", "feat/self-downgrade-attempt"], cwd=tamper_repo, check=True, capture_output=True)
+    (tamper_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "model_routing": {
+                    "max_tier": "trivial",
+                    "overrides": {
+                        "reviewer_claude": "claude_haiku_low",
+                        "reviewer_gemini": "gemini_hydrogen_low",
+                    },
+                },
+                "commands": {"unit_test": ["true"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tamper_repo / "src").mkdir()
+    (tamper_repo / "src" / "auth_service.py").write_text("def verify_login():\n    return True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tamper_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "feat: update auth and verify config"], cwd=tamper_repo, check=True, capture_output=True)
+
+    base_loaded_cfg = mr.load_repo_routing_config(tamper_repo, base_branch="main")
+    pr_tamper_plan = mr.select_pr_models(
+        repo=tamper_repo,
+        pr_data={
+            "title": "Update auth service",
+            "body": "Routine change",
+            "baseRefName": "main",
+            "files": [{"path": ".agent-verify.json"}, {"path": "src/auth_service.py"}],
+        },
+        author_family="gemini",
+        round_num=1,
+    )
+    # Direct config guard: max_tier, weak reviewer overrides, cross-family overrides, and malformed min_tier
+    direct_guard_plan = mr.select_task_models(
+        title="Rotate crypto key",
+        changed_files=["lib/crypto_utils.py"],
+        author_family="gemini",
+        routing_cfg={
+            "min_tier": ["malformed_list"],
+            "max_tier": "trivial",
+            "overrides": {
+                "reviewer_claude": "claude_haiku_low",
+                "reviewer_gemini": "claude_opus_xhigh",
+                "executor_gemini": "gemini_hydrogen_low",
+            },
+        },
+    )
+    escalate_override_plan = mr.select_task_models(
+        title="Fix mapper",
+        changed_files=["src/mapper.py"],
+        author_family="gemini",
+        routing_cfg={"overrides": {"reviewer_claude": "claude_fable_high"}},
+    )
+    if (
+        base_loaded_cfg != {"min_tier": "standard"}
+        or pr_tamper_plan["tier"] != "critical"
+        or pr_tamper_plan["reviewer"]["claude"]["cli_model"] != "opus"
+        or pr_tamper_plan["reviewer"]["claude"]["effort"] != "xhigh"
+        or pr_tamper_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-carbon-high"
+        or direct_guard_plan["tier"] != "trivial"
+        or direct_guard_plan["reviewer_tier"] != "critical"
+        or direct_guard_plan["reviewer"]["claude"]["cli_model"] != "opus"
+        or direct_guard_plan["reviewer"]["claude"]["effort"] != "xhigh"
+        or direct_guard_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-carbon-high"
+        or direct_guard_plan["executor"]["gemini"]["cli_model"] != "gemini-4-hydrogen-low"
+        or escalate_override_plan["reviewer"]["claude"]["cli_model"] != "fable"
+    ):
+        print(
+            f"FAIL 10 base-branch & non-lowering reviewer guard:\n"
+            f"  base_loaded_cfg={base_loaded_cfg}\n"
+            f"  pr_tamper_plan={pr_tamper_plan}\n"
+            f"  direct_guard_plan={direct_guard_plan}\n"
+            f"  escalate_override_plan={escalate_override_plan}"
+        )
+        failures += 1
+    else:
+        print("PASS 10 PR-branch `.agent-verify.json` cannot downgrade review; `reviewer` enforces non-lowering invariant")
+
+    # 11. `CRITICAL_PATH_RE` affix path matching without `author` false positives (BLOCKING 2 regression)
+    must_be_critical = [
+        "src/authentication/login.py",
+        "src/authorization/policy.go",
+        "src/auth_service.py",
+        "src/AuthService.ts",
+        "src/oauth2_client.py",
+        "lib/crypto_utils.py",
+        "app/security_helpers.ts",
+        "services/billing_service.py",
+        "services/payment_gateway.py",
+        "db/migrations_v2/001_init.py",
+    ]
+    must_stay_standard = [
+        "src/author_helper.py",
+        "src/authors/profile.py",
+        "src/coauthor.py",
+        "src/authoring_tool.py",
+    ]
+    missed_crit = [
+        p for p in must_be_critical if mr.select_task_models(changed_files=[p])["tier"] != "critical"
+    ]
+    false_pos_auth = [
+        p for p in must_stay_standard if mr.select_task_models(changed_files=[p])["tier"] != "standard"
+    ]
+    if missed_crit or false_pos_auth:
+        print(f"FAIL 11 critical path affix matching: missed={missed_crit} false_pos={false_pos_auth}")
+        failures += 1
+    else:
+        print("PASS 11 `CRITICAL_PATH_RE` matches affix auth/crypto/security/billing paths without `author` false positives")
+
+    # 12. `_extract_changed_patch_lines` counts `--` lines and blocks `+++ b/README.md` hunk spoofing
+    spoof_diff = (
+        "diff --git a/src/query.py b/src/query.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/query.py\n"
+        "+++ b/src/query.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "--- legacy sql comment removed\n"
+        "+++ b/README.md\n"
+        "+ALTER TABLE accounts DROP COLUMN secret_hash;\n"
+    )
+    cnt_spoof, sample_spoof = mr._extract_changed_patch_lines(spoof_diff)
+    spoof_plan = mr.select_task_models(
+        title="Refactor query helper",
+        changed_files=["src/query.py"],
+        diff_patch=spoof_diff,
+    )
+    if cnt_spoof != 3 or "ALTER TABLE accounts" not in sample_spoof or spoof_plan["tier"] != "critical":
+        print(f"FAIL 12 patch parser spoofing guard: cnt={cnt_spoof} sample={sample_spoof!r} tier={spoof_plan['tier']}")
+        failures += 1
+    else:
+        print("PASS 12 `_extract_changed_patch_lines` accurately counts `--` deletions and blocks `+++` hunk header spoofing")
+
+    # 13. Operator CLI override precedence, model-matched effort, `auto`, and invalid effort validation
+    triv_claude_spec = p_triv["reviewer"]["claude"]  # sonnet / medium
+    triv_gemini_spec = p_triv["reviewer"]["gemini"]  # gemini-4-hydrogen-high
+    r_auto_c = pw._resolve_cli_model_and_effort("claude", triv_claude_spec, claude_model="auto", claude_effort="auto")
+    r_fable_default_e = pw._resolve_cli_model_and_effort("claude", triv_claude_spec, claude_model="fable")
+    r_haiku_default_e = pw._resolve_cli_model_and_effort("claude", triv_claude_spec, claude_model="haiku")
+    r_explicit_both = pw._resolve_cli_model_and_effort(
+        "claude", triv_claude_spec, claude_model="opus", claude_effort="max"
+    )
+    r_agy_override = pw._resolve_cli_model_and_effort(
+        "gemini", triv_gemini_spec, agy_model="gemini-4-argon-medium", agy_effort="high"
+    )
+    bad_effort_caught = False
+    try:
+        pw._resolve_cli_model_and_effort("claude", triv_claude_spec, claude_effort="invalid_level")
+    except ValueError:
+        bad_effort_caught = True
+    if (
+        r_auto_c != ("sonnet", "medium")
+        or r_fable_default_e != ("fable", "high")
+        or r_haiku_default_e != ("haiku", "low")
+        or r_explicit_both != ("opus", "max")
+        or r_agy_override != ("gemini-4-argon-medium", "high")
+        or not bad_effort_caught
+    ):
+        print(
+            f"FAIL 13 operator override precedence: auto={r_auto_c} fable={r_fable_default_e} "
+            f"haiku={r_haiku_default_e} both={r_explicit_both} agy={r_agy_override} bad_caught={bad_effort_caught}"
+        )
+        failures += 1
+    else:
+        print("PASS 13 `_resolve_cli_model_and_effort` honors explicit flags, pairs model-matched effort, and rejects bad effort")
+
+    # 14. Lazy `bin/paf` parser isolation + live installed CLI flag/model smoke check
+    lazy_check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import importlib.machinery, importlib.util, sys; "
+                f"p = {str(PAF_BIN)!r}; "
+                "loader = importlib.machinery.SourceFileLoader('paf_lazy_chk', p); "
+                "spec = importlib.util.spec_from_loader('paf_lazy_chk', loader); "
+                "mod = importlib.util.module_from_spec(spec); "
+                "loader.exec_module(mod); "
+                "mod.build_parser(); "
+                "raise SystemExit(0 if 'paf_model_router' not in sys.modules else 1)"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    live_cli_errors: list[str] = []
+    real_claude = "/Users/linhungfan/bin/claude" if os.path.isfile("/Users/linhungfan/bin/claude") else shutil.which("claude")
+    if real_claude:
+        ch = subprocess.run([real_claude, "--help"], capture_output=True, text=True, timeout=10, check=False)
+        ch_out = (ch.stdout or "") + "\n" + (ch.stderr or "")
+        for token in ("--model", "--effort", "xhigh"):
+            if token not in ch_out:
+                live_cli_errors.append(f"claude --help missing {token!r}")
+    real_agy = "/Users/linhungfan/bin/agy" if os.path.isfile("/Users/linhungfan/bin/agy") else shutil.which("agy")
+    if real_agy:
+        ah = subprocess.run([real_agy, "--help"], capture_output=True, text=True, timeout=10, check=False)
+        ah_out = (ah.stdout or "") + "\n" + (ah.stderr or "")
+        for token in ("--model", "--effort"):
+            if token not in ah_out:
+                live_cli_errors.append(f"agy --help missing {token!r}")
+        am = subprocess.run([real_agy, "models"], capture_output=True, text=True, timeout=10, check=False)
+        am_out = (am.stdout or "") + "\n" + (am.stderr or "")
+        if am.returncode == 0 and "gemini-" in am_out:
+            for spec in mr.MODEL_CATALOG.values():
+                if spec["family"] == "gemini" and spec["cli_model"] not in am_out:
+                    live_cli_errors.append(f"agy models missing catalog model {spec['cli_model']!r}")
+    if lazy_check.returncode != 0 or live_cli_errors:
+        print(f"FAIL 14 lazy parser & live CLI smoke: lazy_rc={lazy_check.returncode} stderr={lazy_check.stderr} cli_errs={live_cli_errors}")
+        failures += 1
+    else:
+        print("PASS 14 `bin/paf` builds parser lazily without importing `model_router` and live `claude`/`agy` CLIs match catalog")
+
     return 1 if failures else 0
 
 

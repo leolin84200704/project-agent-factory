@@ -204,7 +204,7 @@ def _resolve_staging_branches(cfg: dict[str, Any]) -> set[str]:
 
 GOVERNANCE_FILE_RE = re.compile(
     r"(^|/)(CORE\.md|AGENTS\.md|CLAUDE\.md|GEMINI\.md|WORK-LOOP\.md|PERMISSIONS\.md|FEEDBACK\.md|"
-    r"\.agent-verify\.json|run-regression\.py|dune_lint\.py|paf_watcher\.py)$|"
+    r"\.agent-verify\.json|run-regression\.py|dune_lint\.py|paf_watcher\.py|model_router\.py)$|"
     r"^bin/paf$|"
     r"(^|/)(\.claude/settings[^/]*\.json|\.gemini/settings[^/]*\.json|\.gemini/config/|"
     r"\.github/workflows/[^/]+\.ya?ml|eval-tasks/[^/]+\.md|"
@@ -2869,7 +2869,19 @@ def build_parser() -> argparse.ArgumentParser:
         "select-model",
         help="assess task/PR complexity and select Gemini 4 / Claude 5 models per role",
     )
-    _router_mod().populate_arg_parser(s_sel)
+    s_sel.add_argument("--repo", type=Path, default=Path.cwd())
+    s_sel.add_argument("--diff-base", default=None, help="Git base ref (e.g. main or origin/main) to inspect changed files & diff")
+    s_sel.add_argument("--title", default="", help="Ticket or PR title")
+    s_sel.add_argument("--body", default="", help="Ticket or PR description")
+    s_sel.add_argument("--file", dest="files", action="append", default=None, help="Changed file path (repeatable)")
+    s_sel.add_argument("--diff-lines", type=int, default=None, help="Explicit changed line count")
+    s_sel.add_argument("--story-points", type=float, default=None, help="Ticket story point estimate")
+    s_sel.add_argument("--round", dest="round_num", type=int, default=1, help="Consensus review round (1..N)")
+    s_sel.add_argument("--incident", action="store_true", help="Flag production incident / outage")
+    s_sel.add_argument("--author-family", default="claude", help="Primary/author model family (claude or gemini)")
+    s_sel.add_argument("--tier", choices=("trivial", "standard", "complex", "critical"), default=None, help="Explicit complexity tier override")
+    s_sel.add_argument("--role", choices=("router", "planner", "executor", "reviewer"), default=None)
+    s_sel.add_argument("--json", action="store_true", help="Emit structured JSON routing plan")
     s_sel.set_defaults(func=cmd_select_model)
 
     s_aud = sub.add_parser("audit", help="audit agent and product repos across workspace")

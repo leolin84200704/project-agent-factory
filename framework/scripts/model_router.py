@@ -220,10 +220,12 @@ TIER_ESTIMATED_MINUTES: dict[str, str] = {
 }
 
 CRITICAL_PATH_RE = re.compile(
-    r"(^|/)(migrations?|db/migrate|prisma/migrations|alembic|sql/migrations|"
-    r"auth|oauth|security|crypto|billing|payments?|stripe|"
-    r"PERMISSIONS\.md|pre-tool-guard\.py|consensus\.key)(/|$|\.sql$)|"
-    r"\.(key|pem)$",
+    r"(^|/)(?:db/migrate|prisma/migrations|alembic|sql/migrations)(/|$)|"
+    r"(^|/)[\w.-]*(?:"
+    r"migrations?|auth(?!or(?!i[zs]))|oauth(?!or)|security|crypto|hmac|billing|payments?|stripe"
+    r")[\w.-]*(/|$)|"
+    r"(^|/)(?:PERMISSIONS\.md|pre-tool-guard\.py|consensus\.key)$|"
+    r"\.(?:key|pem|sql)$",
     re.IGNORECASE,
 )
 
@@ -273,13 +275,23 @@ def normalize_family(raw: str | None) -> str:
     return FAMILY_ALIASES.get(raw.strip().lower(), "")
 
 
-def _clamp_tier(tier: str, min_tier: str | None, max_tier: str | None) -> str:
+def _clamp_tier(tier: str, min_tier: Any, max_tier: Any) -> str:
     rank = TIER_RANK.get(tier, 1)
-    if min_tier in TIER_RANK:
+    if isinstance(min_tier, str) and min_tier in TIER_RANK:
         rank = max(rank, TIER_RANK[min_tier])
-    if max_tier in TIER_RANK:
+    if isinstance(max_tier, str) and max_tier in TIER_RANK:
         rank = min(rank, TIER_RANK[max_tier])
     return TIERS[rank]
+
+
+def _is_prose_doc_path(raw_target: str) -> bool:
+    if not raw_target or raw_target == "/dev/null":
+        return False
+    return (
+        Path(raw_target).suffix.lower() in TRIVIAL_DOC_EXTS
+        and not CRITICAL_PATH_RE.search(raw_target)
+        and not COMPLEX_GOVERNANCE_PATH_RE.search(raw_target)
+    )
 
 
 def _extract_changed_patch_lines(diff_patch: str) -> tuple[int, str]:
@@ -288,18 +300,34 @@ def _extract_changed_patch_lines(diff_patch: str) -> tuple[int, str]:
     changed_lines: list[str] = []
     count = 0
     current_is_prose_doc = False
+    pending_old_path = ""
+    in_hunk = False
     for line in diff_patch.splitlines():
-        if line.startswith("+++ "):
-            raw_target = line[4:].strip()
-            if raw_target.startswith("b/"):
-                raw_target = raw_target[2:]
-            current_is_prose_doc = (
-                Path(raw_target).suffix.lower() in TRIVIAL_DOC_EXTS
-                and not CRITICAL_PATH_RE.search(raw_target)
-                and not COMPLEX_GOVERNANCE_PATH_RE.search(raw_target)
-            )
+        if line.startswith("diff --git "):
+            in_hunk = False
+            pending_old_path = ""
             continue
-        if line.startswith(("---", "@@")):
+        if not in_hunk:
+            if line.startswith("--- "):
+                raw_old = line[4:].strip()
+                if raw_old.startswith("a/"):
+                    raw_old = raw_old[2:]
+                pending_old_path = "" if raw_old == "/dev/null" else raw_old
+                continue
+            if line.startswith("+++ "):
+                raw_target = line[4:].strip()
+                if raw_target.startswith("b/"):
+                    raw_target = raw_target[2:]
+                eff_path = pending_old_path if raw_target == "/dev/null" else raw_target
+                current_is_prose_doc = _is_prose_doc_path(eff_path)
+                continue
+            if line.startswith("@@"):
+                in_hunk = True
+                continue
+            continue
+        if line.startswith("@@"):
+            continue
+        if line.startswith("\\"):
             continue
         if line.startswith(("+", "-")):
             count += 1
@@ -308,7 +336,7 @@ def _extract_changed_patch_lines(diff_patch: str) -> tuple[int, str]:
     return count, "\n".join(changed_lines)
 
 
-def assess_task_complexity(
+def _compute_intrinsic_tier(
     *,
     title: str = "",
     description: str = "",
@@ -319,12 +347,9 @@ def assess_task_complexity(
     round_num: int = 1,
     is_incident: bool = False,
     explicit_tier: str | None = None,
-    routing_cfg: dict[str, Any] | None = None,
 ) -> tuple[str, list[str]]:
-    cfg = routing_cfg or {}
-    if explicit_tier and explicit_tier in TIER_RANK:
-        clamped = _clamp_tier(explicit_tier, cfg.get("min_tier"), cfg.get("max_tier"))
-        return clamped, [f"explicit_tier={explicit_tier}"]
+    if isinstance(explicit_tier, str) and explicit_tier in TIER_RANK:
+        return explicit_tier, [f"explicit_tier={explicit_tier}"]
 
     files = [re.sub(r"^(?:\./)+", "", str(f).strip()) for f in (changed_files or []) if str(f).strip()]
     crit_files = [f for f in files if CRITICAL_PATH_RE.search(f)]
@@ -363,8 +388,7 @@ def assess_task_complexity(
             critical_reasons.append(f"critical_signal='{crit_kw.group(1).lower()}'")
 
     if critical_reasons:
-        tier = _clamp_tier("critical", cfg.get("min_tier"), cfg.get("max_tier"))
-        return tier, critical_reasons
+        return "critical", critical_reasons
 
     if round_num == 2:
         complex_reasons.append("consensus_round=2 (contested follow-up)")
@@ -384,12 +408,10 @@ def assess_task_complexity(
             complex_reasons.append(f"complex_signal='{cplx_kw.group(1).lower()}'")
 
     if complex_reasons:
-        tier = _clamp_tier("complex", cfg.get("min_tier"), cfg.get("max_tier"))
-        return tier, complex_reasons
+        return "complex", complex_reasons
 
     if pure_non_gov_docs and len(files) <= 3 and eff_diff_lines <= 120:
-        tier = _clamp_tier("trivial", cfg.get("min_tier"), cfg.get("max_tier"))
-        return tier, [f"docs_only ({len(files)} file(s), {eff_diff_lines} diff lines)"]
+        return "trivial", [f"docs_only ({len(files)} file(s), {eff_diff_lines} diff lines)"]
 
     if (
         not files
@@ -398,8 +420,7 @@ def assess_task_complexity(
         and eff_diff_lines <= 60
         and re.search(r"\b(typo|readme|doc|docs|comment|copy|rename\s+label)\b", combined_text, re.IGNORECASE)
     ):
-        tier = _clamp_tier("trivial", cfg.get("min_tier"), cfg.get("max_tier"))
-        return tier, ["story_points<=1 trivial text/doc task"]
+        return "trivial", ["story_points<=1 trivial text/doc task"]
 
     std_reasons = []
     if files:
@@ -408,8 +429,35 @@ def assess_task_complexity(
         std_reasons.append(f"story_points={story_points}")
     else:
         std_reasons.append("default_standard_engineering_task")
-    tier = _clamp_tier("standard", cfg.get("min_tier"), cfg.get("max_tier"))
-    return tier, std_reasons
+    return "standard", std_reasons
+
+
+def assess_task_complexity(
+    *,
+    title: str = "",
+    description: str = "",
+    changed_files: list[str] | None = None,
+    diff_lines: int | None = None,
+    diff_patch: str = "",
+    story_points: float | int | None = None,
+    round_num: int = 1,
+    is_incident: bool = False,
+    explicit_tier: str | None = None,
+    routing_cfg: dict[str, Any] | None = None,
+) -> tuple[str, list[str]]:
+    cfg = routing_cfg if isinstance(routing_cfg, dict) else {}
+    raw_tier, reasons = _compute_intrinsic_tier(
+        title=title,
+        description=description,
+        changed_files=changed_files,
+        diff_lines=diff_lines,
+        diff_patch=diff_patch,
+        story_points=story_points,
+        round_num=round_num,
+        is_incident=is_incident,
+        explicit_tier=explicit_tier,
+    )
+    return _clamp_tier(raw_tier, cfg.get("min_tier"), cfg.get("max_tier")), reasons
 
 
 def _spec_view(catalog_key: str) -> dict[str, Any]:
@@ -444,8 +492,8 @@ def select_task_models(
     explicit_tier: str | None = None,
     routing_cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    cfg = routing_cfg or {}
-    tier, reasons = assess_task_complexity(
+    cfg = routing_cfg if isinstance(routing_cfg, dict) else {}
+    raw_tier, reasons = _compute_intrinsic_tier(
         title=title,
         description=description,
         changed_files=changed_files,
@@ -455,24 +503,38 @@ def select_task_models(
         round_num=round_num,
         is_incident=is_incident,
         explicit_tier=explicit_tier,
-        routing_cfg=cfg,
     )
+    tier = _clamp_tier(raw_tier, cfg.get("min_tier"), cfg.get("max_tier"))
+    # Security invariant: repo routing config may escalate review strength (`min_tier`),
+    # never downgrade `reviewer` below the diff's intrinsic risk tier (`raw_tier`).
+    reviewer_tier = _clamp_tier(raw_tier, cfg.get("min_tier"), None)
+
     row = TIER_ROUTING_TABLE[tier]
+    rev_row = TIER_ROUTING_TABLE[reviewer_tier]
     allow_apex_rev = bool(cfg.get("allow_apex_reviewer", False))
 
     rev_claude_key = (
         "claude_fable_high"
-        if (tier == "critical" and allow_apex_rev)
-        else row["reviewer"]["claude"]
+        if (reviewer_tier == "critical" and allow_apex_rev)
+        else rev_row["reviewer"]["claude"]
     )
-    rev_gemini_key = row["reviewer"]["gemini"]
+    rev_gemini_key = rev_row["reviewer"]["gemini"]
 
     overrides = cfg.get("overrides") if isinstance(cfg.get("overrides"), dict) else {}
 
     def _pick(role: str, fam: str, default_key: str) -> dict[str, Any]:
         ov_key = overrides.get(f"{role}_{fam}")
-        chosen = ov_key if isinstance(ov_key, str) and ov_key in MODEL_CATALOG else default_key
-        return _spec_view(chosen)
+        if (
+            isinstance(ov_key, str)
+            and ov_key in MODEL_CATALOG
+            and MODEL_CATALOG[ov_key]["family"] == fam
+        ):
+            if (
+                role != "reviewer"
+                or MODEL_CATALOG[ov_key]["scores"]["review"] >= MODEL_CATALOG[default_key]["scores"]["review"]
+            ):
+                return _spec_view(ov_key)
+        return _spec_view(default_key)
 
     router_pair = {
         "claude": _pick("router", "claude", row["router"]["claude"]),
@@ -495,6 +557,7 @@ def select_task_models(
 
     return {
         "tier": tier,
+        "reviewer_tier": reviewer_tier,
         "estimated_minutes": TIER_ESTIMATED_MINUTES[tier],
         "author_family": norm_author,
         "round_num": int(round_num),
@@ -510,6 +573,7 @@ def select_task_models(
             "recommended": executor_pair[norm_author],
         },
         "reviewer": {
+            "tier": reviewer_tier,
             "claude": reviewer_claude,
             "gemini": reviewer_gemini,
             "primary": primary_reviewer,
@@ -518,13 +582,27 @@ def select_task_models(
     }
 
 
-def collect_git_diff_signals(repo: Path, diff_base: str | None) -> tuple[list[str], int, str, str]:
+def _git_clean_env() -> tuple[str, dict[str, str]]:
     git_bin = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
     env = {
         k: v
         for k, v in os.environ.items()
-        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
+        if k
+        not in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_PREFIX",
+        )
     }
+    return git_bin, env
+
+
+def collect_git_diff_signals(repo: Path, diff_base: str | None) -> tuple[list[str], int, str, str]:
+    git_bin, env = _git_clean_env()
     subject_proc = subprocess.run(
         [git_bin, "log", "-1", "--pretty=%s"],
         cwd=repo,
@@ -567,15 +645,8 @@ def collect_git_diff_signals(repo: Path, diff_base: str | None) -> tuple[list[st
     return [], 0, "", subject
 
 
-def load_repo_routing_config(repo: Path | None) -> dict[str, Any]:
-    if repo is None:
-        return {}
-    cfg_path = repo.expanduser().resolve() / ".agent-verify.json"
-    if not cfg_path.is_file():
-        return {}
-    try:
-        data = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+def _extract_routing_dict(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
         return {}
     mr = data.get("model_routing")
     if isinstance(mr, dict):
@@ -584,6 +655,66 @@ def load_repo_routing_config(repo: Path | None) -> dict[str, Any]:
     if isinstance(cons, dict) and isinstance(cons.get("model_routing"), dict):
         return cons["model_routing"]
     return {}
+
+
+def load_repo_routing_config(repo: Path | None, *, base_branch: str | None = None) -> dict[str, Any]:
+    """Load `model_routing` config for `repo`.
+
+    When `base_branch` is supplied (e.g. during PR review or `--diff-base` evaluation),
+    reads `.agent-verify.json` strictly from the base git ref (`origin/<base>` or `<base>`)
+    and never falls back to the unreviewed working tree, preventing a PR from modifying
+    `.agent-verify.json` to weaken its own review routing.
+    """
+    if repo is None:
+        return {}
+    repo_resolved = repo.expanduser().resolve()
+    clean_base = (base_branch or "").strip()
+    if clean_base:
+        if not (repo_resolved / ".git").exists():
+            return {}
+        git_bin, env = _git_clean_env()
+        refs = (
+            (clean_base, clean_base[len("origin/") :])
+            if clean_base.startswith("origin/")
+            else (f"origin/{clean_base}", clean_base)
+        )
+        for ref in refs:
+            if not ref:
+                continue
+            rev_p = subprocess.run(
+                [git_bin, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+                cwd=repo_resolved,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if rev_p.returncode != 0:
+                continue
+            show_p = subprocess.run(
+                [git_bin, "show", f"{ref}:.agent-verify.json"],
+                cwd=repo_resolved,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if show_p.returncode != 0:
+                return {}
+            try:
+                return _extract_routing_dict(json.loads(show_p.stdout))
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    cfg_path = repo_resolved / ".agent-verify.json"
+    if not cfg_path.is_file():
+        return {}
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return _extract_routing_dict(data)
 
 
 def select_pr_models(
@@ -602,10 +733,11 @@ def select_pr_models(
             files.append(item)
     title = str(pr_data.get("title") or "")
     raw_body = str(pr_data.get("body") or "")
+    base_branch = str(pr_data.get("baseRefName") or "main").strip() or "main"
     # Strip embedded verification artifact & consensus HTML comment before keyword scan
     clean_body = re.sub(r"<!--\s*paf-consensus:.*?-->", "", raw_body, flags=re.DOTALL)
     clean_body = clean_body.split("### Verification Artifact")[0].strip()
-    routing_cfg = load_repo_routing_config(repo)
+    routing_cfg = load_repo_routing_config(repo, base_branch=base_branch)
     return select_task_models(
         title=title,
         description=clean_body,
@@ -620,6 +752,7 @@ def select_pr_models(
 def format_routing_plan(plan: dict[str, Any], role_filter: str | None = None) -> str:
     if role_filter:
         role_data = plan[role_filter]
+        eff_tier = plan.get("reviewer_tier", plan["tier"]) if role_filter == "reviewer" else plan["tier"]
         if role_filter == "reviewer":
             target = role_data["primary"]
         elif "recommended" in role_data:
@@ -627,7 +760,7 @@ def format_routing_plan(plan: dict[str, Any], role_filter: str | None = None) ->
         else:
             target = role_data[plan["author_family"]]
         return (
-            f"[{role_filter.upper()}] tier={plan['tier']} -> {target['display_name']} "
+            f"[{role_filter.upper()}] tier={eff_tier} -> {target['display_name']} "
             f"({' '.join(target['cli_flags'])}) | TTFT {target['ttft_sec']} | reasons: {', '.join(plan['reasons'])}"
         )
 
@@ -636,8 +769,10 @@ def format_routing_plan(plan: dict[str, Any], role_filter: str | None = None) ->
     r_ex = plan["executor"]["recommended"]
     r_rv = plan["reviewer"]["primary"]
     inline_note = " (inline with executor)" if plan["planner"].get("inline_with_executor") else ""
+    rev_tier = plan.get("reviewer_tier", plan["tier"])
+    rev_tier_note = f", reviewer_tier={rev_tier}" if rev_tier != plan["tier"] else ""
     lines = [
-        f"Model Routing Plan — tier: {plan['tier']} (est. {plan['estimated_minutes']}, author_family={plan['author_family']}, round={plan['round_num']})",
+        f"Model Routing Plan — tier: {plan['tier']}{rev_tier_note} (est. {plan['estimated_minutes']}, author_family={plan['author_family']}, round={plan['round_num']})",
         f"  Signals  : {', '.join(plan['reasons'])}",
         f"  Router   : {r_tr['display_name']} [{' '.join(r_tr['cli_flags'])}] (TTFT {r_tr['ttft_sec']})",
         f"  Planner  : {r_pl['display_name']} [{' '.join(r_pl['cli_flags'])}]{inline_note}",
@@ -693,7 +828,7 @@ def run_from_namespace(args: argparse.Namespace) -> int:
         is_incident=args.incident,
         author_family=args.author_family,
         explicit_tier=args.tier,
-        routing_cfg=load_repo_routing_config(repo),
+        routing_cfg=load_repo_routing_config(repo, base_branch=args.diff_base),
     )
     if args.json:
         out = plan[args.role] if args.role else plan

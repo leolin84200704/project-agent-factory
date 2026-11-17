@@ -675,7 +675,9 @@ def build_author_fix_prompt(
         return (
             f"Local `paf verify --mode pre-push` failed on your changes for {repo_slug} PR #{pr_num}.\n"
             "Fix the failing check(s) directly in the working directory files (do NOT run git commit/push or modify "
-            "`.agent-verify.json` / `.github/workflows/`), keep all code/comments in English, and return the required JSON schema.\n\n"
+            "`.agent-verify.json` / `.github/workflows/`). You have NO shell in sandbox mode: do NOT call Bash, "
+            "run_command, or any terminal tool (command calls are denied and abort your turn); use Read, Grep, Glob, "
+            "Edit, and Write file tools only. Keep all code/comments in English, and return the required JSON schema.\n\n"
             f"Verification Failure Output:\n{verify_failure[:8000]}\n"
         )
     header = (
@@ -693,6 +695,8 @@ def build_author_fix_prompt(
         + "The peer heterogeneous reviewer requested changes below. Inspect and edit files directly in your working "
         "directory to fix every valid defect and add/update tests as needed.\n"
         "Rules:\n"
+        "- You have NO shell in sandbox mode: do NOT call Bash, run_command, or any terminal tool (command calls are "
+        "denied and abort your turn). Use Read, Grep, Glob, Edit, and Write file tools only.\n"
         "- Do NOT run `git commit`, `git push`, or `gh`; the outer orchestrator runs `paf verify`, commits, and pushes.\n"
         "- Do NOT modify `.agent-verify.json` or `.github/workflows/` during automated fix rounds.\n"
         "- All code, comments, commit messages, and `reply_prose` MUST be in English (zero CJK characters in code).\n"
@@ -1174,6 +1178,25 @@ def run_agy_author_turn(
         if isinstance(envelope.get("structured_output"), dict)
         else envelope.get("response")
     )
+    if not raw_payload:
+        denied = sorted(
+            {
+                f"{d.get('action')}:{d.get('display_name')}"
+                for d in (envelope.get("denied_actions") or [])
+                if isinstance(d, dict)
+            }
+        )
+        err_empty = RuntimeError(
+            "agy author returned an empty payload"
+            + (
+                f"; denied tool calls: {', '.join(denied)} ; the author sandbox has no shell and must use file tools only"
+                if denied
+                else ""
+            )
+        )
+        if reported_sid and not resume_session_id and reported_sid not in pre_ids:
+            err_empty.spawned_session_id = reported_sid  # type: ignore[attr-defined]
+        raise err_empty
     res = _normalize_structured_author_turn(raw_payload, session_id)
     res["session_created"] = bool(reported_sid and not resume_session_id and reported_sid not in pre_ids)
     return res
@@ -2020,6 +2043,25 @@ def _load_router_module() -> Any:
     return mod
 
 
+VALID_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def _default_effort_for_claude_model(model_name: str) -> str:
+    low_name = model_name.strip().lower()
+    if "haiku" in low_name:
+        return "low"
+    return "high"
+
+
+def _validate_explicit_effort(raw_effort: str, flag_label: str) -> str:
+    norm = raw_effort.strip().lower()
+    if norm not in VALID_EFFORT_LEVELS:
+        raise ValueError(
+            f"Invalid {flag_label}={raw_effort!r}; expected one of {sorted(VALID_EFFORT_LEVELS)} or 'auto'."
+        )
+    return norm
+
+
 def _resolve_cli_model_and_effort(
     family: str,
     role_spec: dict[str, Any] | None,
@@ -2032,15 +2074,25 @@ def _resolve_cli_model_and_effort(
     spec = role_spec or {}
     if family == "claude":
         raw_m = (claude_model or "").strip()
-        eff_model = raw_m if raw_m and raw_m.lower() != "auto" else str(spec.get("cli_model") or "")
+        has_explicit_m = bool(raw_m and raw_m.lower() != "auto")
+        eff_model = raw_m if has_explicit_m else str(spec.get("cli_model") or "")
         raw_e = (claude_effort or "").strip()
-        eff_effort = raw_e if raw_e and raw_e.lower() != "auto" else str(spec.get("effort") or "")
+        if raw_e and raw_e.lower() != "auto":
+            eff_effort = _validate_explicit_effort(raw_e, "--claude-effort")
+        elif has_explicit_m:
+            eff_effort = _default_effort_for_claude_model(raw_m)
+        else:
+            eff_effort = str(spec.get("effort") or "")
         return (eff_model or None), (eff_effort or None)
     if family == "gemini":
         raw_m = (agy_model or "").strip()
         eff_model = raw_m if raw_m and raw_m.lower() != "auto" else str(spec.get("cli_model") or "")
         raw_e = (agy_effort or "").strip()
-        eff_effort = raw_e if raw_e and raw_e.lower() != "auto" else ""
+        eff_effort = (
+            _validate_explicit_effort(raw_e, "--agy-effort")
+            if (raw_e and raw_e.lower() != "auto")
+            else ""
+        )
         return (eff_model or None), (eff_effort or None)
     return None, None
 
@@ -2527,7 +2579,8 @@ def run_consensus_dialogue(
                         agy_effort=agy_effort,
                     )
                     sys.stderr.write(
-                        f"[paf model-router] {slug}#{pr_number} round={round_idx} tier={routing_plan['tier']} "
+                        f"[paf model-router] {slug}#{pr_number} round={round_idx} "
+                        f"tier={routing_plan.get('reviewer_tier', routing_plan['tier'])} "
                         f"role=reviewer family={fam} model={rev_model or 'default'} "
                         f"effort={rev_effort or 'encoded'} reasons={'; '.join(routing_plan['reasons'])}\n"
                     )
@@ -3291,7 +3344,8 @@ def watch_repo_once(
                                 agy_effort=agy_effort,
                             )
                             sys.stderr.write(
-                                f"[paf model-router] {slug}#{pr_num} round={max(1, next_round)} tier={routing_plan['tier']} "
+                                f"[paf model-router] {slug}#{pr_num} round={max(1, next_round)} "
+                                f"tier={routing_plan.get('reviewer_tier', routing_plan['tier'])} "
                                 f"role=reviewer family={cand_fam} model={rev_model or 'default'} "
                                 f"effort={rev_effort or 'encoded'} reasons={'; '.join(routing_plan['reasons'])}\n"
                             )
