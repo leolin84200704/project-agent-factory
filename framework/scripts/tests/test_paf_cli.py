@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -11,6 +12,17 @@ import tempfile
 
 FACTORY_ROOT = pathlib.Path(__file__).resolve().parents[3]
 PAF_BIN = FACTORY_ROOT / "bin" / "paf"
+HERMETIC_KEY_DIR = pathlib.Path(tempfile.mkdtemp(prefix="paf-cli-test-key-"))
+HERMETIC_KEY_FILE = HERMETIC_KEY_DIR / "consensus.key"
+_SCRUBBED_CALLER_ENV = (
+    "PAF_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CLAUDECODE",
+    "AGY_CONVERSATION_ID",
+    "PAF_AUTHOR_FAMILY",
+    "PAF_CONSENSUS_KEY",
+    "PAF_CONSENSUS_KEY_FILE",
+)
 
 
 def init_temp_git_repo() -> pathlib.Path:
@@ -41,10 +53,21 @@ def init_temp_git_repo() -> pathlib.Path:
     return repo
 
 
-def run_paf(args: list[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
+def run_paf(
+    args: list[str],
+    cwd: pathlib.Path,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    for k in _SCRUBBED_CALLER_ENV:
+        env.pop(k, None)
+    env["PAF_CONSENSUS_KEY_FILE"] = str(HERMETIC_KEY_FILE)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, str(PAF_BIN), *args],
         cwd=cwd,
+        env=env,
         text=True,
         capture_output=True,
         check=False,
@@ -560,7 +583,7 @@ def main() -> int:
         failures += 1
     else:
         print("PASS C3a governance-file PR with verified dual-model consensus merges without Leo's approval")
-    # Opt-in `governance_requires_human` restores the single human pause (also exercised by D3 below)
+    # Opt-in `governance_requires_human` restores the single human pause
     (auto_repo / ".agent-verify.json").write_text(
         json.dumps(
             {
@@ -576,7 +599,7 @@ def main() -> int:
         ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
         cwd=auto_repo,
     )
-    res_c3_approved = run_paf(
+    res_c3_approved_gov = run_paf(
         [
             "merge-consensus",
             "--repo",
@@ -602,17 +625,17 @@ def main() -> int:
     if (
         res_c3_pause.returncode != 0
         or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in res_c3_pause.stdout
-        or res_c3_approved.returncode != 0
-        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_approved.stdout
+        or res_c3_approved_gov.returncode != 0
+        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_approved_gov.stdout
         or res_c4_human_req.returncode == 0
     ):
         print(
-            f"FAIL C3/C4 governance & human-review gates: c3_pause={res_c3_pause.stdout.strip()} "
-            f"c3_approved={res_c3_approved.stdout.strip()} c4_rc={res_c4_human_req.returncode}"
+            f"FAIL C3b/C4 governance opt-in & human-review gates: pause={res_c3_pause.stdout.strip()} "
+            f"approved={res_c3_approved_gov.stdout.strip()} c4_rc={res_c4_human_req.returncode}"
         )
         failures += 1
     else:
-        print("PASS C3/C4 pause governance-file PRs for Leo and honor required human GitHub reviews")
+        print("PASS C3b/C4 governance_requires_human pauses until --approved-governance, and honors GitHub human review")
 
     # 19. D1: Local `paf record-review` receipt NEVER overrides an open PR consensus gate (`request_changes`, `pending_review`, `needs_human_decision`)
     res_rec = run_paf(
@@ -723,8 +746,17 @@ def main() -> int:
     else:
         print("PASS D2 honors same-family/unlabeled objections and rejects substring family collisions")
 
-    # 21. D3 + truncated files guard: `.claude/settings*.json`, `.gemini/settings.json`, `framework/WORK-LOOP.md`,
-    #     `GEMINI.md`, `skills/verify/SKILL.md`, `framework/githooks/commit-msg`, and truncated `changedFiles > len(files)` all pause
+    # 21. D3: Governance, workflow, settings, skill, and hook PRs in autonomous repos merge directly once
+    #     heterogeneous model consensus approves by default, pause when `governance_requires_human` is enabled,
+    #     and block when peer model requests changes
+    subprocess.run(["git", "config", "user.email", "t@example.test"], cwd=auto_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=auto_repo, check=True)
+    (auto_repo / ".agent-verify.json").write_text(
+        json.dumps({"zone": "autonomous", "default_branch": "main", "commands": {"unit_test": ["true"]}}),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", ".agent-verify.json"], cwd=auto_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base default cfg"], cwd=auto_repo, check=True, capture_output=True)
     d3_paths = (
         ".agent-verify.json",
         ".github/workflows/verify.yml",
@@ -761,9 +793,51 @@ def main() -> int:
             ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
             cwd=auto_repo,
         )
-        if r_gov.returncode != 0 or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_gov.stdout:
+        if (
+            r_gov.returncode != 0
+            or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in r_gov.stdout
+            or "PAUSED_FOR_GOVERNANCE_APPROVAL" in r_gov.stdout
+        ):
             d3_ok = False
-            print(f"FAIL D3 governance path missed: {gov_path} -> {r_gov.stdout.strip()}")
+            print(f"FAIL D3 default autonomous consensus merge blocked on {gov_path}: {r_gov.stdout.strip()}")
+
+    (auto_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "zone": "autonomous",
+                "default_branch": "main",
+                "governance_requires_human": True,
+                "commands": {"unit_test": ["true"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    for gov_path in d3_paths:
+        auto_pr_fix.write_text(
+            json.dumps(
+                {
+                    "number": 115,
+                    "url": "https://example.test/pr/115",
+                    "state": "OPEN",
+                    "headRefName": "feature/rules",
+                    "baseRefName": "main",
+                    "headRefOid": mul_sha,
+                    "body": gemini_author_mul,
+                    "comments": [{"body": claude_approve_mul}],
+                    "files": [{"path": gov_path}],
+                    "changedFiles": 1,
+                    "reviewDecision": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        r_gov_opt = run_paf(
+            ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
+            cwd=auto_repo,
+        )
+        if r_gov_opt.returncode != 0 or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_gov_opt.stdout:
+            d3_ok = False
+            print(f"FAIL D3 governance_requires_human missed {gov_path}: {r_gov_opt.stdout.strip()}")
 
     auto_pr_fix.write_text(
         json.dumps(
@@ -775,23 +849,23 @@ def main() -> int:
                 "baseRefName": "main",
                 "headRefOid": mul_sha,
                 "body": gemini_author_mul,
-                "comments": [{"body": claude_approve_mul}],
-                "files": [{"path": "src/app.py"}],
-                "changedFiles": 250,
+                "comments": [{"body": claude_req_block2}],
+                "files": [{"path": "CORE.md"}],
+                "changedFiles": 1,
                 "reviewDecision": "",
             }
         ),
         encoding="utf-8",
     )
-    r_trunc = run_paf(
+    r_gov_unapproved = run_paf(
         ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
         cwd=auto_repo,
     )
-    if not d3_ok or r_trunc.returncode != 0 or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_trunc.stdout:
-        print(f"FAIL D3 / truncated changedFiles guard: d3_ok={d3_ok} trunc={r_trunc.stdout.strip()}")
+    if not d3_ok or r_gov_unapproved.returncode != 2:
+        print(f"FAIL D3 peer-model governance check: d3_ok={d3_ok} unapproved_rc={r_gov_unapproved.returncode}")
         failures += 1
     else:
-        print("PASS D3 expands governance-file coverage and pauses when PR file list is truncated")
+        print("PASS D3 confirms governance/hook/workflow PRs via peer model by default and honors governance_requires_human")
 
     # 22. Truncated or missing PR file list: the local `git diff` fallback counts only when local HEAD is the PR head
     fb_repo = pathlib.Path(tempfile.mkdtemp())
@@ -816,10 +890,10 @@ def main() -> int:
     other_sha = "d" * 40
 
     def write_fb_fixture(head_oid: str, files: list[str] | None, changed: int | None) -> None:
-        author = '<!-- paf-consensus: ' + json.dumps(
+        author = "<!-- paf-consensus: " + json.dumps(
             {"v": 1, "role": "author", "model_family": "gemini", "verdict": "open", "head_sha": head_oid}
-        ) + ' -->'
-        approve = '<!-- paf-consensus: ' + json.dumps(
+        ) + " -->"
+        approve = "<!-- paf-consensus: " + json.dumps(
             {
                 "v": 1,
                 "role": "reviewer",
@@ -829,7 +903,7 @@ def main() -> int:
                 "round": 1,
                 "blocking_count": 0,
             }
-        ) + ' -->'
+        ) + " -->"
         data: dict[str, object] = {
             "number": 116,
             "url": "https://example.test/pr/116",
@@ -852,16 +926,12 @@ def main() -> int:
             ["merge-consensus", "--repo", str(fb_repo), "--pr-fixture", str(fb_fix), "--dry-run"], cwd=fb_repo
         )
 
-    # local checkout sits on an unrelated branch with enough files to cover the count: must stay truncated
     write_fb_fixture(other_sha, ["src/app.py"], 3)
     r_fb_other = fb_dry_run()
-    # no file list at all and the local checkout is not the PR head: must pause, not pass as "no governance files"
     write_fb_fixture(other_sha, None, None)
     r_fb_nofiles = fb_dry_run()
-    # local HEAD is the PR head and holds no governance file: the fallback completes the list, no pause
     write_fb_fixture(plain_sha, ["a.py"], 3)
     r_fb_same_plain = fb_dry_run()
-    # local HEAD is the PR head and the truncated-away part holds a governance file: pause and name it
     (fb_repo / "CORE.md").write_text("rule\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
     subprocess.run(["git", "commit", "-m", "rule file"], cwd=fb_repo, check=True, capture_output=True)
@@ -889,7 +959,554 @@ def main() -> int:
     else:
         print("PASS truncated or missing PR file list trusts local git diff only when local HEAD is the PR head")
 
-    # 23. Governance gate on the `paf ship` path (Leo, 2026-11-16): consensus alone merges a governance PR; a
+    # 24. Deploy + Post-Deploy Verification Pipeline: if deploy is configured, execute deploy after post-merge
+    #     and immediately re-test after deploy (`post_deploy_check` or fallback stage), failing closed on error
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.SourceFileLoader("paf_cli_test_mod", str(PAF_BIN))
+    spec = importlib.util.spec_from_loader("paf_cli_test_mod", loader)
+    assert spec is not None and spec.loader is not None
+    paf_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(paf_mod)
+
+    dep_repo = pathlib.Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-b", "main"], cwd=dep_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=dep_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=dep_repo, check=True)
+    step_log = dep_repo / "pipeline-steps.log"
+    (dep_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "commands": {
+                    "unit_test": [f"echo unit_test >> {step_log}"],
+                    "post_merge_check": [f"echo post_merge >> {step_log}"],
+                    "deploy": [f"echo deploy >> {step_log}"],
+                    "post_deploy_check": [f"echo post_deploy >> {step_log}"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", ".agent-verify.json"], cwd=dep_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init deploy repo"], cwd=dep_repo, check=True, capture_output=True)
+    dep_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=dep_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+
+    ok_full, tag_full = paf_mod.run_post_merge_and_deploy_checks(
+        dep_repo,
+        pr_url="https://example.test/pr/118",
+        base_branch="main",
+        merged_sha=dep_sha,
+        host_id="personal-mac",
+    )
+    seq_full = step_log.read_text(encoding="utf-8").splitlines() if step_log.is_file() else []
+
+    # Fallback check: when `deploy` is set without `post_deploy_check`, `post-deploy` still re-runs `post_merge_check`
+    step_log.unlink(missing_ok=True)
+    (dep_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "commands": {
+                    "unit_test": [f"echo unit_test >> {step_log}"],
+                    "post_merge_check": [f"echo post_merge >> {step_log}"],
+                    "deploy": [f"echo deploy >> {step_log}"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_fb, tag_fb = paf_mod.run_post_merge_and_deploy_checks(
+        dep_repo,
+        pr_url="https://example.test/pr/119",
+        base_branch="main",
+        merged_sha=dep_sha,
+        host_id="personal-mac",
+    )
+    seq_fb = step_log.read_text(encoding="utf-8").splitlines() if step_log.is_file() else []
+
+    # Host affinity check: `deploy_host` defers deploy when running on a different machine
+    step_log.unlink(missing_ok=True)
+    (dep_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "deploy_host": "prod-runner",
+                "commands": {
+                    "post_merge_check": [f"echo post_merge >> {step_log}"],
+                    "deploy": [f"echo deploy >> {step_log}"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_def, tag_def = paf_mod.run_post_merge_and_deploy_checks(
+        dep_repo,
+        pr_url="https://example.test/pr/120",
+        base_branch="main",
+        merged_sha=dep_sha,
+        host_id="personal-mac",
+    )
+    seq_def = step_log.read_text(encoding="utf-8").splitlines() if step_log.is_file() else []
+
+    # Failure check: post-deploy failure returns False so auto-revert triggers
+    (dep_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "commands": {
+                    "post_merge_check": ["true"],
+                    "deploy": ["true"],
+                    "post_deploy_check": ["false"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_fail, msg_fail = paf_mod.run_post_merge_and_deploy_checks(
+        dep_repo,
+        pr_url="https://example.test/pr/121",
+        base_branch="main",
+        merged_sha=dep_sha,
+        host_id="personal-mac",
+    )
+
+    if (
+        not ok_full
+        or tag_full != "shipped_and_verified"
+        or seq_full != ["post_merge", "deploy", "post_deploy"]
+        or not ok_fb
+        or tag_fb != "shipped_and_verified"
+        or seq_fb != ["post_merge", "deploy", "post_merge"]
+        or not ok_def
+        or tag_def != "shipped_deploy_deferred"
+        or seq_def != ["post_merge"]
+        or ok_fail
+        or "POST_DEPLOY_VERIFICATION_FAILED" not in msg_fail
+    ):
+        print(
+            f"FAIL deploy + post-deploy pipeline: full=({ok_full},{tag_full},{seq_full}) "
+            f"fb=({ok_fb},{tag_fb},{seq_fb}) def=({ok_def},{tag_def},{seq_def}) fail=({ok_fail},{msg_fail!r})"
+        )
+        failures += 1
+    else:
+        print("PASS post-merge -> deploy -> post-deploy re-test pipeline, fallback stage, deploy_host deferral, and failure gate")
+
+    # 23. Production merge_pr_in_process + GitHubBus.merge_pr + caller family anti-spoofing + ship/drive-consensus CLI gates
+    live_root = pathlib.Path(tempfile.mkdtemp(prefix="paf-live-merge-test-"))
+    bare_origin = live_root / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_origin)], check=True, capture_output=True)
+
+    live_repo = live_root / "work"
+    subprocess.run(["git", "clone", str(bare_origin), str(live_repo)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=live_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=live_repo, check=True)
+
+    live_log = live_root / "live_steps.log"
+    live_key_file = live_root / "consensus.key"
+    sys.path.insert(0, str(FACTORY_ROOT / "framework" / "scripts"))
+    import paf_watcher as pw_test  # type: ignore
+
+    pw_test.init_consensus_key(live_key_file)
+    live_secret = pw_test.load_consensus_secret(live_key_file)
+
+    def _write_live_cfg(zone_val: str) -> None:
+        (live_repo / ".agent-verify.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "zone": zone_val,
+                    "default_branch": "main",
+                    "staging_branches": ["staging"],
+                    "consensus": {"require_hmac": True, "max_rounds": 3},
+                    "commands": {
+                        "unit_test": ["true"],
+                        "post_merge_check": [f"echo post_merge >> {live_log}"],
+                        "deploy": [f"echo deploy >> {live_log}"],
+                        "post_deploy_check": [f"echo post_deploy >> {live_log}"],
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    _write_live_cfg("autonomous")
+    (live_repo / "mod.py").write_text("X = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".agent-verify.json", "mod.py"], cwd=live_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init main"], cwd=live_repo, check=True, capture_output=True)
+    subprocess.run(["git", "push", "-u", "origin", "main"], cwd=live_repo, check=True, capture_output=True)
+
+    subprocess.run(["git", "checkout", "-b", "feature/in-proc-merge"], cwd=live_repo, check=True, capture_output=True)
+    (live_repo / "mod.py").write_text("X = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "mod.py"], cwd=live_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "feature change"], cwd=live_repo, check=True, capture_output=True)
+    subprocess.run(["git", "push", "-u", "origin", "feature/in-proc-merge"], cwd=live_repo, check=True, capture_output=True)
+    feat_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=live_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+
+    # 23a. Caller family inference + anti-spoofing + `paf ship --consensus --dry-run` + NB1 `reviewDecision` gate
+    r_spoof_ship = run_paf(
+        ["ship", "--repo", str(live_repo), "--consensus", "--author-family", "claude", "--dry-run"],
+        cwd=live_repo,
+        extra_env={"AGY_CONVERSATION_ID": "agy-caller-123"},
+    )
+    r_spoof_post = run_paf(
+        [
+            "post-consensus",
+            "--repo",
+            str(live_repo),
+            "--pr",
+            "200",
+            "--pr-fixture",
+            str(auto_pr_fix),
+            "--role",
+            "reviewer",
+            "--family",
+            "gemini",
+            "--verdict",
+            "request_changes",
+            "--head-sha",
+            mul_sha,
+            "--blocking-count",
+            "1",
+        ],
+        cwd=live_repo,
+        extra_env={"CLAUDECODE": "1"},
+    )
+    r_infer_ship = run_paf(
+        ["ship", "--repo", str(live_repo), "--consensus", "--dry-run"],
+        cwd=live_repo,
+        extra_env={"AGY_CONVERSATION_ID": "agy-caller-123"},
+    )
+
+    pr_state_file = live_root / "mock_gh_pr.json"
+    auth_m_200 = {
+        "v": 1,
+        "role": "author",
+        "model_family": "gemini",
+        "verdict": "open",
+        "head_sha": feat_sha,
+        "host": pw_test.resolve_host_id(None),
+        "base_branch": "main",
+        "pr_number": 200,
+        "session_id": "agy-caller-123",
+    }
+    pw_test.sign_marker_in_place(auth_m_200, live_secret, key_file=live_key_file, require_hmac=True)
+    rev_m_200 = {
+        "v": 1,
+        "role": "reviewer",
+        "model_family": "claude",
+        "verdict": "approve",
+        "head_sha": feat_sha,
+        "round": 1,
+        "blocking_count": 0,
+        "needs_human_decision": False,
+        "host": pw_test.resolve_host_id(None),
+        "base_branch": "main",
+        "pr_number": 200,
+        "session_id": "22222222-2222-2222-2222-222222222222",
+    }
+    pw_test.sign_marker_in_place(rev_m_200, live_secret, key_file=live_key_file, require_hmac=True)
+
+    def _write_pr_state(rev_decision: str = "", comments_list: list[dict] | None = None) -> None:
+        pr_state_file.write_text(
+            json.dumps(
+                {
+                    "number": 200,
+                    "url": "https://example.test/pr/200",
+                    "state": "OPEN",
+                    "headRefName": "feature/in-proc-merge",
+                    "baseRefName": "main",
+                    "headRefOid": feat_sha,
+                    "body": f"Feature\n\n<!-- paf-consensus: {json.dumps(auth_m_200, separators=(',', ':'))} -->",
+                    "comments": comments_list
+                    if comments_list is not None
+                    else [{"body": f"Approved.\n\n<!-- paf-consensus: {json.dumps(rev_m_200, separators=(',', ':'))} -->"}],
+                    "files": [{"path": "mod.py"}],
+                    "changedFiles": 1,
+                    "reviewDecision": rev_decision,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _set_committed_live_zone(zone_val: str) -> str:
+        _write_live_cfg(zone_val)
+        subprocess.run(["git", "add", ".agent-verify.json"], cwd=live_repo, check=True)
+        subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=live_repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "push", "-f", "origin", "feature/in-proc-merge"],
+            cwd=live_repo,
+            check=True,
+            capture_output=True,
+        )
+        sha_now = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=live_repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+        auth_m_200["head_sha"] = sha_now
+        auth_m_200.pop("sig", None)
+        auth_m_200.pop("key_id", None)
+        pw_test.sign_marker_in_place(auth_m_200, live_secret, key_file=live_key_file, require_hmac=True)
+        rev_m_200["head_sha"] = sha_now
+        rev_m_200.pop("sig", None)
+        rev_m_200.pop("key_id", None)
+        pw_test.sign_marker_in_place(rev_m_200, live_secret, key_file=live_key_file, require_hmac=True)
+        return sha_now
+
+    # NB1: guarded REVIEW_REQUIRED and any CHANGES_REQUESTED block `paf ship --consensus --dry-run`
+    feat_sha = _set_committed_live_zone("guarded")
+    _write_pr_state(rev_decision="REVIEW_REQUIRED")
+    r_guarded_rev_req = run_paf(
+        [
+            "ship",
+            "--repo",
+            str(live_repo),
+            "--pr-fixture",
+            str(pr_state_file),
+            "--consensus",
+            "--author-family",
+            "gemini",
+            "--dry-run",
+        ],
+        cwd=live_repo,
+    )
+    feat_sha = _set_committed_live_zone("autonomous")
+    _write_pr_state(rev_decision="CHANGES_REQUESTED")
+    r_changes_req = run_paf(
+        [
+            "ship",
+            "--repo",
+            str(live_repo),
+            "--pr-fixture",
+            str(pr_state_file),
+            "--consensus",
+            "--author-family",
+            "gemini",
+            "--dry-run",
+        ],
+        cwd=live_repo,
+    )
+
+    # 23b. Mock `gh` binary to exercise `merge_pr_in_process`, `GitHubBus.merge_pr`, and `paf drive-consensus`
+    mock_gh_dir = live_root / "mock_bin"
+    mock_gh_dir.mkdir(parents=True, exist_ok=True)
+    mock_gh = mock_gh_dir / "gh"
+    mock_gh.write_text(
+        f"""#!/usr/bin/env python3
+import json, pathlib, subprocess, sys
+args = sys.argv[1:]
+pr_file = pathlib.Path({str(pr_state_file)!r})
+bare = pathlib.Path({str(bare_origin)!r})
+slog = pathlib.Path({str(live_log)!r})
+if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+    print(json.dumps([{{"name": "verify", "state": "SUCCESS", "bucket": "pass", "link": "https://example.test/c/1"}}]))
+    sys.exit(0)
+if len(args) >= 2 and args[0] == "pr" and args[1] == "view":
+    if not pr_file.is_file():
+        sys.stderr.write("no pull requests found\\n")
+        sys.exit(1)
+    data = json.loads(pr_file.read_text(encoding="utf-8"))
+    print(json.dumps(data))
+    sys.exit(0)
+if len(args) >= 2 and args[0] == "pr" and args[1] == "merge":
+    assert "--squash" in args and "--match-head-commit" in args, f"Unexpected gh pr merge args: {{args}}"
+    exp_sha = args[args.index("--match-head-commit") + 1]
+    data = json.loads(pr_file.read_text(encoding="utf-8"))
+    assert data["headRefOid"] == exp_sha, f"SHA mismatch: {{data['headRefOid']}} vs {{exp_sha}}"
+    subprocess.run(["/usr/bin/git", "--git-dir", str(bare), "update-ref", "refs/heads/main", exp_sha], check=True)
+    data["state"] = "MERGED"
+    data["mergeCommit"] = {{"oid": exp_sha}}
+    pr_file.write_text(json.dumps(data), encoding="utf-8")
+    with slog.open("a", encoding="utf-8") as fh:
+        fh.write("gh_pr_merge\\n")
+    sys.exit(0)
+sys.stderr.write(f"unhandled mock gh args: {{args}}\\n")
+sys.exit(1)
+""",
+        encoding="utf-8",
+    )
+    mock_gh.chmod(0o755)
+
+    old_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{mock_gh_dir}:{old_path}"
+    try:
+        # `paf drive-consensus` missing PR -> rc == 1; caller family spoofing -> rc == 2
+        pr_state_file.unlink(missing_ok=True)
+        r_drv_missing = run_paf(
+            ["drive-consensus", "--repo", str(live_repo), "--author-family", "gemini"],
+            cwd=live_repo,
+            extra_env={"PATH": os.environ["PATH"], "PAF_CONSENSUS_KEY_FILE": str(live_key_file)},
+        )
+        r_drv_spoof = run_paf(
+            ["drive-consensus", "--repo", str(live_repo), "--pr", "200", "--author-family", "gemini"],
+            cwd=live_repo,
+            extra_env={
+                "PATH": os.environ["PATH"],
+                "CLAUDE_SESSION_ID": "11111111-1111-1111-1111-111111111111",
+            },
+        )
+
+        # `merge_pr_in_process` blocks on REVIEW_REQUIRED
+        _write_pr_state(rev_decision="REVIEW_REQUIRED")
+        rc_rr, tag_rr = paf_mod.merge_pr_in_process(
+            repo=live_repo,
+            pr_number=200,
+            key_file=live_key_file,
+            require_hmac=True,
+        )
+
+        # `merge_pr_in_process` returns (4, "paused_tiebreak") and `paf drive-consensus` returns rc == 4 on paused_human_tiebreak
+        nh_m = dict(rev_m_200, verdict="request_changes", blocking_count=1, needs_human_decision=True)
+        nh_m.pop("sig", None)
+        nh_m.pop("key_id", None)
+        pw_test.sign_marker_in_place(nh_m, live_secret, key_file=live_key_file, require_hmac=True)
+        _write_pr_state(
+            rev_decision="",
+            comments_list=[{"body": f"Needs decision.\n\n<!-- paf-consensus: {json.dumps(nh_m, separators=(',', ':'))} -->"}],
+        )
+        rc_tb, tag_tb = paf_mod.merge_pr_in_process(
+            repo=live_repo,
+            pr_number=200,
+            key_file=live_key_file,
+            require_hmac=True,
+        )
+        r_drv_tiebreak = run_paf(
+            [
+                "drive-consensus",
+                "--repo",
+                str(live_repo),
+                "--pr",
+                "200",
+                "--author-family",
+                "gemini",
+                "--state-dir",
+                str(live_root / "st_tb"),
+                "--key-file",
+                str(live_key_file),
+            ],
+            cwd=live_repo,
+            extra_env={"PATH": os.environ["PATH"]},
+        )
+
+        # Guarded `main` pauses cleanly via both `GitHubBus.merge_pr` and `paf drive-consensus` (`rc == 0`)
+        _write_live_cfg("guarded")
+        _write_pr_state(rev_decision="")
+        live_bus = pw_test.GitHubBus(live_repo, PAF_BIN, key_file=live_key_file)
+        ok_g_pause, reason_g_pause = live_bus.merge_pr(
+            200,
+            require_hmac=True,
+            key_file=live_key_file,
+            on_merged_callback=lambda: None,
+        )
+        r_drv_paused_main = run_paf(
+            [
+                "drive-consensus",
+                "--repo",
+                str(live_repo),
+                "--pr",
+                "200",
+                "--author-family",
+                "gemini",
+                "--state-dir",
+                str(live_root / "st_pm"),
+                "--key-file",
+                str(live_key_file),
+                "--json",
+            ],
+            cwd=live_repo,
+            extra_env={"PATH": os.environ["PATH"]},
+        )
+        drv_pm_json = json.loads(r_drv_paused_main.stdout) if r_drv_paused_main.stdout.strip().startswith("{") else {}
+
+        # Autonomous `main` merges in-process via `GitHubBus.merge_pr`, fires `on_merged_callback` BEFORE post-merge/deploy!
+        _write_live_cfg("autonomous")
+        subprocess.run(["git", "add", ".agent-verify.json"], cwd=live_repo, check=True)
+        subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=live_repo, check=True, capture_output=True)
+        subprocess.run(["git", "push", "-f", "origin", "feature/in-proc-merge"], cwd=live_repo, check=True, capture_output=True)
+        feat_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=live_repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+        auth_m_200["head_sha"] = feat_sha
+        auth_m_200.pop("sig", None)
+        auth_m_200.pop("key_id", None)
+        pw_test.sign_marker_in_place(auth_m_200, live_secret, key_file=live_key_file, require_hmac=True)
+        rev_m_200["head_sha"] = feat_sha
+        rev_m_200.pop("sig", None)
+        rev_m_200.pop("key_id", None)
+        pw_test.sign_marker_in_place(rev_m_200, live_secret, key_file=live_key_file, require_hmac=True)
+        _write_pr_state(rev_decision="")
+        live_log.unlink(missing_ok=True)
+
+        def _live_close_cb() -> None:
+            with live_log.open("a", encoding="utf-8") as fh:
+                fh.write("sessions_closed\n")
+
+        ok_live_merge, reason_live_merge = live_bus.merge_pr(
+            200,
+            require_hmac=True,
+            key_file=live_key_file,
+            host_id=pw_test.resolve_host_id(None),
+            on_merged_callback=_live_close_cb,
+        )
+        live_seq = live_log.read_text(encoding="utf-8").splitlines() if live_log.is_file() else []
+    finally:
+        os.environ["PATH"] = old_path
+
+    if (
+        r_spoof_ship.returncode != 2
+        or "family_mismatch" not in r_spoof_ship.stderr
+        or r_spoof_post.returncode != 2
+        or "family_mismatch" not in r_spoof_post.stderr
+        or r_infer_ship.returncode != 0
+        or "DRY_RUN_DRIVE_CONSENSUS_READY" not in r_infer_ship.stdout
+        or "author=gemini" not in r_infer_ship.stdout
+        or r_guarded_rev_req.returncode != 2
+        or r_changes_req.returncode != 2
+        or r_drv_missing.returncode != 1
+        or r_drv_spoof.returncode != 2
+        or rc_rr != 2
+        or not tag_rr.startswith("human_review_required")
+        or rc_tb != 4
+        or tag_tb != "paused_tiebreak"
+        or r_drv_tiebreak.returncode != 4
+        or ok_g_pause is not False
+        or reason_g_pause != "paused"
+        or r_drv_paused_main.returncode != 0
+        or drv_pm_json.get("status") != "paused_main_approval"
+        or ok_live_merge is not True
+        or reason_live_merge != "merged"
+        or live_seq != ["gh_pr_merge", "sessions_closed", "post_merge", "deploy", "post_deploy"]
+    ):
+        print(
+            f"FAIL 24 production merge_pr_in_process / CLI gates:\n"
+            f"  spoof_ship=({r_spoof_ship.returncode},{r_spoof_ship.stderr.strip()!r}) "
+            f"spoof_post=({r_spoof_post.returncode},{r_spoof_post.stderr.strip()!r})\n"
+            f"  infer_ship=({r_infer_ship.returncode},{r_infer_ship.stdout.strip()!r})\n"
+            f"  rev_req_rc={r_guarded_rev_req.returncode} chg_req_rc={r_changes_req.returncode}\n"
+            f"  drv_missing={r_drv_missing.returncode} drv_spoof={r_drv_spoof.returncode} "
+            f"rc_rr=({rc_rr},{tag_rr}) rc_tb=({rc_tb},{tag_tb}) drv_tb={r_drv_tiebreak.returncode}\n"
+            f"  g_pause=({ok_g_pause},{reason_g_pause}) drv_pm=({r_drv_paused_main.returncode},{drv_pm_json})\n"
+            f"  live_merge=({ok_live_merge},{reason_live_merge}) seq={live_seq}"
+        )
+        failures += 1
+    else:
+        print("PASS 24 verifies merge_pr_in_process, GitHubBus.merge_pr callback order, caller anti-spoofing, and drive-consensus CLI")
+
+    # 25. Governance gate on the `paf ship` path (Leo, 2026-11-16): consensus alone merges a governance PR; a
     #     single-model blind receipt, an author-only marker, or a PR that strips `governance_requires_human` still pauses
     gs_repo = pathlib.Path(tempfile.mkdtemp())
     subprocess.run(["git", "init", "-b", "main"], cwd=gs_repo, check=True, capture_output=True)

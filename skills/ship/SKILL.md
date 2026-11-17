@@ -7,15 +7,19 @@ description: Ship a verified feature branch through Cross-Model PR Consensus and
 
 Use this skill after committing changes on a feature branch (never on `main`/`master`) with a clean working tree.
 
-## Standing General Rule: Auto-Merge Upon Dual-Model Consensus
+## Standing General Rule: End-to-End Persistent-Session Consensus, Merge, Teardown & Post-Deploy Test
 
-1. Every PR goes through **heterogeneous dual-model review** (`claude` <-> `gemini`) directly via SHA-pinned GitHub PR comments (`<!-- paf-consensus: {...} -->`).
-2. **Once heterogeneous consensus (`verdict: "approve"` on the latest `headRefOid`) and GitHub Actions CI pass, merge immediately yourself — NEVER ask Leo to press merge** for normal code PRs in `zone: "autonomous"` repos or on `zone: "guarded"` branches explicitly allowlisted in `staging_branches` (`staging`, `stage_test`).
-   - If a sibling PR landed on `main` first and `paf merge-consensus` fails closed on a base conflict, rebuild the branch onto `origin/main` and re-verify tests + CI; because the rebuilt branch has a new `headRefOid`, obtain a fresh SHA-pinned `approve` on the new SHA (e.g. via `git range-diff`) before merging.
+1. Every PR runs the **five-step synchronous consensus pipeline** (`paf ship --consensus` / `paf drive-consensus`):
+   - **Open PR** after passing `paf verify --mode pre-push`.
+   - **Call the opposite model family (`claude` <-> `gemini`) and discuss back and forth**, keeping each of the two models in its **same persistent session** across all rounds (`--session-id` / `--resume` for `claude`, `--conversation` for `agy`).
+   - **Merge immediately upon SHA-pinned `approve` consensus + green CI** (`gh pr merge --squash --match-head-commit <SHA>`) — **NEVER ask Leo to confirm governance files or press merge** in `zone: "autonomous"` repos or on `zone: "guarded"` `staging_branches` (`staging`, `stage_test`). Governance, rule, `bin/paf`, hook, and skill changes are confirmed directly by the heterogeneous peer model.
+   - **Close and clean up both model sessions** immediately upon merge (removing temporary session transcripts and PR worktrees).
+   - **Run `post_merge_check`, and if `deploy` (`commands.deploy` or `deploy_workflows`) is configured, execute `deploy` and then test again (`post_deploy_check`)**, auto-reverting on regression.
+2. If a sibling PR landed on `main` first and `paf merge-consensus` fails closed on a base conflict, rebuild the branch onto `origin/main` and re-verify tests + CI; because the rebuilt branch has a new `headRefOid`, obtain a fresh SHA-pinned `approve` on the new SHA before merging.
 3. Escalate / pause for Leo ONLY when:
    - Consensus exceeds `max_rounds` (default `3`) without approval (`PAUSED_FOR_CONSENSUS_TIEBREAK`),
    - A product/UX preference trade-off requires his call (`--needs-human-decision`),
-   - A PR modifies governance or permission-granting files (`CORE.md`, `AGENTS.md`, `CLAUDE.md`, `PERMISSIONS.md`, `FEEDBACK.md`, `.agent-verify.json`, `bin/paf`, hooks, workflows, `launchd/`, `DailyJob/`, skills) WITHOUT verified dual-model consensus, or the repo sets `"governance_requires_human": true` -> pauses at `PAUSED_FOR_GOVERNANCE_APPROVAL` until `--approved-governance` (with consensus + green CI, governance PRs merge like any other PR; Leo, 2026-11-16 — the PR description must state plainly which rule or permission changed so Leo can see it afterwards; `governance_requires_human` is read from the base branch, so a PR cannot remove its own gate), or
+   - A PR modifies governance or permission-granting files (`CORE.md`, `AGENTS.md`, `CLAUDE.md`, `PERMISSIONS.md`, `FEEDBACK.md`, `.agent-verify.json`, `bin/paf`, hooks, workflows, `launchd/`, `DailyJob/`, skills) WITHOUT verified dual-model consensus, or the repo sets `"governance_requires_human": true` on the base branch -> pauses at `PAUSED_FOR_GOVERNANCE_APPROVAL` until `--approved-governance` (with dual-model consensus + green CI, governance PRs merge directly like any other PR; Leo, 2026-11-16 — the PR description must state plainly which rule or permission changed so Leo can see it afterwards; `governance_requires_human` is read from the base branch, so a PR cannot strip its own gate), or
    - `zone: "guarded"` targets any branch outside `staging_branches` (`main`, `master`, `release/*`) -> pauses at `PAUSED_FOR_MAIN_APPROVAL` until `--approved-main` (and always yields to required human colleague reviews and any stricter workspace `CLAUDE.md` rule).
 
 ## Trust Boundaries & Marker Semantics
@@ -28,20 +32,14 @@ Use this skill after committing changes on a feature branch (never on `main`/`ma
 
 ## Commands
 
-1. **Author Model — Verify & Open/Update PR for Cross-Model Consensus**:
+1. **Primary End-to-End Pipeline (Verify -> Open PR -> Persistent 2-Session Discussion -> Merge -> Close Both Sessions -> Deploy & Post-Deploy Test)**:
    ```bash
-   paf ship --repo . --open-for-consensus --author-family <claude|gemini> \
+   paf ship --repo . --consensus --author-family <claude|gemini> \
      --title "[scope] Concise English summary" --body "Context and test evidence"
    ```
-2. **Reviewer Model (Heterogeneous Family) — Post SHA-Pinned Verdict & Auto-Merge on Approve**:
+2. **Drive Persistent-Session Consensus Loop on an Existing Open PR**:
    ```bash
-   # Request changes during round 1..3 (--head-sha is required for reviewers):
-   paf post-consensus --repo . --pr <num> --role reviewer --family <gemini|claude> \
-     --head-sha <reviewed_sha> --verdict request_changes --round 1 --body-file review.md
-
-   # Approve and immediately run CI wait + atomic --match-head-commit merge + post-merge verify:
-   paf post-consensus --repo . --pr <num> --role reviewer --family <gemini|claude> \
-     --head-sha <reviewed_sha> --verdict approve --round 2 --body-file approve.md --auto-merge
+   paf drive-consensus --repo . --pr <num> --author-family <claude|gemini>
    ```
 3. **Check or Resume Merge on an Already-Approved Consensus PR**:
    ```bash

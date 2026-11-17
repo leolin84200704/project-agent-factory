@@ -11,6 +11,7 @@ Commands:
   paf check-consensus  Verify SHA-pinned heterogeneous dual-model consensus (`<!-- paf-consensus: ... -->`) on a PR
   paf post-consensus   Post a SHA-pinned consensus marker comment on a PR (and optionally auto-merge on approve)
   paf merge-consensus  Atomically merge a PR once heterogeneous dual-model consensus + CI pass, then verify post-merge
+  paf drive-consensus  Drive persistent two-session PR consensus, auto-merge, session close, and post-deploy check
   paf init-consensus-key  Provision or rotate the 0600 local HMAC-SHA256 shared key (`~/.config/paf/consensus.key`)
   paf watch-prs        ETag/state-driven cross-model PR consensus reviewer, claim coordinator, and auto-merger
   paf install-watcher  Generate (and optionally load) macOS launchd StartInterval plist for `paf watch-prs`
@@ -22,6 +23,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import importlib.util
@@ -34,7 +36,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 FACTORY_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_SCORING_PATH = FACTORY_ROOT / "framework" / "scripts" / "memory_scoring.py"
@@ -84,6 +86,43 @@ def _resolve_session_id(cli_session_id: str | None = None) -> str:
         if val:
             return val
     return ""
+
+
+def _infer_caller_family() -> str:
+    has_agy = bool(os.environ.get("AGY_CONVERSATION_ID", "").strip())
+    has_claude = bool(
+        os.environ.get("CLAUDE_SESSION_ID", "").strip()
+        or os.environ.get("CLAUDECODE", "").strip()
+    )
+    if has_agy and not has_claude:
+        return "gemini"
+    if has_claude and not has_agy:
+        return "claude"
+    explicit = os.environ.get("PAF_AUTHOR_FAMILY", "").strip().lower()
+    if explicit in ("claude", "gemini", "openai"):
+        return explicit
+    return ""
+
+
+def _validate_claimed_family(claimed_family: str | None, subcmd: str) -> bool:
+    if not claimed_family or not claimed_family.strip():
+        return True
+    norm_claimed = _normalize_family(claimed_family)
+    if not norm_claimed:
+        print(
+            f"paf {subcmd} REFUSED: unrecognized family '{claimed_family}' (expected claude, gemini, or openai).",
+            file=sys.stderr,
+        )
+        return False
+    inferred = _infer_caller_family()
+    if inferred and inferred != norm_claimed:
+        print(
+            f"paf {subcmd} REFUSED (family_mismatch): caller environment belongs to '{inferred}', "
+            f"cannot claim '{norm_claimed}'.",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -392,6 +431,31 @@ def execute_verify(
                     steps.append(step)
                     if not step["passed"]:
                         break
+    elif mode == "deploy":
+        deploy_cmds = commands_cfg.get("deploy") or []
+        for cmd in deploy_cmds:
+            step = _run_shell_step(repo, "deploy", cmd)
+            steps.append(step)
+            if not step["passed"]:
+                break
+    elif mode == "post-deploy":
+        post_deploy_cmds = commands_cfg.get("post_deploy_check") or []
+        if post_deploy_cmds:
+            for cmd in post_deploy_cmds:
+                step = _run_shell_step(repo, "post_deploy_check", cmd)
+                steps.append(step)
+                if not step["passed"]:
+                    break
+        else:
+            for fallback_stage in ("post_merge_check", "boot_smoke", "unit_test"):
+                fb_cmds = commands_cfg.get(fallback_stage) or []
+                if fb_cmds:
+                    for cmd in fb_cmds:
+                        step = _run_shell_step(repo, f"post_deploy:{fallback_stage}", cmd)
+                        steps.append(step)
+                        if not step["passed"]:
+                            break
+                    break
     else:
         raise ValueError(f"Unsupported verify mode: {mode}")
 
@@ -1222,6 +1286,131 @@ def _load_pr_data(repo: Path, pr_ref: str | None, pr_fixture: Path | None = None
     return json.loads(proc.stdout)
 
 
+def _wait_for_deploy_workflows(
+    repo: Path,
+    merged_sha: str,
+    workflow_names: list[str],
+    max_wait_sec: int = 900,
+) -> tuple[bool, str]:
+    deadline = time.time() + max_wait_sec
+    targets = {w.strip().lower() for w in workflow_names if w.strip()}
+    if not targets:
+        return True, "No deploy_workflows configured."
+    while time.time() < deadline:
+        proc = subprocess.run(
+            [
+                "gh",
+                "run",
+                "list",
+                "--commit",
+                merged_sha,
+                "--json",
+                "name,workflowName,status,conclusion,url",
+            ],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip().startswith("["):
+            runs = json.loads(proc.stdout)
+            matched = [
+                r
+                for r in runs
+                if isinstance(r, dict)
+                and (
+                    str(r.get("workflowName") or "").strip().lower() in targets
+                    or str(r.get("name") or "").strip().lower() in targets
+                )
+            ]
+            if matched:
+                pending = [r for r in matched if str(r.get("status") or "").lower() != "completed"]
+                failed = [
+                    r
+                    for r in matched
+                    if str(r.get("status") or "").lower() == "completed"
+                    and str(r.get("conclusion") or "").lower() not in ("success", "neutral", "skipped")
+                ]
+                if failed:
+                    return False, f"Deploy workflow failed: {failed[0]}"
+                if not pending:
+                    return True, f"All {len(matched)} deploy workflow(s) succeeded for {merged_sha[:12]}."
+        time.sleep(8)
+    return False, f"Timed out waiting {max_wait_sec}s for deploy_workflows on {merged_sha[:12]}."
+
+
+def run_post_merge_and_deploy_checks(
+    post_repo: Path,
+    *,
+    pr_url: str,
+    base_branch: str,
+    merged_sha: str,
+    host_id: str | None = None,
+) -> tuple[bool, str]:
+    cfg = _load_verify_config(post_repo)
+    commands_cfg = cfg.get("commands") or {}
+
+    try:
+        post_ok, _post_rep, post_json, _post_md = execute_verify(post_repo, mode="post-merge")
+    except Exception as exc:
+        return False, f"POST_MERGE_VERIFICATION_ERROR: {exc}"
+    if not post_ok:
+        return (
+            False,
+            f"POST_MERGE_VERIFICATION_FAILED on {base_branch}@{merged_sha[:12]}! Artifact: {post_json}",
+        )
+
+    deploy_cmds = commands_cfg.get("deploy") or []
+    raw_deploy_wf = cfg.get("deploy_workflows") or []
+    deploy_workflows = (
+        [str(w).strip() for w in raw_deploy_wf if str(w).strip()]
+        if isinstance(raw_deploy_wf, list)
+        else []
+    )
+    deploy_host = str(cfg.get("deploy_host") or "").strip().lower()
+    eff_host = (host_id or _watcher_mod().resolve_host_id(None)).strip().lower()
+
+    if deploy_cmds or deploy_workflows:
+        if deploy_host and deploy_host != eff_host:
+            print(
+                f"DEPLOY_DEFERRED_TO_HOST: configured deploy_host='{deploy_host}' != current host='{eff_host}' "
+                f"(post-merge checks passed on {base_branch}@{merged_sha[:12]})."
+            )
+            print(f"SHIPPED_AND_VERIFIED: {pr_url} -> {base_branch}@{merged_sha[:12]}")
+            return True, "shipped_deploy_deferred"
+
+        if deploy_cmds:
+            try:
+                dep_ok, _dep_rep, dep_json, _dep_md = execute_verify(post_repo, mode="deploy")
+            except Exception as exc:
+                return False, f"DEPLOY_ERROR on {base_branch}@{merged_sha[:12]}: {exc}"
+            if not dep_ok:
+                return (
+                    False,
+                    f"DEPLOY_FAILED on {base_branch}@{merged_sha[:12]}! Artifact: {dep_json}",
+                )
+
+        if deploy_workflows:
+            wf_ok, wf_msg = _wait_for_deploy_workflows(post_repo, merged_sha, deploy_workflows)
+            print(wf_msg)
+            if not wf_ok:
+                return False, f"DEPLOY_WORKFLOW_FAILED on {base_branch}@{merged_sha[:12]}: {wf_msg}"
+
+        try:
+            pd_ok, _pd_rep, pd_json, _pd_md = execute_verify(post_repo, mode="post-deploy")
+        except Exception as exc:
+            return False, f"POST_DEPLOY_VERIFICATION_ERROR on {base_branch}@{merged_sha[:12]}: {exc}"
+        if not pd_ok:
+            return (
+                False,
+                f"POST_DEPLOY_VERIFICATION_FAILED on {base_branch}@{merged_sha[:12]}! Artifact: {pd_json}",
+            )
+        print(f"DEPLOYED_AND_VERIFIED: {pr_url} -> {base_branch}@{merged_sha[:12]}")
+
+    print(f"SHIPPED_AND_VERIFIED: {pr_url} -> {base_branch}@{merged_sha[:12]}")
+    return True, "shipped_and_verified"
+
+
 def _merge_and_verify_pr(
     repo: Path,
     *,
@@ -1232,6 +1421,8 @@ def _merge_and_verify_pr(
     base_branch: str,
     max_wait_ci: int,
     no_auto_revert: bool,
+    host_id: str | None = None,
+    on_merged_callback: Callable[[], None] | None = None,
 ) -> int:
     print(f"Waiting for CI checks on PR #{pr_number} ({pr_url}) ...")
     ci_ok, ci_msg = _wait_for_pr_checks(repo, pr_number, head_sha, max_wait_sec=max_wait_ci)
@@ -1267,6 +1458,9 @@ def _merge_and_verify_pr(
 
     if branch and branch not in (base_branch, "main", "master"):
         _git(repo, "push", "origin", "--delete", branch, check=False)
+
+    if on_merged_callback is not None:
+        on_merged_callback()
 
     _git(repo, "fetch", "origin", base_branch, check=True)
     merged_sha = ""
@@ -1309,25 +1503,23 @@ def _merge_and_verify_pr(
         post_repo = wt_tmp
         cleanup_wt = wt_tmp
 
-    post_json: Path | None = None
     try:
-        post_ok, _post_report, post_json, _post_md = execute_verify(post_repo, mode="post-merge")
-    except Exception as exc:
-        print(f"POST_MERGE_VERIFICATION_ERROR: {exc}", file=sys.stderr)
-        post_ok = False
+        checks_ok, checks_msg = run_post_merge_and_deploy_checks(
+            post_repo,
+            pr_url=pr_url,
+            base_branch=base_branch,
+            merged_sha=merged_sha,
+            host_id=host_id,
+        )
     finally:
         if cleanup_wt is not None:
             _git(repo, "worktree", "remove", "--force", str(cleanup_wt), check=False)
             shutil.rmtree(cleanup_wt, ignore_errors=True)
 
-    if post_ok:
-        print(f"SHIPPED_AND_VERIFIED: {pr_url} -> {base_branch}@{merged_sha[:12]}")
+    if checks_ok:
         return 0
 
-    print(
-        f"POST_MERGE_VERIFICATION_FAILED on {base_branch}@{merged_sha[:12]}! Artifact: {post_json}",
-        file=sys.stderr,
-    )
+    print(checks_msg, file=sys.stderr)
     if not no_auto_revert:
         rev_ok, rev_msg = _auto_revert_merge(repo, base_branch, merged_sha)
         print(rev_msg, file=sys.stderr)
@@ -1484,7 +1676,103 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
         base_branch=base_branch,
         max_wait_ci=args.max_wait_ci,
         no_auto_revert=args.no_auto_revert,
+        host_id=pw.resolve_host_id(getattr(args, "host", None)),
     )
+
+
+def merge_pr_in_process(
+    *,
+    repo: Path,
+    pr_number: int,
+    key_file: Path | None = None,
+    require_hmac: bool = False,
+    allow_same_family_fallback: bool = False,
+    approved_main: bool = False,
+    approved_governance: bool = False,
+    max_wait_ci: int = 600,
+    no_auto_revert: bool = False,
+    host_id: str | None = None,
+    on_merged_callback: Callable[[], None] | None = None,
+) -> tuple[int, str]:
+    repo = repo.expanduser().resolve()
+    cfg = _load_verify_config(repo)
+    zone = str(cfg["zone"])
+    default_branch = str(cfg.get("default_branch", "main"))
+    staging_branches = _resolve_staging_branches(cfg)
+    consensus_cfg = cfg.get("consensus") or {}
+    max_rounds = _resolve_max_rounds(None, consensus_cfg)
+    pw = _watcher_mod()
+    hmac_secret = pw.load_consensus_secret(key_file)
+    eff_req_hmac = bool(require_hmac or consensus_cfg.get("require_hmac", False))
+    eff_allow_fb = bool(allow_same_family_fallback or consensus_cfg.get("allow_same_family_fallback", False))
+
+    pr_data = _load_pr_data(repo, str(pr_number), None)
+    if str(pr_data.get("state") or "").upper() != "OPEN":
+        return 1, f"pr_state={pr_data.get('state')}"
+
+    review_decision = str(pr_data.get("reviewDecision") or "").strip().upper()
+    if review_decision in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+        print(
+            f"paf merge-consensus BLOCKED (human_review_required): GitHub reviewDecision is '{review_decision}' — "
+            "model consensus does not replace required human colleague review.",
+            file=sys.stderr,
+        )
+        return 2, f"human_review_required:{review_decision}"
+
+    verdict = evaluate_pr_consensus(
+        pr_data,
+        author_family_override=None,
+        max_rounds=max_rounds,
+        hmac_secret=hmac_secret,
+        require_hmac=eff_req_hmac,
+        allow_same_family_fallback=eff_allow_fb,
+    )
+    if verdict["status"] == "paused_human_tiebreak":
+        print(f"PAUSED_FOR_CONSENSUS_TIEBREAK: {verdict['reason']}", file=sys.stderr)
+        return 4, "paused_tiebreak"
+    if verdict["status"] != "approved":
+        return 2, f"{verdict['status']}: {verdict['reason']}"
+
+    head_sha = str(pr_data["headRefOid"])
+    base_branch = str(pr_data.get("baseRefName") or default_branch)
+    branch = str(pr_data.get("headRefName") or "")
+    pr_url = str(pr_data.get("url") or f"PR#{pr_number}")
+    requires_human_merge_approval = zone == "guarded" and base_branch not in staging_branches
+    gov_files = _governance_files_touched(repo, pr_data, base_branch)
+    gov_ns = argparse.Namespace(approved_governance=approved_governance, approved_main=approved_main)
+
+    if requires_human_merge_approval and not approved_main:
+        print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (base={base_branch} head={head_sha})")
+        print(
+            f"Dual-model consensus is complete. Once Leo replies 'approve' (and any stricter workspace rule is met), resume via:\n"
+            f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-main"
+        )
+        return 0, "paused"
+
+    if _governance_needs_human(repo, base_branch, cfg, gov_files, gov_ns, consensus_approved=True):
+        print(
+            f"PAUSED_FOR_GOVERNANCE_APPROVAL: {pr_url} (head={head_sha}) modifies governance/permission files: "
+            f"{', '.join(gov_files)}"
+        )
+        print(
+            f"Once Leo confirms this rule/permission change, resume via:\n"
+            f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-governance"
+        )
+        return 0, "paused_governance"
+
+    rc = _merge_and_verify_pr(
+        repo,
+        pr_number=pr_number,
+        pr_url=pr_url,
+        head_sha=head_sha,
+        branch=branch,
+        base_branch=base_branch,
+        max_wait_ci=max_wait_ci,
+        no_auto_revert=no_auto_revert,
+        host_id=host_id,
+        on_merged_callback=on_merged_callback,
+    )
+    return (0, "merged") if rc == 0 else (rc, f"merge_or_post_verify_rc={rc}")
 
 
 def cmd_post_consensus(args: argparse.Namespace) -> int:
@@ -1495,6 +1783,8 @@ def cmd_post_consensus(args: argparse.Namespace) -> int:
             "paf post-consensus REFUSED: unrecognized --family (expected claude, gemini, or openai).",
             file=sys.stderr,
         )
+        return 2
+    if not _validate_claimed_family(args.family, "post-consensus"):
         return 2
 
     if args.role == "reviewer" and not args.head_sha:
@@ -1645,7 +1935,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
     base_branch = str(args.base or default_branch)
     require_blind = bool(cfg.get("require_blind_review", True))
     consensus_cfg = cfg.get("consensus") or {}
-    max_rounds = _resolve_max_rounds(None, consensus_cfg)
+    max_rounds = _resolve_max_rounds(getattr(args, "max_rounds", None), consensus_cfg)
     pw = _watcher_mod()
     try:
         hmac_secret = pw.load_consensus_secret(getattr(args, "key_file", None))
@@ -1653,9 +1943,14 @@ def cmd_ship(args: argparse.Namespace) -> int:
         print(f"paf ship ERROR: {exc}", file=sys.stderr)
         return 1
     require_hmac = bool(consensus_cfg.get("require_hmac", False))
-    allow_fb = bool(consensus_cfg.get("allow_same_family_fallback", False))
+    allow_fb = bool(
+        getattr(args, "allow_same_family_fallback", False)
+        or consensus_cfg.get("allow_same_family_fallback", False)
+    )
     host_id = pw.resolve_host_id(getattr(args, "host", None))
     session_id = _resolve_session_id(getattr(args, "session_id", None))
+    drive_consensus = bool(getattr(args, "consensus", False) or getattr(args, "drive_consensus", False))
+    open_or_drive_consensus = bool(args.open_for_consensus or drive_consensus)
 
     branch = _git_branch(repo)
     if branch in (default_branch, "main", "master", "HEAD", "unknown"):
@@ -1697,7 +1992,9 @@ def cmd_ship(args: argparse.Namespace) -> int:
     )
 
     requires_human_merge_approval = zone == "guarded" and base_branch not in staging_branches
-    author_fam = _normalize_family(args.author_family)
+    if not _validate_claimed_family(args.author_family, "ship"):
+        return 2
+    author_fam = _normalize_family(args.author_family) or (_infer_caller_family() if open_or_drive_consensus else "")
 
     parsed_pr: dict[str, Any] | None = None
     if args.pr_fixture is not None:
@@ -1760,20 +2057,30 @@ def cmd_ship(args: argparse.Namespace) -> int:
                 require_hmac=require_hmac,
                 allow_same_family_fallback=allow_fb,
             )
-        elif remote_pr_head and not (args.allow_update_pr or args.open_for_consensus):
+        elif remote_pr_head and not (args.allow_update_pr or open_or_drive_consensus):
             print(
                 f"paf ship REFUSED ('one PR one head'): OPEN PR #{parsed_pr.get('number')} "
                 f"already exists on '{branch}' at {remote_pr_head[:12]}, while local HEAD is "
                 f"{head_sha[:12]}. Open a fresh branch from '{base_branch}' or pass "
-                "--open-for-consensus / --allow-update-pr for multi-round PR consensus.",
+                "--consensus / --open-for-consensus / --allow-update-pr for multi-round PR consensus.",
                 file=sys.stderr,
             )
             return 1
 
-    if args.open_for_consensus:
+    if open_pr_info is not None:
+        rev_dec = str(open_pr_info.get("reviewDecision") or "").strip().upper()
+        if rev_dec in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+            print(
+                f"paf ship BLOCKED (human_review_required): GitHub reviewDecision is '{rev_dec}' - "
+                "model consensus does not replace required human colleague review.",
+                file=sys.stderr,
+            )
+            return 2
+
+    if open_or_drive_consensus:
         if not author_fam:
             print(
-                "paf ship BLOCKED: --open-for-consensus requires --author-family (claude, gemini, or openai).",
+                "paf ship BLOCKED: --consensus / --open-for-consensus requires --author-family (claude, gemini, or openai).",
                 file=sys.stderr,
             )
             return 2
@@ -1785,28 +2092,19 @@ def cmd_ship(args: argparse.Namespace) -> int:
             )
             return 2
         if args.dry_run:
-            print(f"DRY_RUN_OPEN_FOR_CONSENSUS_READY: zone={zone} base={base_branch} author={author_fam} sha={head_sha}")
+            tag = "DRY_RUN_DRIVE_CONSENSUS_READY" if drive_consensus else "DRY_RUN_OPEN_FOR_CONSENSUS_READY"
+            print(f"{tag}: zone={zone} base={base_branch} author={author_fam} sha={head_sha}")
             return 0
-
-    if open_pr_info is not None:
-        rev_dec = str(open_pr_info.get("reviewDecision") or "").strip().upper()
-        if rev_dec in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
-            print(
-                f"paf ship BLOCKED (human_review_required): GitHub reviewDecision is '{rev_dec}' — "
-                "model consensus does not replace required human colleague review.",
-                file=sys.stderr,
-            )
-            return 2
 
     # When an open PR carries any consensus marker, PR consensus is the sole gate (a local receipt never overrides it)
     local_review_ok = bool(review and review.get("verdict") == "approve" and review.get("head_sha") == head_sha)
-    if not args.open_for_consensus:
+    if not open_or_drive_consensus:
         if has_consensus_markers:
             if remote_pr_head != head_sha or cons_verdict is None:
                 print(
                     f"paf ship BLOCKED (pending_review): PR #{open_pr_info.get('number') if open_pr_info else '?'} "
                     f"carries consensus markers at {remote_pr_head[:12]}, while local HEAD is {head_sha[:12]}; "
-                    "push with --open-for-consensus and obtain a fresh SHA-pinned approve before merging.",
+                    "push with --consensus or --open-for-consensus and obtain a fresh SHA-pinned approve before merging.",
                     file=sys.stderr,
                 )
                 return 2
@@ -1822,8 +2120,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
         elif require_blind and not local_review_ok:
             print(
                 f"paf ship BLOCKED: missing SHA-pinned approval for {head_sha[:12]}.\n"
-                "Either open for cross-model PR consensus (`paf ship --open-for-consensus --author-family <claude|gemini>`)\n"
-                "or record a blind review receipt (`paf record-review --verdict approve ...`).",
+                "Run `paf ship --consensus --author-family <claude|gemini>` to open the PR, run persistent cross-model consensus, auto-merge, close both sessions, and verify post-merge/deploy.",
                 file=sys.stderr,
             )
             return 2
@@ -1946,6 +2243,61 @@ def cmd_ship(args: argparse.Namespace) -> int:
         info2 = json.loads(re_view.stdout)
         pr_number = int(info2["number"])
         pr_url = str(info2["url"])
+        if author_fam:
+            author_marker["pr_number"] = pr_number
+            author_marker.pop("sig", None)
+            author_marker.pop("key_id", None)
+            pw.sign_marker_in_place(
+                author_marker,
+                hmac_secret,
+                key_file=getattr(args, "key_file", None),
+                require_hmac=require_hmac,
+            )
+            pr_body_sections[-1] = f"<!-- paf-consensus: {json.dumps(author_marker, separators=(',', ':'))} -->"
+            full_body = "\n\n---\n\n".join(pr_body_sections)
+            subprocess.run(
+                ["gh", "pr", "edit", str(pr_number), "--body", full_body],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+    if drive_consensus:
+        print(f"OPENED_FOR_CONSENSUS: {pr_url} (pr=#{pr_number} head={head_sha} author={author_fam})")
+        try:
+            res = pw.run_consensus_dialogue(
+                repo=repo,
+                pr_number=pr_number,
+                author_family=author_fam,
+                caller_session_id=session_id,
+                host_id=host_id,
+                state_dir=getattr(args, "state_dir", None),
+                key_file=getattr(args, "key_file", None),
+                claude_model=getattr(args, "claude_model", None),
+                agy_model=getattr(args, "agy_model", None),
+                allow_same_family_fallback=allow_fb,
+                max_rounds=max_rounds,
+                review_timeout_sec=int(getattr(args, "review_timeout", 660)),
+                author_timeout_sec=int(getattr(args, "author_timeout", 1200)),
+                approved_main=bool(args.approved_main),
+                approved_governance=bool(getattr(args, "approved_governance", False)),
+                max_wait_ci=int(args.max_wait_ci),
+                no_auto_revert=bool(args.no_auto_revert),
+            )
+        except Exception as exc:
+            print(f"paf ship consensus ERROR: {exc}", file=sys.stderr)
+            return 1
+        st = str(res.get("status") or "")
+        if st in ("merged", "paused_main_approval", "paused_governance_approval"):
+            return 0
+        if st == "paused_human_tiebreak":
+            print(
+                f"PAUSED_FOR_CONSENSUS_TIEBREAK: {res.get('reason')} (pr=#{pr_number} head={res.get('head_sha')})",
+                file=sys.stderr,
+            )
+            return 4
+        print(f"paf ship consensus finished with status '{st}': {res}", file=sys.stderr)
+        return 2
 
     if args.open_for_consensus:
         print(f"OPENED_FOR_CONSENSUS: {pr_url} (pr=#{pr_number} head={head_sha} author={author_fam})")
@@ -1981,7 +2333,76 @@ def cmd_ship(args: argparse.Namespace) -> int:
         base_branch=base_branch,
         max_wait_ci=args.max_wait_ci,
         no_auto_revert=args.no_auto_revert,
+        host_id=host_id,
     )
+
+
+def cmd_drive_consensus(args: argparse.Namespace) -> int:
+    repo = args.repo.expanduser().resolve()
+    if not _validate_claimed_family(args.author_family, "drive-consensus"):
+        return 2
+    pw = _watcher_mod()
+    pr_num: int
+    if args.pr:
+        pr_num = int(args.pr)
+    else:
+        branch = _git_branch(repo)
+        view = subprocess.run(
+            ["gh", "pr", "view", branch, "--json", "number"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if view.returncode != 0 or not view.stdout.strip().startswith("{"):
+            print(
+                f"paf drive-consensus ERROR: no open PR found for branch '{branch}'; pass --pr <number>.",
+                file=sys.stderr,
+            )
+            return 1
+        pr_num = int(json.loads(view.stdout)["number"])
+
+    session_id = _resolve_session_id(getattr(args, "session_id", None))
+    allow_fb: bool | None = True if args.allow_same_family_fallback else None
+    out_guard = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
+    try:
+        with out_guard:
+            res = pw.run_consensus_dialogue(
+                repo=repo,
+                pr_number=pr_num,
+                author_family=_normalize_family(args.author_family) or _infer_caller_family() or None,
+                caller_session_id=session_id,
+                host_id=args.host,
+                state_dir=args.state_dir,
+                key_file=args.key_file,
+                claude_model=args.claude_model,
+                agy_model=args.agy_model,
+                allow_same_family_fallback=allow_fb,
+                max_rounds=args.max_rounds,
+                review_timeout_sec=args.review_timeout,
+                author_timeout_sec=int(getattr(args, "author_timeout", 1200)),
+                approved_main=args.approved_main,
+                approved_governance=bool(getattr(args, "approved_governance", False)),
+                max_wait_ci=args.max_wait_ci,
+                no_auto_revert=args.no_auto_revert,
+            )
+    except Exception as exc:
+        print(f"paf drive-consensus ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(res, indent=2))
+    st = str(res.get("status") or "")
+    if st in ("merged", "paused_main_approval", "paused_governance_approval"):
+        return 0
+    if st == "paused_human_tiebreak":
+        if not args.json:
+            print(
+                f"PAUSED_FOR_CONSENSUS_TIEBREAK: {res.get('reason')} (pr=#{pr_num} head={res.get('head_sha')})",
+                file=sys.stderr,
+            )
+        return 4
+    return 2
 
 
 def _sha256_file(path: Path) -> str:
@@ -2252,7 +2673,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     s_ver = sub.add_parser("verify", help="execute .agent-verify.json gates")
     s_ver.add_argument("--repo", type=Path, default=Path.cwd())
-    s_ver.add_argument("--mode", choices=("pre-push", "ci", "post-merge"), default="pre-push")
+    s_ver.add_argument(
+        "--mode",
+        choices=("pre-push", "ci", "post-merge", "deploy", "post-deploy"),
+        default="pre-push",
+    )
     s_ver.add_argument("--artifact", type=Path, default=None)
     s_ver.add_argument("--markdown", type=Path, default=None)
     s_ver.set_defaults(func=cmd_verify)
@@ -2300,7 +2725,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_pst_c.add_argument("--author-family", default=None)
     s_pst_c.add_argument("--max-rounds", type=int, default=None)
     s_pst_c.add_argument("--approved-main", action="store_true")
-    s_pst_c.add_argument("--approved-governance", action="store_true", help="Leo approved a governance-file PR that lacks dual-model consensus, or a repo sets governance_requires_human")
+    s_pst_c.add_argument(
+        "--approved-governance",
+        action="store_true",
+        help="Leo approved a governance-file PR that lacks dual-model consensus, or a repo sets governance_requires_human",
+    )
     s_pst_c.add_argument("--max-wait-ci", type=int, default=600)
     s_pst_c.add_argument("--no-auto-revert", action="store_true")
     s_pst_c.set_defaults(func=cmd_post_consensus)
@@ -2315,31 +2744,69 @@ def build_parser() -> argparse.ArgumentParser:
     s_mrg_c.add_argument("--require-hmac", action="store_true")
     s_mrg_c.add_argument("--allow-same-family-fallback", action="store_true")
     s_mrg_c.add_argument("--approved-main", action="store_true")
-    s_mrg_c.add_argument("--approved-governance", action="store_true", help="Leo approved a governance-file PR that lacks dual-model consensus, or a repo sets governance_requires_human")
+    s_mrg_c.add_argument(
+        "--approved-governance",
+        action="store_true",
+        help="Leo approved a governance-file PR that lacks dual-model consensus, or a repo sets governance_requires_human",
+    )
     s_mrg_c.add_argument("--max-wait-ci", type=int, default=600)
     s_mrg_c.add_argument("--no-auto-revert", action="store_true")
     s_mrg_c.add_argument("--dry-run", action="store_true")
     s_mrg_c.set_defaults(func=cmd_merge_consensus)
 
-    s_ship = sub.add_parser("ship", help="autonomous PR + CI + Consensus / Blind Review + merge + post-merge loop")
+    s_ship = sub.add_parser("ship", help="autonomous PR + persistent two-session consensus + merge + teardown + post-deploy loop")
     s_ship.add_argument("--repo", type=Path, default=Path.cwd())
     s_ship.add_argument("--base", default=None)
     s_ship.add_argument("--title", default=None)
     s_ship.add_argument("--body", default=None)
     s_ship.add_argument("--pr-fixture", type=Path, default=None)
+    s_ship.add_argument("--consensus", action="store_true", help="open/update PR and drive persistent two-session cross-model consensus through merge, teardown, and post-deploy check")
+    s_ship.add_argument("--drive-consensus", action="store_true", help="alias for --consensus")
     s_ship.add_argument("--open-for-consensus", action="store_true")
     s_ship.add_argument("--author-family", default=None)
     s_ship.add_argument("--session-id", default=None)
     s_ship.add_argument("--host", default=None)
+    s_ship.add_argument("--state-dir", type=Path, default=None)
     s_ship.add_argument("--key-file", type=Path, default=None)
+    s_ship.add_argument("--claude-model", default=None)
+    s_ship.add_argument("--agy-model", default=None)
+    s_ship.add_argument("--max-rounds", type=int, default=None)
+    s_ship.add_argument("--review-timeout", type=int, default=660)
+    s_ship.add_argument("--author-timeout", type=int, default=1200)
+    s_ship.add_argument("--allow-same-family-fallback", action="store_true")
     s_ship.add_argument("--approved-main", action="store_true")
-    s_ship.add_argument("--approved-governance", action="store_true", help="Leo approved a governance-file PR that lacks dual-model consensus, or a repo sets governance_requires_human")
+    s_ship.add_argument(
+        "--approved-governance",
+        action="store_true",
+        help="Leo approved a governance-file PR that lacks dual-model consensus, or a repo sets governance_requires_human",
+    )
     s_ship.add_argument("--allow-update-pr", action="store_true")
     s_ship.add_argument("--allow-cross-host", action="store_true")
     s_ship.add_argument("--max-wait-ci", type=int, default=600)
     s_ship.add_argument("--no-auto-revert", action="store_true")
     s_ship.add_argument("--dry-run", action="store_true")
     s_ship.set_defaults(func=cmd_ship)
+
+    s_drv = sub.add_parser("drive-consensus", help="drive persistent two-session PR consensus, auto-merge, teardown, and post-deploy verify on an open PR")
+    s_drv.add_argument("--repo", type=Path, default=Path.cwd())
+    s_drv.add_argument("--pr", default=None)
+    s_drv.add_argument("--author-family", default=None)
+    s_drv.add_argument("--session-id", default=None)
+    s_drv.add_argument("--host", default=None)
+    s_drv.add_argument("--state-dir", type=Path, default=None)
+    s_drv.add_argument("--key-file", type=Path, default=None)
+    s_drv.add_argument("--claude-model", default=None)
+    s_drv.add_argument("--agy-model", default=None)
+    s_drv.add_argument("--max-rounds", type=int, default=None)
+    s_drv.add_argument("--review-timeout", type=int, default=660)
+    s_drv.add_argument("--author-timeout", type=int, default=1200)
+    s_drv.add_argument("--allow-same-family-fallback", action="store_true")
+    s_drv.add_argument("--approved-main", action="store_true")
+    s_drv.add_argument("--approved-governance", action="store_true")
+    s_drv.add_argument("--max-wait-ci", type=int, default=600)
+    s_drv.add_argument("--no-auto-revert", action="store_true")
+    s_drv.add_argument("--json", action="store_true")
+    s_drv.set_defaults(func=cmd_drive_consensus)
 
     s_key = sub.add_parser("init-consensus-key", help="generate or rotate 0600 HMAC-SHA256 consensus key")
     s_key.add_argument("--key-file", type=Path, default=None)

@@ -1131,6 +1131,466 @@ def main() -> int:
     else:
         print("PASS 10 enforces worktree-only Claude tools, setting-sources=user, ghp_ filter, ETag retry, SIGKILL key self-heal, and strict stderr-only outage fallback")
 
+    # ------------------------------------------------------------------
+    # 11. Persistent Two-Session Consensus Loop -> Merge -> Session Teardown -> Deploy -> Post-Deploy Re-Test
+    # ------------------------------------------------------------------
+    dlg_root = _mkdtemp("paf-dlg-suite-")
+    fake_home = dlg_root / "home"
+    caller_brain = fake_home / ".gemini" / "antigravity-cli" / "brain" / "caller-interactive-sess-001"
+    caller_brain.mkdir(parents=True, exist_ok=True)
+    (caller_brain / "keep.txt").write_text("do not delete caller session\n", encoding="utf-8")
+
+    trace_log = dlg_root / "chronology.log"
+    repo_dlg = dlg_root / "repo"
+    repo_dlg.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_dlg, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "leo@example.com"], cwd=repo_dlg, check=True)
+    subprocess.run(["git", "config", "user.name", "Leo Test"], cwd=repo_dlg, check=True)
+    (repo_dlg / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zone": "autonomous",
+                "default_branch": "main",
+                "consensus": {"require_hmac": True, "max_rounds": 4},
+                "commands": {
+                    "unit_test": ["test -f app.py"],
+                    "post_merge_check": [f"echo post_merge_check >> {trace_log}"],
+                    "deploy": [f"echo deploy >> {trace_log}"],
+                    "post_deploy_check": [f"echo post_deploy_check >> {trace_log}"],
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (repo_dlg / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".agent-verify.json", "app.py"], cwd=repo_dlg, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial main commit"], cwd=repo_dlg, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "feature/persistent-dlg"], cwd=repo_dlg, check=True, capture_output=True)
+    (repo_dlg / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=repo_dlg, check=True)
+    subprocess.run(["git", "commit", "-m", "Feature round 1"], cwd=repo_dlg, check=True, capture_output=True)
+    dlg_sha1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dlg, text=True, capture_output=True, check=True
+    ).stdout.strip()
+
+    dlg_author_m = {
+        "v": 1,
+        "role": "author",
+        "model_family": "gemini",
+        "verdict": "open",
+        "head_sha": dlg_sha1,
+        "host": "personal-mac",
+        "base_branch": "main",
+        "pr_number": 88,
+        "session_id": "caller-interactive-sess-001",
+    }
+    dlg_secret = paf_watcher.load_consensus_secret(key_file)
+    paf_watcher.sign_marker_in_place(dlg_author_m, dlg_secret, key_file=key_file, require_hmac=True)
+    dlg_pr_body = f"Feature PR\n\n<!-- paf-consensus: {json.dumps(dlg_author_m, separators=(',', ':'))} -->"
+
+    dlg_mock_bin = dlg_root / "bin"
+    dlg_mock_bin.mkdir(parents=True, exist_ok=True)
+    reviewer_counter = dlg_root / "rev_count.txt"
+    author_counter = dlg_root / "auth_count.txt"
+    expected_agy_sid = "spawned-agy-author-sess-999"
+
+    dlg_claude = dlg_mock_bin / "mock_claude_persistent"
+    dlg_claude.write_text(
+        f"""#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+cnt_file = pathlib.Path({str(reviewer_counter)!r})
+n = int(cnt_file.read_text()) + 1 if cnt_file.is_file() else 1
+cnt_file.write_text(str(n))
+cwd = pathlib.Path.cwd()
+trace = pathlib.Path({str(trace_log)!r})
+home = pathlib.Path(os.environ["HOME"])
+
+if n == 1:
+    assert "--session-id" in args and "--resume" not in args, f"Round 1 expected --session-id, got {{args}}"
+    sid = args[args.index("--session-id") + 1]
+    proj = home / ".claude" / "projects" / "dlg-reviewer"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / f"{{sid}}.jsonl").write_text('{{"turn":1}}\\n', encoding="utf-8")
+    (dlg_cwd_file := pathlib.Path({str(dlg_root / 'rev_cwd.txt')!r})).write_text(str(cwd))
+    with trace.open("a", encoding="utf-8") as fh:
+        fh.write(f"review_1:init:{{sid}}\\n")
+    out = {{"verdict": "request_changes", "blocking_count": 1, "needs_human_decision": False, "prose": "Please add fix1.txt."}}
+elif n == 2:
+    assert "--resume" in args and "--session-id" not in args, f"Round 2 expected --resume, got {{args}}"
+    sid = args[args.index("--resume") + 1]
+    assert str(cwd) == pathlib.Path({str(dlg_root / 'rev_cwd.txt')!r}).read_text(), "Reviewer worktree path changed!"
+    assert (cwd / "fix1.txt").is_file(), "Expected fix1.txt in reviewer worktree on Round 2"
+    with trace.open("a", encoding="utf-8") as fh:
+        fh.write(f"review_2:resume:{{sid}}\\n")
+    out = {{"verdict": "request_changes", "blocking_count": 1, "needs_human_decision": False, "prose": "Good, now also add fix2.txt."}}
+else:
+    assert "--resume" in args and "--session-id" not in args, f"Round 3 expected --resume, got {{args}}"
+    sid = args[args.index("--resume") + 1]
+    assert str(cwd) == pathlib.Path({str(dlg_root / 'rev_cwd.txt')!r}).read_text(), "Reviewer worktree path changed!"
+    assert (cwd / "fix1.txt").is_file() and (cwd / "fix2.txt").is_file(), "Expected fix1.txt and fix2.txt on Round 3"
+    with trace.open("a", encoding="utf-8") as fh:
+        fh.write(f"review_3:resume:{{sid}}\\n")
+    out = {{"verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "All issues resolved in persistent session. Approved."}}
+
+print(json.dumps({{"type": "result", "is_error": False, "session_id": sid, "structured_output": out}}))
+""",
+        encoding="utf-8",
+    )
+    dlg_claude.chmod(0o755)
+
+    dlg_agy = dlg_mock_bin / "mock_agy_persistent"
+    dlg_agy.write_text(
+        f"""#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+cnt_file = pathlib.Path({str(author_counter)!r})
+n = int(cnt_file.read_text()) + 1 if cnt_file.is_file() else 1
+cnt_file.write_text(str(n))
+cwd = pathlib.Path.cwd()
+trace = pathlib.Path({str(trace_log)!r})
+home = pathlib.Path(os.environ["HOME"])
+expected_sid = {expected_agy_sid!r}
+assert "--mode" in args and args[args.index("--mode") + 1] == "accept-edits", f"Expected --mode accept-edits: {{args}}"
+
+if n == 1:
+    assert "--conversation" not in args, f"Author Turn 1 must not pass --conversation: {{args}}"
+    sid = expected_sid
+    bdir = home / ".gemini" / "antigravity-cli" / "brain" / sid
+    bdir.mkdir(parents=True, exist_ok=True)
+    (bdir / "transcript.jsonl").write_text('{{"step":1}}\\n', encoding="utf-8")
+    pathlib.Path({str(dlg_root / 'auth_cwd.txt')!r}).write_text(str(cwd))
+    (cwd / "fix1.txt").write_text("fixed round 1\\n", encoding="utf-8")
+    with trace.open("a", encoding="utf-8") as fh:
+        fh.write(f"author_1:init:{{sid}}\\n")
+    out = {{"commit_message": "[fix] Add fix1.txt for round 1", "reply_prose": "Added fix1.txt.", "needs_human_decision": False}}
+else:
+    assert "--conversation" in args, f"Author Turn 2 expected --conversation: {{args}}"
+    sid = args[args.index("--conversation") + 1]
+    assert sid == expected_sid, f"Expected resumed agy sid {{expected_sid}}, got {{sid}}"
+    assert str(cwd) == pathlib.Path({str(dlg_root / 'auth_cwd.txt')!r}).read_text(), "Author worktree path changed!"
+    (cwd / "fix2.txt").write_text("fixed round 2\\n", encoding="utf-8")
+    with trace.open("a", encoding="utf-8") as fh:
+        fh.write(f"author_2:resume:{{sid}}\\n")
+    out = {{"commit_message": "[fix] Add fix2.txt for round 2", "reply_prose": "Added fix2.txt.", "needs_human_decision": False}}
+
+print(json.dumps({{"status": "DONE", "conversation_id": sid, "structured_output": out}}))
+""",
+        encoding="utf-8",
+    )
+    dlg_agy.chmod(0o755)
+
+    dlg_bus = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo_dlg,
+        prs={
+            88: {
+                "number": 88,
+                "url": "https://example.test/pr/88",
+                "state": "OPEN",
+                "headRefName": "feature/persistent-dlg",
+                "baseRefName": "main",
+                "headRefOid": dlg_sha1,
+                "body": dlg_pr_body,
+                "comments": [],
+                "files": [{"path": "CORE.md"}, {"path": "app.py"}],
+                "reviewDecision": "",
+            }
+        },
+        key_file=key_file,
+        run_post_merge_verify=True,
+    )
+    dlg_state = dlg_root / "state"
+
+    def _on_close_hook(rec: dict) -> None:
+        _ = rec
+        with trace_log.open("a", encoding="utf-8") as fh:
+            fh.write("sessions_closed\n")
+
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(fake_home)
+    try:
+        dlg_res = paf_watcher.run_consensus_dialogue(
+            repo=repo_dlg,
+            pr_number=88,
+            repo_slug="leolin84200704/dlg",
+            author_family="gemini",
+            caller_session_id="caller-interactive-sess-001",
+            host_id="personal-mac",
+            state_dir=dlg_state,
+            key_file=key_file,
+            bus=dlg_bus,
+            claude_bin=str(dlg_claude),
+            agy_bin=str(dlg_agy),
+            max_rounds=4,
+            close_hook=_on_close_hook,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
+    # Forbidden auto-edit guard check: modifying `.agent-verify.json` raises RuntimeError
+    forbid_wt = dlg_root / "forbid_wt"
+    subprocess.run(["git", "worktree", "add", "--detach", str(forbid_wt), dlg_sha1], cwd=repo_dlg, check=True, capture_output=True)
+    (forbid_wt / ".agent-verify.json").write_text('{"zone":"autonomous"}\n', encoding="utf-8")
+    forbid_blocked = False
+    try:
+        paf_watcher._list_dirty_paths(forbid_wt)
+    except RuntimeError:
+        forbid_blocked = True
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(forbid_wt)], cwd=repo_dlg, check=False, capture_output=True)
+
+    rev_sid = str(dlg_res.get("reviewer_session_id") or "")
+    auth_sid = str(dlg_res.get("author_session_id") or "")
+    trace_lines = trace_log.read_text(encoding="utf-8").splitlines() if trace_log.is_file() else []
+    expected_trace = [
+        f"review_1:init:{rev_sid}",
+        f"author_1:init:{expected_agy_sid}",
+        f"review_2:resume:{rev_sid}",
+        f"author_2:resume:{expected_agy_sid}",
+        f"review_3:resume:{rev_sid}",
+        "sessions_closed",
+        "post_merge_check",
+        "deploy",
+        "post_deploy_check",
+    ]
+    spawned_claude_jsonl = fake_home / ".claude" / "projects" / "dlg-reviewer" / f"{rev_sid}.jsonl"
+    spawned_agy_dir = fake_home / ".gemini" / "antigravity-cli" / "brain" / expected_agy_sid
+    reg_after = json.loads((dlg_state / "active-pr-sessions.json").read_text(encoding="utf-8"))
+    rev_wt_dir = dlg_state / "sessions" / "leolin84200704_dlg-pr-88-reviewer"
+    auth_wt_dir = dlg_state / "sessions" / "leolin84200704_dlg-pr-88-author"
+
+    if (
+        dlg_res.get("status") != "merged"
+        or dlg_res.get("rounds") != 3
+        or auth_sid != expected_agy_sid
+        or not rev_sid
+        or dlg_res.get("sessions_closed") is not True
+        or trace_lines != expected_trace
+        or spawned_claude_jsonl.exists()
+        or spawned_agy_dir.exists()
+        or not (caller_brain / "keep.txt").is_file()
+        or rev_wt_dir.exists()
+        or auth_wt_dir.exists()
+        or reg_after.get("active") != {}
+        or "leolin84200704/dlg#88" not in (reg_after.get("closed") or {})
+        or not forbid_blocked
+    ):
+        print(
+            f"FAIL 11 persistent two-session consensus dialogue:\n"
+            f"  res={dlg_res}\n"
+            f"  trace={trace_lines}\n"
+            f"  expected={expected_trace}\n"
+            f"  claude_exists={spawned_claude_jsonl.exists()} agy_exists={spawned_agy_dir.exists()} caller_kept={(caller_brain / 'keep.txt').is_file()}\n"
+            f"  wts_exist=({rev_wt_dir.exists()},{auth_wt_dir.exists()}) reg={reg_after} forbid_blocked={forbid_blocked}"
+        )
+        failures += 1
+    else:
+        print("PASS 11 drives multi-round persistent --session-id/--resume & --conversation consensus, merges, closes both sessions, and runs deploy + post-deploy check")
+
+    # ------------------------------------------------------------------
+    # 12. Dialogue <-> Watcher Interlock, Refreshed Verify Artifact, Empty Session Guard, & Nonce Cleanup
+    # ------------------------------------------------------------------
+    final_dlg_sha = str(dlg_res.get("head_sha") or "")
+    refreshed_art = repo_dlg / ".git" / f"paf-verify-{final_dlg_sha[:12]}-pre-push.md"
+    updated_pr88_body = str(dlg_bus.prs[88].get("body") or "")
+    nb3_ok = (
+        bool(final_dlg_sha)
+        and final_dlg_sha != dlg_sha1
+        and refreshed_art.is_file()
+        and final_dlg_sha in updated_pr88_body
+        and "## Verification Artifact" in updated_pr88_body
+        and "caller-interactive-sess-001" in updated_pr88_body
+    )
+
+    # NB4 expanded protected path regex check
+    nb4_ok = all(
+        paf_watcher.FORBIDDEN_AUTO_EDIT_RE.search(p) is not None
+        for p in (
+            ".claude/settings.local.json",
+            ".gemini/settings.json",
+            "githooks/pre-push",
+            "framework/githooks/pre-push",
+            "hooks/pre-tool.py",
+            "framework/hooks/guard.py",
+        )
+    ) and all(
+        paf_watcher.FORBIDDEN_AUTO_EDIT_RE.search(p) is None
+        for p in ("bin/paf", "framework/scripts/paf_watcher.py", "CORE.md")
+    )
+
+    # Nonce-attributed agy brain session lookup (never touches unrelated concurrent brain dirs)
+    old_home_12 = os.environ.get("HOME")
+    os.environ["HOME"] = str(fake_home)
+    try:
+        b_unrelated = fake_home / ".gemini" / "antigravity-cli" / "brain" / "concurrent-unrelated-sess-777"
+        b_unrelated.mkdir(parents=True, exist_ok=True)
+        (b_unrelated / "transcript.jsonl").write_text('{"prompt":"other task"}\n', encoding="utf-8")
+        b_target = fake_home / ".gemini" / "antigravity-cli" / "brain" / "timed-out-author-sess-888"
+        b_target.mkdir(parents=True, exist_ok=True)
+        (b_target / "transcript.jsonl").write_text('{"prompt":"<!-- paf-agy-nonce-test-123 -->"}\n', encoding="utf-8")
+        matched_nonce_sid = paf_watcher._find_agy_session_by_nonce(
+            {"caller-interactive-sess-001"}, "paf-agy-nonce-test-123"
+        )
+    finally:
+        if old_home_12 is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home_12
+
+    # Interlock check: `run_consensus_dialogue` lock + registry lease blocks duplicate dialogue and skips `watch_repo_once`
+    ilock_state = dlg_root / "ilock_state"
+    ilock_bus = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo_dlg,
+        prs={
+            89: {
+                "number": 89,
+                "url": "https://example.test/pr/89",
+                "state": "OPEN",
+                "headRefName": "feature/persistent-dlg",
+                "baseRefName": "main",
+                "headRefOid": dlg_sha1,
+                "body": f"Feature\n\n<!-- paf-consensus: {json.dumps(dict(dlg_author_m, pr_number=89, sig='', key_id=''), separators=(',', ':'))} -->",
+                "comments": [],
+                "files": [{"path": "app.py"}],
+                "reviewDecision": "",
+            }
+        },
+        key_file=key_file,
+    )
+    m89 = dict(dlg_author_m, pr_number=89)
+    m89.pop("sig", None)
+    m89.pop("key_id", None)
+    paf_watcher.sign_marker_in_place(m89, dlg_secret, key_file=key_file, require_hmac=True)
+    ilock_bus.prs[89]["body"] = f"Feature\n\n<!-- paf-consensus: {json.dumps(m89, separators=(',', ':'))} -->"
+
+    dup_lock_blocked = False
+    with paf_watcher._acquire_pr_dialogue_lock(ilock_state, "leolin84200704/dlg", 89):
+        watch_while_locked = paf_watcher.watch_repo_once(
+            repo=repo_dlg,
+            repo_slug="leolin84200704/dlg",
+            host_id="personal-mac",
+            state_dir=ilock_state,
+            key_file=key_file,
+            bus=ilock_bus,
+            claude_bin=str(dlg_claude),
+            agy_bin=str(dlg_agy),
+        )
+        try:
+            paf_watcher.run_consensus_dialogue(
+                repo=repo_dlg,
+                pr_number=89,
+                repo_slug="leolin84200704/dlg",
+                author_family="gemini",
+                host_id="personal-mac",
+                state_dir=ilock_state,
+                key_file=key_file,
+                bus=ilock_bus,
+                claude_bin=str(dlg_claude),
+                agy_bin=str(dlg_agy),
+            )
+        except RuntimeError as exc:
+            dup_lock_blocked = "already held" in str(exc)
+
+    # Stale registry entry (dead PID) is evicted automatically so `watch_repo_once` recovers after crash
+    reg_ilock_file = ilock_state / "active-pr-sessions.json"
+    reg_ilock_file.write_text(
+        json.dumps(
+            {
+                "active": {
+                    "leolin84200704/dlg#89": {
+                        "pr_number": 89,
+                        "pid": 99999999,
+                        "host": "personal-mac",
+                        "expires_epoch": paf_watcher.time.time() + 600,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_active = paf_watcher.is_pr_actively_driven(
+        ilock_state, "leolin84200704/dlg", 89, local_host="personal-mac"
+    )
+    evicted_after = json.loads(reg_ilock_file.read_text(encoding="utf-8")).get("active")
+
+    # NB2 check: primary reviewer returning empty `session_id` fails closed instead of running non-persistent
+    empty_sid_claude = dlg_mock_bin / "mock_claude_empty_sid"
+    empty_sid_claude.write_text(
+        """#!/usr/bin/env python3
+import json
+print(json.dumps({"type": "result", "is_error": False, "session_id": "", "structured_output": {
+    "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "ok"
+}}))
+""",
+        encoding="utf-8",
+    )
+    empty_sid_claude.chmod(0o755)
+    # Note: `run_claude_review` falls back to `init_session_id` if `reported_sid` is empty, so test `gemini` reviewer returning empty `conversation_id`!
+    empty_sid_agy = dlg_mock_bin / "mock_agy_empty_sid"
+    empty_sid_agy.write_text(
+        """#!/usr/bin/env python3
+import json
+print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": {
+    "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "ok"
+}}))
+""",
+        encoding="utf-8",
+    )
+    empty_sid_agy.chmod(0o755)
+    m90 = dict(m89, pr_number=90, model_family="claude")
+    m90.pop("sig", None)
+    m90.pop("key_id", None)
+    paf_watcher.sign_marker_in_place(m90, dlg_secret, key_file=key_file, require_hmac=True)
+    ilock_bus.prs[90] = dict(
+        ilock_bus.prs[89],
+        number=90,
+        body=f"Feature\n\n<!-- paf-consensus: {json.dumps(m90, separators=(',', ':'))} -->",
+    )
+    empty_sid_rejected = False
+    try:
+        paf_watcher.run_consensus_dialogue(
+            repo=repo_dlg,
+            pr_number=90,
+            repo_slug="leolin84200704/dlg",
+            author_family="claude",
+            host_id="personal-mac",
+            state_dir=ilock_state,
+            key_file=key_file,
+            bus=ilock_bus,
+            claude_bin=str(empty_sid_claude),
+            agy_bin=str(empty_sid_agy),
+        )
+    except RuntimeError as exc:
+        empty_sid_rejected = "empty session_id" in str(exc)
+
+    if (
+        not nb3_ok
+        or not nb4_ok
+        or matched_nonce_sid != "timed-out-author-sess-888"
+        or watch_while_locked.get("reviewed") != []
+        or watch_while_locked.get("merged") != []
+        or ilock_bus.prs[89]["comments"] != []
+        or not dup_lock_blocked
+        or stale_active is not False
+        or evicted_after != {}
+        or not empty_sid_rejected
+    ):
+        print(
+            f"FAIL 12 interlock & hardening:\n"
+            f"  nb3_ok={nb3_ok} nb4_ok={nb4_ok} nonce_sid={matched_nonce_sid!r}\n"
+            f"  watch_locked={watch_while_locked} dup_blocked={dup_lock_blocked}\n"
+            f"  stale_active={stale_active} evicted_after={evicted_after} empty_sid_rejected={empty_sid_rejected}"
+        )
+        failures += 1
+    else:
+        print("PASS 12 interlocks run_consensus_dialogue with watch-prs, refreshes verify artifact SHA, blocks protected edits, and enforces session_id")
+
     return 1 if failures else 0
 
 
