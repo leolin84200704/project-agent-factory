@@ -892,6 +892,24 @@ def _build_claude_confinement_settings(
                 "Edit(**/.env.*)",
                 "Write(**/.env)",
                 "Write(**/.env.*)",
+                "Edit(**/*.key)",
+                "Edit(**/*.pem)",
+                "Write(**/*.key)",
+                "Write(**/*.pem)",
+                "Edit(~/.config/**)",
+                "Write(~/.config/**)",
+                "Edit(~/.ssh/**)",
+                "Write(~/.ssh/**)",
+                "Edit(~/.aws/**)",
+                "Write(~/.aws/**)",
+                "Edit(~/.gnupg/**)",
+                "Write(~/.gnupg/**)",
+                "Edit(~/.kube/**)",
+                "Write(~/.kube/**)",
+                "Edit(~/.netrc)",
+                "Write(~/.netrc)",
+                "Edit(~/.git-credentials)",
+                "Write(~/.git-credentials)",
             ]
         )
     for sys_root in ("/Users", "/home", "/etc", "/root"):
@@ -911,6 +929,8 @@ def _build_claude_confinement_settings(
                     f"Glob({key_dir_slash})",
                 ]
             )
+            if allow_write:
+                deny_rules.extend([f"Edit({key_dir_slash})", f"Write({key_dir_slash})"])
     settings_json = json.dumps(
         {
             "permissions": {
@@ -1635,6 +1655,7 @@ class GitHubBus:
         allow_same_family_fallback: bool = False,
         key_file: Path | None = None,
         approved_main: bool = False,
+        approved_governance: bool = False,
         max_wait_ci: int = 600,
         no_auto_revert: bool = False,
         host_id: str | None = None,
@@ -1650,6 +1671,7 @@ class GitHubBus:
                 require_hmac=require_hmac,
                 allow_same_family_fallback=bool(allow_same_family_fallback),
                 approved_main=approved_main,
+                approved_governance=approved_governance,
                 max_wait_ci=max_wait_ci,
                 no_auto_revert=no_auto_revert,
                 host_id=host_id,
@@ -1657,8 +1679,8 @@ class GitHubBus:
             )
             if rc == 0 and status_tag == "merged":
                 return True, "merged"
-            if status_tag == "paused":
-                return False, "paused"
+            if status_tag in ("paused", "paused_governance", "paused_tiebreak"):
+                return False, status_tag
             return False, f"blocked({rc}): {status_tag}"
 
         env = _clean_git_env()
@@ -1681,6 +1703,8 @@ class GitHubBus:
             cmd.append("--allow-same-family-fallback")
         if approved_main:
             cmd.append("--approved-main")
+        if approved_governance:
+            cmd.append("--approved-governance")
         if no_auto_revert:
             cmd.append("--no-auto-revert")
         proc = subprocess.run(
@@ -1694,6 +1718,10 @@ class GitHubBus:
         combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
         if proc.returncode == 0 and "SHIPPED_AND_VERIFIED:" in combined:
             return True, "merged"
+        if "PAUSED_FOR_CONSENSUS_TIEBREAK" in combined or proc.returncode == 4:
+            return False, "paused_tiebreak"
+        if "PAUSED_FOR_GOVERNANCE_APPROVAL" in combined:
+            return False, "paused_governance"
         if "PAUSED_FOR_" in combined:
             return False, "paused"
         return False, f"blocked({proc.returncode}): {combined[:240]}"
@@ -1806,6 +1834,7 @@ class InMemoryGitHubBus:
         allow_same_family_fallback: bool = False,
         key_file: Path | None = None,
         approved_main: bool = False,
+        approved_governance: bool = False,
         max_wait_ci: int = 600,
         no_auto_revert: bool = False,
         host_id: str | None = None,
@@ -1835,6 +1864,8 @@ class InMemoryGitHubBus:
             cmd.append("--allow-same-family-fallback")
         if approved_main:
             cmd.append("--approved-main")
+        if approved_governance:
+            cmd.append("--approved-governance")
         proc = subprocess.run(
             cmd,
             cwd=self.repo_path,
@@ -1872,6 +1903,10 @@ class InMemoryGitHubBus:
                 finally:
                     _remove_worktree(self.repo_path, wt_post, created_post)
             return True, "merged"
+        if "PAUSED_FOR_CONSENSUS_TIEBREAK" in combined or proc.returncode == 4:
+            return False, "paused_tiebreak"
+        if "PAUSED_FOR_GOVERNANCE_APPROVAL" in combined:
+            return False, "paused_governance"
         if "PAUSED_FOR_" in combined:
             return False, "paused"
         return False, f"blocked({proc.returncode}): {combined[:240]}"
@@ -2187,6 +2222,7 @@ def run_consensus_dialogue(
     review_timeout_sec: int = 660,
     author_timeout_sec: int = 1200,
     approved_main: bool = False,
+    approved_governance: bool = False,
     max_wait_ci: int = 600,
     no_auto_revert: bool = False,
     close_hook: Callable[[dict[str, Any]], None] | None = None,
@@ -2728,6 +2764,7 @@ def run_consensus_dialogue(
                 allow_same_family_fallback=allow_fb,
                 key_file=resolved_key,
                 approved_main=approved_main,
+                approved_governance=approved_governance,
                 max_wait_ci=max_wait_ci,
                 no_auto_revert=no_auto_revert,
                 host_id=resolved_host,
@@ -2739,6 +2776,28 @@ def run_consensus_dialogue(
             if merged_ok:
                 return {
                     "status": "merged",
+                    "pr_number": int(pr_number),
+                    "head_sha": final_sha,
+                    "rounds": rounds_run,
+                    "author_session_id": session_ctx["author_session_id"],
+                    "reviewer_session_id": session_ctx["reviewer_session_id"],
+                    "sessions_closed": bool(close_rec.get("closed")),
+                }
+            if merge_reason == "paused_tiebreak":
+                return {
+                    "status": "paused_human_tiebreak",
+                    "reason": "Consensus tiebreak required at merge gate.",
+                    "pr_number": int(pr_number),
+                    "head_sha": final_sha,
+                    "rounds": rounds_run,
+                    "author_session_id": session_ctx["author_session_id"],
+                    "reviewer_session_id": session_ctx["reviewer_session_id"],
+                    "sessions_closed": bool(close_rec.get("closed")),
+                }
+            if merge_reason == "paused_governance":
+                return {
+                    "status": "paused_governance_approval",
+                    "reason": merge_reason,
                     "pr_number": int(pr_number),
                     "head_sha": final_sha,
                     "rounds": rounds_run,
@@ -2900,6 +2959,9 @@ def watch_repo_once(
             if status == "approved":
                 owns_pr = (author_host == resolved_host) if author_host else (author_family in enabled_families)
                 if owns_pr:
+                    if is_pr_actively_driven(resolved_state, slug, pr_num, local_host=resolved_host):
+                        has_pending_work = True
+                        continue
                     ok, m_reason = active_bus.merge_pr(
                         pr_num,
                         require_hmac=require_hmac,
@@ -2909,7 +2971,7 @@ def watch_repo_once(
                     if ok:
                         merged.append(pr_num)
                         did_mutate = True
-                    elif m_reason == "paused":
+                    elif m_reason in ("paused", "paused_governance", "paused_tiebreak"):
                         paused.append(pr_num)
                     else:
                         # Check runs still pending or transient merge block -> do not cache ETag!
@@ -3202,6 +3264,9 @@ def watch_repo_once(
                     + "\n\n"
                     + f"<!-- paf-consensus: {json.dumps(marker, separators=(',', ':'))} -->"
                 )
+                if is_pr_actively_driven(resolved_state, slug, pr_num, local_host=resolved_host):
+                    has_pending_work = True
+                    continue
                 active_bus.post_comment(pr_num, comment_body)
                 reviewed.append(pr_num)
                 did_mutate = True
@@ -3219,6 +3284,7 @@ def watch_repo_once(
                     and review_result["verdict"] == "approve"
                     and review_result["blocking_count"] == 0
                     and not review_result["needs_human_decision"]
+                    and not is_pr_actively_driven(resolved_state, slug, pr_num, local_host=resolved_host)
                 ):
                     ok, m_reason = active_bus.merge_pr(
                         pr_num,
@@ -3228,7 +3294,7 @@ def watch_repo_once(
                     )
                     if ok:
                         merged.append(pr_num)
-                    elif m_reason == "paused":
+                    elif m_reason in ("paused", "paused_governance", "paused_tiebreak"):
                         paused.append(pr_num)
                     else:
                         has_pending_work = True

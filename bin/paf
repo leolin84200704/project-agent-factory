@@ -196,6 +196,111 @@ def _resolve_staging_branches(cfg: dict[str, Any]) -> set[str]:
     return {"staging", "stage_test"}
 
 
+GOVERNANCE_FILE_RE = re.compile(
+    r"(^|/)(CORE\.md|AGENTS\.md|CLAUDE\.md|GEMINI\.md|WORK-LOOP\.md|PERMISSIONS\.md|FEEDBACK\.md|"
+    r"\.agent-verify\.json|run-regression\.py|dune_lint\.py|paf_watcher\.py)$|"
+    r"^bin/paf$|"
+    r"(^|/)(\.claude/settings[^/]*\.json|\.gemini/settings[^/]*\.json|\.gemini/config/|"
+    r"\.github/workflows/[^/]+\.ya?ml|eval-tasks/[^/]+\.md|"
+    r"hooks/|githooks/|framework/githooks/|"
+    r"scripts/dream\.md|DailyJob/|launchd/|"
+    r"\.claude/skills/|\.gemini/skills/|skills/)"
+)
+
+
+def _base_governance_requires_human(repo: Path, base_branch: str, gov_files: list[str]) -> bool | None:
+    """Read `governance_requires_human` from the base branch's `.agent-verify.json`.
+
+    Returns None when the base config cannot be read. A PR must not be able to strip its own human gate,
+    so the caller trusts the base branch, not the PR's working tree, for this flag.
+    """
+    for ref in (f"origin/{base_branch}", base_branch):
+        res = _git(repo, "show", f"{ref}:.agent-verify.json", check=False)
+        if res.returncode != 0:
+            continue
+        try:
+            base_cfg = json.loads(res.stdout)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(base_cfg, dict):
+            return bool(base_cfg.get("governance_requires_human", False))
+    return None
+
+
+def _governance_needs_human(
+    repo: Path,
+    base_branch: str,
+    cfg: dict[str, Any],
+    gov_files: list[str],
+    args: argparse.Namespace,
+    consensus_approved: bool,
+) -> bool:
+    """Governance/permission-file PRs merge on heterogeneous dual-model consensus alone (Leo, 2026-11-16).
+
+    Leo's explicit approval is still required when the PR has no verified dual-model consensus on its head
+    SHA (for example a single-model blind-review receipt), or when the repo opts back in with
+    `"governance_requires_human": true` in `.agent-verify.json`. The flag is honored if either the base
+    branch or the working tree sets it; when the PR edits `.agent-verify.json` and the base config cannot
+    be read, the gate fails closed.
+    """
+    if not gov_files or getattr(args, "approved_governance", False) or getattr(args, "approved_main", False):
+        return False
+    base_flag = _base_governance_requires_human(repo, base_branch, gov_files)
+    edits_verify_cfg = any(p.rsplit("/", 1)[-1] == ".agent-verify.json" for p in gov_files)
+    if base_flag is None and edits_verify_cfg:
+        return True
+    if base_flag or bool(cfg.get("governance_requires_human", False)):
+        return True
+    return not consensus_approved
+
+def _governance_files_touched(repo: Path, pr_data: dict[str, Any] | None, base_branch: str) -> list[str]:
+    pr_paths: list[str] = []
+    expected_count: int | None = None
+    files_listed = False
+    if pr_data is not None:
+        if pr_data.get("changedFiles") is not None:
+            try:
+                expected_count = int(pr_data["changedFiles"])
+            except (TypeError, ValueError):
+                expected_count = None
+        if isinstance(pr_data.get("files"), list):
+            files_listed = True
+            for item in pr_data["files"]:
+                if isinstance(item, dict) and item.get("path"):
+                    pr_paths.append(str(item["path"]))
+                elif isinstance(item, str) and item:
+                    pr_paths.append(item)
+    truncated = expected_count is not None and expected_count > len(pr_paths)
+    # A PR payload with no file list at all says nothing about which files changed.
+    unknown = pr_data is not None and not files_listed
+    paths: list[str] = list(pr_paths)
+    if (not paths or truncated or unknown) and (repo / ".git").exists():
+        # The local diff describes the PR only when the local checkout is the PR head. Without a PR payload
+        # (`paf ship` before a PR exists) the local branch is what ships, so the diff is the right source.
+        local_is_pr_head = True
+        if pr_data is not None:
+            pr_head = str(pr_data.get("headRefOid") or "").strip().lower()
+            local_head_res = _git(repo, "rev-parse", "HEAD", check=False)
+            local_head = local_head_res.stdout.strip().lower() if local_head_res.returncode == 0 else ""
+            local_is_pr_head = bool(pr_head) and pr_head == local_head
+        if local_is_pr_head:
+            for ref in (base_branch, f"origin/{base_branch}"):
+                diff_res = _git(repo, "diff", "--name-only", f"{ref}...HEAD", check=False)
+                if diff_res.returncode == 0:
+                    git_paths = [line.strip() for line in diff_res.stdout.splitlines() if line.strip()]
+                    paths.extend(git_paths)
+                    unknown = False
+                    if expected_count is not None and len(set(paths)) >= expected_count:
+                        truncated = False
+                    break
+    matched = sorted({p for p in paths if GOVERNANCE_FILE_RE.search(re.sub(r"^(?:\./)+", "", p))})
+    if truncated:
+        matched.append(f"<truncated-pr-files:{len(pr_paths)}/{expected_count}>")
+    elif unknown:
+        matched.append("<unknown-pr-files>")
+    return matched
+
+
 def _run_shell_step(repo: Path, stage: str, command: str, timeout_sec: int = 900) -> dict[str, Any]:
     t0 = time.monotonic()
     env = _clean_git_env()
@@ -1537,12 +1642,24 @@ def cmd_merge_consensus(args: argparse.Namespace) -> int:
     pr_number = int(pr_data["number"])
     pr_url = str(pr_data.get("url") or f"PR#{pr_number}")
     requires_human_merge_approval = zone == "guarded" and base_branch not in staging_branches
+    gov_files = _governance_files_touched(repo, pr_data, base_branch)
 
     if requires_human_merge_approval and not args.approved_main:
         print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (base={base_branch} head={head_sha})")
         print(
             f"Dual-model consensus is complete. Once Leo replies 'approve' (and any stricter workspace rule is met), resume via:\n"
             f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-main"
+        )
+        return 0
+
+    if _governance_needs_human(repo, base_branch, cfg, gov_files, args, consensus_approved=True):
+        print(
+            f"PAUSED_FOR_GOVERNANCE_APPROVAL: {pr_url} (head={head_sha}) modifies governance/permission files: "
+            f"{', '.join(gov_files)}"
+        )
+        print(
+            f"Once Leo confirms this rule/permission change, resume via:\n"
+            f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-governance"
         )
         return 0
 
@@ -1571,6 +1688,7 @@ def merge_pr_in_process(
     require_hmac: bool = False,
     allow_same_family_fallback: bool = False,
     approved_main: bool = False,
+    approved_governance: bool = False,
     max_wait_ci: int = 600,
     no_auto_revert: bool = False,
     host_id: str | None = None,
@@ -1611,7 +1729,7 @@ def merge_pr_in_process(
     )
     if verdict["status"] == "paused_human_tiebreak":
         print(f"PAUSED_FOR_CONSENSUS_TIEBREAK: {verdict['reason']}", file=sys.stderr)
-        return 4, "paused"
+        return 4, "paused_tiebreak"
     if verdict["status"] != "approved":
         return 2, f"{verdict['status']}: {verdict['reason']}"
 
@@ -1620,6 +1738,8 @@ def merge_pr_in_process(
     branch = str(pr_data.get("headRefName") or "")
     pr_url = str(pr_data.get("url") or f"PR#{pr_number}")
     requires_human_merge_approval = zone == "guarded" and base_branch not in staging_branches
+    gov_files = _governance_files_touched(repo, pr_data, base_branch)
+    gov_ns = argparse.Namespace(approved_governance=approved_governance, approved_main=approved_main)
 
     if requires_human_merge_approval and not approved_main:
         print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (base={base_branch} head={head_sha})")
@@ -1628,6 +1748,17 @@ def merge_pr_in_process(
             f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-main"
         )
         return 0, "paused"
+
+    if _governance_needs_human(repo, base_branch, cfg, gov_files, gov_ns, consensus_approved=True):
+        print(
+            f"PAUSED_FOR_GOVERNANCE_APPROVAL: {pr_url} (head={head_sha}) modifies governance/permission files: "
+            f"{', '.join(gov_files)}"
+        )
+        print(
+            f"Once Leo confirms this rule/permission change, resume via:\n"
+            f"  paf merge-consensus --repo {repo} --pr {pr_number} --approved-governance"
+        )
+        return 0, "paused_governance"
 
     rc = _merge_and_verify_pr(
         repo,
@@ -1938,9 +2069,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
 
     if open_pr_info is not None:
         rev_dec = str(open_pr_info.get("reviewDecision") or "").strip().upper()
-        if rev_dec == "CHANGES_REQUESTED" or (
-            rev_dec == "REVIEW_REQUIRED" and (zone == "guarded" or not open_or_drive_consensus)
-        ):
+        if rev_dec in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
             print(
                 f"paf ship BLOCKED (human_review_required): GitHub reviewDecision is '{rev_dec}' - "
                 "model consensus does not replace required human colleague review.",
@@ -1996,10 +2125,24 @@ def cmd_ship(args: argparse.Namespace) -> int:
             )
             return 2
 
+    gov_files = _governance_files_touched(repo, open_pr_info, base_branch)
+    # Verified dual-model consensus on this exact head SHA, not merely the presence of markers
+    ship_consensus_approved = bool(
+        has_consensus_markers
+        and cons_verdict is not None
+        and cons_verdict.get("status") == "approved"
+        and remote_pr_head == head_sha
+    )
+
     if args.dry_run:
         if requires_human_merge_approval and not args.approved_main:
             print(
                 f"PAUSED_FOR_MAIN_APPROVAL (dry-run): zone=guarded base={base_branch} sha={head_sha}"
+            )
+            return 0
+        if _governance_needs_human(repo, base_branch, cfg, gov_files, args, consensus_approved=ship_consensus_approved):
+            print(
+                f"PAUSED_FOR_GOVERNANCE_APPROVAL (dry-run): sha={head_sha} files={','.join(gov_files)}"
             )
             return 0
         print(
@@ -2137,6 +2280,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
                 review_timeout_sec=int(getattr(args, "review_timeout", 660)),
                 author_timeout_sec=int(getattr(args, "author_timeout", 1200)),
                 approved_main=bool(args.approved_main),
+                approved_governance=bool(getattr(args, "approved_governance", False)),
                 max_wait_ci=int(args.max_wait_ci),
                 no_auto_revert=bool(args.no_auto_revert),
             )
@@ -2144,9 +2288,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
             print(f"paf ship consensus ERROR: {exc}", file=sys.stderr)
             return 1
         st = str(res.get("status") or "")
-        if st == "merged":
-            return 0
-        if st == "paused_main_approval":
+        if st in ("merged", "paused_main_approval", "paused_governance_approval"):
             return 0
         if st == "paused_human_tiebreak":
             print(
@@ -2161,12 +2303,24 @@ def cmd_ship(args: argparse.Namespace) -> int:
         print(f"OPENED_FOR_CONSENSUS: {pr_url} (pr=#{pr_number} head={head_sha} author={author_fam})")
         return 0
 
-    # Step 4: Guarded non-staging branches pause for Leo's single `approve`
+    # Step 4: Guarded non-staging branches pause for Leo's single `approve`; governance-file edits pause only
+    # when there is no verified dual-model consensus (or the repo sets `governance_requires_human`)
     if requires_human_merge_approval and not args.approved_main:
         print(f"PAUSED_FOR_MAIN_APPROVAL: {pr_url} (base={base_branch} head={head_sha})")
         print(
             f"Once Leo replies 'approve' (and any stricter workspace rule is met), resume via:\n"
             f"  paf ship --repo {repo} --base {base_branch} --approved-main"
+        )
+        return 0
+
+    if _governance_needs_human(repo, base_branch, cfg, gov_files, args, consensus_approved=ship_consensus_approved):
+        print(
+            f"PAUSED_FOR_GOVERNANCE_APPROVAL: {pr_url} (head={head_sha}) modifies governance/permission files: "
+            f"{', '.join(gov_files)}"
+        )
+        print(
+            f"Once Leo confirms this rule/permission change, resume via:\n"
+            f"  paf ship --repo {repo} --base {base_branch} --approved-governance"
         )
         return 0
 
@@ -2228,6 +2382,7 @@ def cmd_drive_consensus(args: argparse.Namespace) -> int:
                 review_timeout_sec=args.review_timeout,
                 author_timeout_sec=int(getattr(args, "author_timeout", 1200)),
                 approved_main=args.approved_main,
+                approved_governance=bool(getattr(args, "approved_governance", False)),
                 max_wait_ci=args.max_wait_ci,
                 no_auto_revert=args.no_auto_revert,
             )
@@ -2238,7 +2393,7 @@ def cmd_drive_consensus(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(res, indent=2))
     st = str(res.get("status") or "")
-    if st in ("merged", "paused_main_approval"):
+    if st in ("merged", "paused_main_approval", "paused_governance_approval"):
         return 0
     if st == "paused_human_tiebreak":
         if not args.json:
@@ -2573,7 +2728,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_pst_c.add_argument(
         "--approved-governance",
         action="store_true",
-        help="deprecated no-op; governance files are confirmed by peer model consensus",
+        help="Leo approved a governance-file PR that lacks dual-model consensus, or a repo sets governance_requires_human",
     )
     s_pst_c.add_argument("--max-wait-ci", type=int, default=600)
     s_pst_c.add_argument("--no-auto-revert", action="store_true")
@@ -2592,7 +2747,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_mrg_c.add_argument(
         "--approved-governance",
         action="store_true",
-        help="deprecated no-op; governance files are confirmed by peer model consensus",
+        help="Leo approved a governance-file PR that lacks dual-model consensus, or a repo sets governance_requires_human",
     )
     s_mrg_c.add_argument("--max-wait-ci", type=int, default=600)
     s_mrg_c.add_argument("--no-auto-revert", action="store_true")
@@ -2623,7 +2778,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_ship.add_argument(
         "--approved-governance",
         action="store_true",
-        help="deprecated no-op; governance files are confirmed by peer model consensus",
+        help="Leo approved a governance-file PR that lacks dual-model consensus, or a repo sets governance_requires_human",
     )
     s_ship.add_argument("--allow-update-pr", action="store_true")
     s_ship.add_argument("--allow-cross-host", action="store_true")
@@ -2647,6 +2802,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_drv.add_argument("--author-timeout", type=int, default=1200)
     s_drv.add_argument("--allow-same-family-fallback", action="store_true")
     s_drv.add_argument("--approved-main", action="store_true")
+    s_drv.add_argument("--approved-governance", action="store_true")
     s_drv.add_argument("--max-wait-ci", type=int, default=600)
     s_drv.add_argument("--no-auto-revert", action="store_true")
     s_drv.add_argument("--json", action="store_true")

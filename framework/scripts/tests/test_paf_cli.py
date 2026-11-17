@@ -543,8 +543,8 @@ def main() -> int:
     else:
         print("PASS C1 guarded repo pauses on every non-staging base branch and fails closed on missing zone")
 
-    # 18. C3 & C4: Autonomous repo merges governance/tooling PRs directly upon heterogeneous model consensus
-    #     (zero human governance confirmation), while still blocking when GitHub `reviewDecision` requires human review
+    # 18. C3 & C4: Governance/permission file edits (`CORE.md`, `.agent-verify.json`, etc.) merge on consensus by default;
+    #     with `governance_requires_human` the autonomous repo pauses once until `--approved-governance`, and blocks when GitHub `reviewDecision` requires human review
     auto_repo = pathlib.Path(tempfile.mkdtemp())
     subprocess.run(["git", "init", "-b", "main"], cwd=auto_repo, check=True, capture_output=True)
     (auto_repo / ".agent-verify.json").write_text(
@@ -569,11 +569,37 @@ def main() -> int:
         ),
         encoding="utf-8",
     )
-    res_c3_direct = run_paf(
+    # Default (Leo, 2026-11-16): verified dual-model consensus alone merges governance-file PRs, no pause
+    res_c3_default = run_paf(
         ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
         cwd=auto_repo,
     )
-    res_c3_legacy_flag = run_paf(
+    if (
+        res_c3_default.returncode != 0
+        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_default.stdout
+        or "PAUSED_FOR_GOVERNANCE_APPROVAL" in res_c3_default.stdout
+    ):
+        print(f"FAIL C3a governance PR with consensus should merge by default: {res_c3_default.stdout.strip()}")
+        failures += 1
+    else:
+        print("PASS C3a governance-file PR with verified dual-model consensus merges without Leo's approval")
+    # Opt-in `governance_requires_human` restores the single human pause
+    (auto_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "zone": "autonomous",
+                "default_branch": "main",
+                "governance_requires_human": True,
+                "commands": {"unit_test": ["true"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    res_c3_pause = run_paf(
+        ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
+        cwd=auto_repo,
+    )
+    res_c3_approved_gov = run_paf(
         [
             "merge-consensus",
             "--repo",
@@ -597,20 +623,19 @@ def main() -> int:
         cwd=repo,
     )
     if (
-        res_c3_direct.returncode != 0
-        or "PAUSED_FOR_GOVERNANCE_APPROVAL" in res_c3_direct.stdout
-        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_direct.stdout
-        or res_c3_legacy_flag.returncode != 0
-        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_legacy_flag.stdout
+        res_c3_pause.returncode != 0
+        or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in res_c3_pause.stdout
+        or res_c3_approved_gov.returncode != 0
+        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in res_c3_approved_gov.stdout
         or res_c4_human_req.returncode == 0
     ):
         print(
-            f"FAIL C3/C4 autonomous consensus & human-review gates: c3_direct={res_c3_direct.stdout.strip()} "
-            f"c3_legacy={res_c3_legacy_flag.stdout.strip()} c4_rc={res_c4_human_req.returncode}"
+            f"FAIL C3b/C4 governance opt-in & human-review gates: pause={res_c3_pause.stdout.strip()} "
+            f"approved={res_c3_approved_gov.stdout.strip()} c4_rc={res_c4_human_req.returncode}"
         )
         failures += 1
     else:
-        print("PASS C3/C4 autonomous repo merges rule/tooling PRs on peer-model consensus without asking human, and honors GitHub human review")
+        print("PASS C3b/C4 governance_requires_human pauses until --approved-governance, and honors GitHub human review")
 
     # 19. D1: Local `paf record-review` receipt NEVER overrides an open PR consensus gate (`request_changes`, `pending_review`, `needs_human_decision`)
     res_rec = run_paf(
@@ -722,7 +747,16 @@ def main() -> int:
         print("PASS D2 honors same-family/unlabeled objections and rejects substring family collisions")
 
     # 21. D3: Governance, workflow, settings, skill, and hook PRs in autonomous repos merge directly once
-    #     heterogeneous model consensus approves, and still block when peer model requests changes
+    #     heterogeneous model consensus approves by default, pause when `governance_requires_human` is enabled,
+    #     and block when peer model requests changes
+    subprocess.run(["git", "config", "user.email", "t@example.test"], cwd=auto_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=auto_repo, check=True)
+    (auto_repo / ".agent-verify.json").write_text(
+        json.dumps({"zone": "autonomous", "default_branch": "main", "commands": {"unit_test": ["true"]}}),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", ".agent-verify.json"], cwd=auto_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base default cfg"], cwd=auto_repo, check=True, capture_output=True)
     d3_paths = (
         ".agent-verify.json",
         ".github/workflows/verify.yml",
@@ -765,7 +799,45 @@ def main() -> int:
             or "PAUSED_FOR_GOVERNANCE_APPROVAL" in r_gov.stdout
         ):
             d3_ok = False
-            print(f"FAIL D3 autonomous consensus merge blocked on {gov_path}: {r_gov.stdout.strip()}")
+            print(f"FAIL D3 default autonomous consensus merge blocked on {gov_path}: {r_gov.stdout.strip()}")
+
+    (auto_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "zone": "autonomous",
+                "default_branch": "main",
+                "governance_requires_human": True,
+                "commands": {"unit_test": ["true"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    for gov_path in d3_paths:
+        auto_pr_fix.write_text(
+            json.dumps(
+                {
+                    "number": 115,
+                    "url": "https://example.test/pr/115",
+                    "state": "OPEN",
+                    "headRefName": "feature/rules",
+                    "baseRefName": "main",
+                    "headRefOid": mul_sha,
+                    "body": gemini_author_mul,
+                    "comments": [{"body": claude_approve_mul}],
+                    "files": [{"path": gov_path}],
+                    "changedFiles": 1,
+                    "reviewDecision": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+        r_gov_opt = run_paf(
+            ["merge-consensus", "--repo", str(auto_repo), "--pr-fixture", str(auto_pr_fix), "--dry-run"],
+            cwd=auto_repo,
+        )
+        if r_gov_opt.returncode != 0 or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_gov_opt.stdout:
+            d3_ok = False
+            print(f"FAIL D3 governance_requires_human missed {gov_path}: {r_gov_opt.stdout.strip()}")
 
     auto_pr_fix.write_text(
         json.dumps(
@@ -793,9 +865,101 @@ def main() -> int:
         print(f"FAIL D3 peer-model governance check: d3_ok={d3_ok} unapproved_rc={r_gov_unapproved.returncode}")
         failures += 1
     else:
-        print("PASS D3 confirms governance/hook/workflow PRs via peer model without human governance pause")
+        print("PASS D3 confirms governance/hook/workflow PRs via peer model by default and honors governance_requires_human")
 
-    # 22. Deploy + Post-Deploy Verification Pipeline: if deploy is configured, execute deploy after post-merge
+    # 22. Truncated or missing PR file list: the local `git diff` fallback counts only when local HEAD is the PR head
+    fb_repo = pathlib.Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-b", "main"], cwd=fb_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=fb_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=fb_repo, check=True)
+    (fb_repo / ".agent-verify.json").write_text(
+        json.dumps({"version": 1, "zone": "autonomous", "default_branch": "main", "governance_requires_human": True}),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=fb_repo, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "feature/plain"], cwd=fb_repo, check=True, capture_output=True)
+    for name in ("a.py", "b.py", "c.py"):
+        (fb_repo / name).write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "plain files"], cwd=fb_repo, check=True, capture_output=True)
+    plain_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fb_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+    fb_fix = fb_repo / ".git" / "pr-fallback.json"
+    other_sha = "d" * 40
+
+    def write_fb_fixture(head_oid: str, files: list[str] | None, changed: int | None) -> None:
+        author = "<!-- paf-consensus: " + json.dumps(
+            {"v": 1, "role": "author", "model_family": "gemini", "verdict": "open", "head_sha": head_oid}
+        ) + " -->"
+        approve = "<!-- paf-consensus: " + json.dumps(
+            {
+                "v": 1,
+                "role": "reviewer",
+                "model_family": "claude",
+                "verdict": "approve",
+                "head_sha": head_oid,
+                "round": 1,
+                "blocking_count": 0,
+            }
+        ) + " -->"
+        data: dict[str, object] = {
+            "number": 116,
+            "url": "https://example.test/pr/116",
+            "state": "OPEN",
+            "headRefName": "feature/remote",
+            "baseRefName": "main",
+            "headRefOid": head_oid,
+            "body": author,
+            "comments": [{"body": approve}],
+            "reviewDecision": "",
+        }
+        if files is not None:
+            data["files"] = [{"path": f} for f in files]
+        if changed is not None:
+            data["changedFiles"] = changed
+        fb_fix.write_text(json.dumps(data), encoding="utf-8")
+
+    def fb_dry_run() -> subprocess.CompletedProcess[str]:
+        return run_paf(
+            ["merge-consensus", "--repo", str(fb_repo), "--pr-fixture", str(fb_fix), "--dry-run"], cwd=fb_repo
+        )
+
+    write_fb_fixture(other_sha, ["src/app.py"], 3)
+    r_fb_other = fb_dry_run()
+    write_fb_fixture(other_sha, None, None)
+    r_fb_nofiles = fb_dry_run()
+    write_fb_fixture(plain_sha, ["a.py"], 3)
+    r_fb_same_plain = fb_dry_run()
+    (fb_repo / "CORE.md").write_text("rule\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=fb_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "rule file"], cwd=fb_repo, check=True, capture_output=True)
+    gov_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fb_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+    write_fb_fixture(gov_sha, ["a.py"], 4)
+    r_fb_same_gov = fb_dry_run()
+    if (
+        "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_fb_other.stdout
+        or "truncated-pr-files" not in r_fb_other.stdout
+        or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_fb_nofiles.stdout
+        or "unknown-pr-files" not in r_fb_nofiles.stdout
+        or "CONSENSUS_AUTONOMOUS_MERGE_READY" not in r_fb_same_plain.stdout
+        or "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_fb_same_gov.stdout
+        or "CORE.md" not in r_fb_same_gov.stdout
+        or "truncated-pr-files" in r_fb_same_gov.stdout
+    ):
+        print(
+            "FAIL file-list fallback bound to PR head: "
+            f"other={r_fb_other.stdout.strip()!r} nofiles={r_fb_nofiles.stdout.strip()!r} "
+            f"same_plain={r_fb_same_plain.stdout.strip()!r} same_gov={r_fb_same_gov.stdout.strip()!r}"
+        )
+        failures += 1
+    else:
+        print("PASS truncated or missing PR file list trusts local git diff only when local HEAD is the PR head")
+
+    # 24. Deploy + Post-Deploy Verification Pipeline: if deploy is configured, execute deploy after post-merge
     #     and immediately re-test after deploy (`post_deploy_check` or fallback stage), failing closed on error
     import importlib.machinery
     import importlib.util
@@ -1205,7 +1369,7 @@ sys.exit(1)
             require_hmac=True,
         )
 
-        # `paf drive-consensus` returns rc == 4 on paused_human_tiebreak
+        # `merge_pr_in_process` returns (4, "paused_tiebreak") and `paf drive-consensus` returns rc == 4 on paused_human_tiebreak
         nh_m = dict(rev_m_200, verdict="request_changes", blocking_count=1, needs_human_decision=True)
         nh_m.pop("sig", None)
         nh_m.pop("key_id", None)
@@ -1213,6 +1377,12 @@ sys.exit(1)
         _write_pr_state(
             rev_decision="",
             comments_list=[{"body": f"Needs decision.\n\n<!-- paf-consensus: {json.dumps(nh_m, separators=(',', ':'))} -->"}],
+        )
+        rc_tb, tag_tb = paf_mod.merge_pr_in_process(
+            repo=live_repo,
+            pr_number=200,
+            key_file=live_key_file,
+            require_hmac=True,
         )
         r_drv_tiebreak = run_paf(
             [
@@ -1310,6 +1480,8 @@ sys.exit(1)
         or r_drv_spoof.returncode != 2
         or rc_rr != 2
         or not tag_rr.startswith("human_review_required")
+        or rc_tb != 4
+        or tag_tb != "paused_tiebreak"
         or r_drv_tiebreak.returncode != 4
         or ok_g_pause is not False
         or reason_g_pause != "paused"
@@ -1320,19 +1492,132 @@ sys.exit(1)
         or live_seq != ["gh_pr_merge", "sessions_closed", "post_merge", "deploy", "post_deploy"]
     ):
         print(
-            f"FAIL 23 production merge_pr_in_process / CLI gates:\n"
+            f"FAIL 24 production merge_pr_in_process / CLI gates:\n"
             f"  spoof_ship=({r_spoof_ship.returncode},{r_spoof_ship.stderr.strip()!r}) "
             f"spoof_post=({r_spoof_post.returncode},{r_spoof_post.stderr.strip()!r})\n"
             f"  infer_ship=({r_infer_ship.returncode},{r_infer_ship.stdout.strip()!r})\n"
             f"  rev_req_rc={r_guarded_rev_req.returncode} chg_req_rc={r_changes_req.returncode}\n"
             f"  drv_missing={r_drv_missing.returncode} drv_spoof={r_drv_spoof.returncode} "
-            f"rc_rr=({rc_rr},{tag_rr}) drv_tb={r_drv_tiebreak.returncode}\n"
+            f"rc_rr=({rc_rr},{tag_rr}) rc_tb=({rc_tb},{tag_tb}) drv_tb={r_drv_tiebreak.returncode}\n"
             f"  g_pause=({ok_g_pause},{reason_g_pause}) drv_pm=({r_drv_paused_main.returncode},{drv_pm_json})\n"
             f"  live_merge=({ok_live_merge},{reason_live_merge}) seq={live_seq}"
         )
         failures += 1
     else:
-        print("PASS 23 verifies merge_pr_in_process, GitHubBus.merge_pr callback order, caller anti-spoofing, and drive-consensus CLI")
+        print("PASS 24 verifies merge_pr_in_process, GitHubBus.merge_pr callback order, caller anti-spoofing, and drive-consensus CLI")
+
+    # 25. Governance gate on the `paf ship` path (Leo, 2026-11-16): consensus alone merges a governance PR; a
+    #     single-model blind receipt, an author-only marker, or a PR that strips `governance_requires_human` still pauses
+    gs_repo = pathlib.Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-b", "main"], cwd=gs_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@example.test"], cwd=gs_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=gs_repo, check=True)
+    (gs_repo / ".agent-verify.json").write_text(
+        json.dumps({"zone": "autonomous", "default_branch": "main", "allow_lint_only": True, "commands": {}}),
+        encoding="utf-8",
+    )
+    (gs_repo / "CORE.md").write_text("rule v1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=gs_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=gs_repo, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "feature/rule"], cwd=gs_repo, check=True, capture_output=True)
+    (gs_repo / "CORE.md").write_text("rule v2\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-am", "rule v2"], cwd=gs_repo, check=True, capture_output=True)
+    gs_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=gs_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+    gs_fix = gs_repo / ".git" / "pr-gs.json"
+
+    def gs_fixture(head: str, body: str, comments: list[dict[str, str]], files: list[str]) -> None:
+        gs_fix.write_text(
+            json.dumps(
+                {
+                    "number": 201,
+                    "url": "https://example.test/pr/201",
+                    "state": "OPEN",
+                    "headRefName": "feature/rule",
+                    "baseRefName": "main",
+                    "headRefOid": head,
+                    "body": body,
+                    "comments": comments,
+                    "files": [{"path": f} for f in files],
+                    "changedFiles": len(files),
+                    "reviewDecision": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def gs_ship() -> subprocess.CompletedProcess[str]:
+        return run_paf(
+            ["ship", "--repo", str(gs_repo), "--base", "main", "--pr-fixture", str(gs_fix), "--dry-run"], cwd=gs_repo
+        )
+
+    gs_author = f'<!-- paf-consensus: {{"role":"author","model_family":"claude","verdict":"open","head_sha":"{gs_sha}"}} -->'
+    gs_approve = (
+        f'<!-- paf-consensus: {{"role":"reviewer","model_family":"gemini","verdict":"approve","head_sha":"{gs_sha}","round":1}} -->'
+    )
+    # (a) verified dual-model consensus on head: no governance pause
+    gs_fixture(gs_sha, gs_author, [{"body": gs_approve}], ["CORE.md"])
+    r_gs_cons = gs_ship()
+    # (b) author-only marker: not consensus, must not slip past the gate
+    gs_fixture(gs_sha, gs_author, [], ["CORE.md"])
+    r_gs_author_only = gs_ship()
+    # (c) single-model blind receipt only, no PR markers: pause
+    run_paf(
+        ["record-review", "--repo", str(gs_repo), "--verdict", "approve", "--reviewer", "blind", "--summary", "ok"],
+        cwd=gs_repo,
+    )
+    gs_fixture(gs_sha, "plain body", [], ["CORE.md"])
+    r_gs_blind = gs_ship()
+    # (d) base sets governance_requires_human; the PR strips it in its own tree: still pause despite consensus
+    subprocess.run(["git", "checkout", "main"], cwd=gs_repo, check=True, capture_output=True)
+    (gs_repo / ".agent-verify.json").write_text(
+        json.dumps(
+            {
+                "zone": "autonomous",
+                "default_branch": "main",
+                "allow_lint_only": True,
+                "governance_requires_human": True,
+                "commands": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "commit", "-am", "require human"], cwd=gs_repo, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "feature/strip"], cwd=gs_repo, check=True, capture_output=True)
+    (gs_repo / ".agent-verify.json").write_text(
+        json.dumps({"zone": "autonomous", "default_branch": "main", "allow_lint_only": True, "commands": {}}),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "commit", "-am", "strip"], cwd=gs_repo, check=True, capture_output=True)
+    strip_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=gs_repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+    gs_fixture(
+        strip_sha,
+        gs_author.replace(gs_sha, strip_sha),
+        [{"body": gs_approve.replace(gs_sha, strip_sha)}],
+        [".agent-verify.json"],
+    )
+    r_gs_strip = gs_ship()
+    gs_ok = (
+        "PAUSED_FOR_GOVERNANCE_APPROVAL" not in r_gs_cons.stdout
+        and "MERGE_READY" in r_gs_cons.stdout
+        and "MERGE_READY" not in r_gs_author_only.stdout
+        and "PAUSED_FOR_GOVERNANCE_APPROVAL" in r_gs_blind.stdout
+        and "PAUSED_FOR_GOVERNANCE_APPROVAL" in r_gs_strip.stdout
+    )
+    if not gs_ok:
+        print(
+            "FAIL ship-path governance gate: "
+            f"cons={r_gs_cons.stdout.strip()!r}/{r_gs_cons.stderr.strip()[-200:]!r} "
+            f"author_only={r_gs_author_only.stdout.strip()!r}/{r_gs_author_only.stderr.strip()[-200:]!r} "
+            f"blind={r_gs_blind.stdout.strip()!r}/{r_gs_blind.stderr.strip()[-200:]!r} "
+            f"strip={r_gs_strip.stdout.strip()!r}/{r_gs_strip.stderr.strip()[-200:]!r}"
+        )
+        failures += 1
+    else:
+        print("PASS ship-path governance gate: consensus merges; author-only, blind-only and self-stripped flag pause")
 
     return 1 if failures else 0
 

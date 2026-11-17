@@ -17,8 +17,9 @@ Use this skill after committing changes on a feature branch (never on `main`/`ma
    - **Run `post_merge_check`, and if `deploy` (`commands.deploy` or `deploy_workflows`) is configured, execute `deploy` and then test again (`post_deploy_check`)**, auto-reverting on regression.
 2. If a sibling PR landed on `main` first and `paf merge-consensus` fails closed on a base conflict, rebuild the branch onto `origin/main` and re-verify tests + CI; because the rebuilt branch has a new `headRefOid`, obtain a fresh SHA-pinned `approve` on the new SHA before merging.
 3. Escalate / pause for Leo ONLY when:
-   - Consensus exceeds `max_rounds` without approval (`PAUSED_FOR_CONSENSUS_TIEBREAK`),
-   - A genuine product/UX preference trade-off requires his call (`--needs-human-decision`), or
+   - Consensus exceeds `max_rounds` (default `3`) without approval (`PAUSED_FOR_CONSENSUS_TIEBREAK`),
+   - A product/UX preference trade-off requires his call (`--needs-human-decision`),
+   - A PR modifies governance or permission-granting files (`CORE.md`, `AGENTS.md`, `CLAUDE.md`, `PERMISSIONS.md`, `FEEDBACK.md`, `.agent-verify.json`, `bin/paf`, hooks, workflows, `launchd/`, `DailyJob/`, skills) WITHOUT verified dual-model consensus, or the repo sets `"governance_requires_human": true` on the base branch -> pauses at `PAUSED_FOR_GOVERNANCE_APPROVAL` until `--approved-governance` (with dual-model consensus + green CI, governance PRs merge directly like any other PR; Leo, 2026-11-16 — the PR description must state plainly which rule or permission changed so Leo can see it afterwards; `governance_requires_human` is read from the base branch, so a PR cannot strip its own gate), or
    - `zone: "guarded"` targets any branch outside `staging_branches` (`main`, `master`, `release/*`) -> pauses at `PAUSED_FOR_MAIN_APPROVAL` until `--approved-main` (and always yields to required human colleague reviews and any stricter workspace `CLAUDE.md` rule).
 
 ## Trust Boundaries & Marker Semantics
@@ -43,6 +44,8 @@ Use this skill after committing changes on a feature branch (never on `main`/`ma
 3. **Check or Resume Merge on an Already-Approved Consensus PR**:
    ```bash
    paf check-consensus --repo . --pr <num>
-   paf merge-consensus --repo . --pr <num>                  # autonomous or guarded staging
-   paf merge-consensus --repo . --pr <num> --approved-main  # guarded non-staging after Leo's approve
+   paf merge-consensus --repo . --pr <num>                        # autonomous or guarded staging
+   paf merge-consensus --repo . --pr <num> --approved-governance  # repo sets governance_requires_human, after Leo's ok
+   paf ship --repo . --base main --approved-governance             # governance PR with only a blind-review receipt, after Leo's ok
+   paf merge-consensus --repo . --pr <num> --approved-main        # guarded non-staging after Leo's approve
    ```
