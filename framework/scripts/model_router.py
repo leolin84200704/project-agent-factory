@@ -287,12 +287,23 @@ def _extract_changed_patch_lines(diff_patch: str) -> tuple[int, str]:
         return 0, ""
     changed_lines: list[str] = []
     count = 0
+    current_is_prose_doc = False
     for line in diff_patch.splitlines():
-        if line.startswith(("+++", "---", "@@")):
+        if line.startswith("+++ "):
+            raw_target = line[4:].strip()
+            if raw_target.startswith("b/"):
+                raw_target = raw_target[2:]
+            current_is_prose_doc = (
+                Path(raw_target).suffix.lower() in TRIVIAL_DOC_EXTS
+                and not CRITICAL_PATH_RE.search(raw_target)
+                and not COMPLEX_GOVERNANCE_PATH_RE.search(raw_target)
+            )
+            continue
+        if line.startswith(("---", "@@")):
             continue
         if line.startswith(("+", "-")):
             count += 1
-            if len(changed_lines) < 400:
+            if not current_is_prose_doc and len(changed_lines) < 400:
                 changed_lines.append(line[1:])
     return count, "\n".join(changed_lines)
 
@@ -316,6 +327,15 @@ def assess_task_complexity(
         return clamped, [f"explicit_tier={explicit_tier}"]
 
     files = [re.sub(r"^(?:\./)+", "", str(f).strip()) for f in (changed_files or []) if str(f).strip()]
+    crit_files = [f for f in files if CRITICAL_PATH_RE.search(f)]
+    gov_files = [f for f in files if COMPLEX_GOVERNANCE_PATH_RE.search(f)]
+    pure_non_gov_docs = (
+        bool(files)
+        and all(Path(f).suffix.lower() in TRIVIAL_DOC_EXTS for f in files)
+        and not crit_files
+        and not gov_files
+    )
+
     patch_line_count, patch_sample = _extract_changed_patch_lines(diff_patch)
     eff_diff_lines = int(diff_lines) if diff_lines is not None else patch_line_count
     combined_text = "\n".join(part for part in (title, description[:4000], patch_sample) if part)
@@ -334,13 +354,13 @@ def assess_task_complexity(
     if eff_diff_lines > 1200:
         critical_reasons.append(f"diff_lines={eff_diff_lines} (>1200)")
 
-    crit_files = [f for f in files if CRITICAL_PATH_RE.search(f)]
     if crit_files:
         critical_reasons.append(f"critical_paths={','.join(crit_files[:3])}")
 
-    crit_kw = CRITICAL_TEXT_RE.search(combined_text)
-    if crit_kw:
-        critical_reasons.append(f"critical_signal='{crit_kw.group(1).lower()}'")
+    if not pure_non_gov_docs:
+        crit_kw = CRITICAL_TEXT_RE.search(combined_text)
+        if crit_kw:
+            critical_reasons.append(f"critical_signal='{crit_kw.group(1).lower()}'")
 
     if critical_reasons:
         tier = _clamp_tier("critical", cfg.get("min_tier"), cfg.get("max_tier"))
@@ -355,20 +375,19 @@ def assess_task_complexity(
     if eff_diff_lines > 400:
         complex_reasons.append(f"diff_lines={eff_diff_lines} (>400)")
 
-    gov_files = [f for f in files if COMPLEX_GOVERNANCE_PATH_RE.search(f)]
     if gov_files:
         complex_reasons.append(f"governance_or_engine_paths={','.join(gov_files[:3])}")
 
-    cplx_kw = COMPLEX_TEXT_RE.search(combined_text)
-    if cplx_kw:
-        complex_reasons.append(f"complex_signal='{cplx_kw.group(1).lower()}'")
+    if not pure_non_gov_docs:
+        cplx_kw = COMPLEX_TEXT_RE.search(combined_text)
+        if cplx_kw:
+            complex_reasons.append(f"complex_signal='{cplx_kw.group(1).lower()}'")
 
     if complex_reasons:
         tier = _clamp_tier("complex", cfg.get("min_tier"), cfg.get("max_tier"))
         return tier, complex_reasons
 
-    all_docs = bool(files) and all(Path(f).suffix.lower() in TRIVIAL_DOC_EXTS for f in files)
-    if all_docs and len(files) <= 3 and eff_diff_lines <= 120:
+    if pure_non_gov_docs and len(files) <= 3 and eff_diff_lines <= 120:
         tier = _clamp_tier("trivial", cfg.get("min_tier"), cfg.get("max_tier"))
         return tier, [f"docs_only ({len(files)} file(s), {eff_diff_lines} diff lines)"]
 

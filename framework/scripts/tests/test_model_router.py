@@ -537,6 +537,25 @@ def main() -> int:
     else:
         print("PASS 8 `run_consensus_dialogue` starts on fast standard tier and escalates model on contested Round 2")
 
+    # 9. Pure non-governance docs mentioning words like "Stripe" or "HMAC" stay `trivial`, whereas `PERMISSIONS.md` is `critical`
+    p_doc_kw = mr.select_task_models(
+        title="docs: explain Stripe webhook HMAC verification in README",
+        changed_files=["README.md"],
+        diff_patch="--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n+Verify Stripe webhook HMAC header.\n",
+        author_family="claude",
+    )
+    p_perm_doc = mr.select_task_models(
+        title="Update PERMISSIONS.md",
+        changed_files=["PERMISSIONS.md"],
+        diff_lines=10,
+        author_family="claude",
+    )
+    if p_doc_kw["tier"] != "trivial" or p_perm_doc["tier"] != "critical":
+        print(f"FAIL 9 doc keyword vs critical doc guard: doc_kw={p_doc_kw['tier']} perm={p_perm_doc['tier']}")
+        failures += 1
+    else:
+        print("PASS 9 pure README mentioning HMAC/Stripe stays `trivial` while `PERMISSIONS.md` escalates to `critical`")
+
     return 1 if failures else 0
 
 
