@@ -525,8 +525,34 @@ def _clean_git_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def resolve_gemini_key_file() -> Path:
+    env_val = os.environ.get("PAF_GEMINI_KEY_FILE", "").strip()
+    return Path(env_val).expanduser() if env_val else DEFAULT_KEY_FILE.parent / "gemini.key"
+
+
+def gemini_api_key(base_env: dict[str, str] | None = None) -> str:
+    """The Gemini API key for agy: the environment first, then the key file.
+
+    The key used to live only in the interactive shell profile. A shell that does not read it (a background
+    job, launchd, cron, CI) started agy without GEMINI_API_KEY and the review stopped on its first step, three
+    times in three days (2026-11-16 to 2026-11-18). The file makes the key independent of how paf was started.
+    """
+    env = base_env if base_env is not None else os.environ
+    value = (env.get("GEMINI_API_KEY") or "").strip()
+    if value:
+        return value
+    try:
+        return resolve_gemini_key_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def _scrubbed_reviewer_env(target_family: str) -> dict[str, str]:
     env = _clean_git_env()
+    if target_family == "gemini" and not (env.get("GEMINI_API_KEY") or "").strip():
+        key = gemini_api_key(env)
+        if key:
+            env["GEMINI_API_KEY"] = key
     for key in list(env.keys()):
         upper = key.upper()
         if (
