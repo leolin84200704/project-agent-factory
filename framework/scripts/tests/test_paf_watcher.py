@@ -486,6 +486,31 @@ def main() -> int:
         print(f"FAIL 3-6 import paf_watcher: {exc}")
         return 1
 
+    # 3-0: the Gemini key comes from the key file when the environment that started paf does not carry it
+    key_dir = pathlib.Path(tempfile.mkdtemp(prefix="paf-gemini-key-"))
+    key_path = key_dir / "gemini.key"
+    key_path.write_text("file-key\n", encoding="utf-8")
+    saved_env = {k: os.environ.pop(k, None) for k in ("GEMINI_API_KEY", "PAF_GEMINI_KEY_FILE")}
+    try:
+        os.environ["PAF_GEMINI_KEY_FILE"] = str(key_path)
+        from_file = paf_watcher._scrubbed_reviewer_env("gemini").get("GEMINI_API_KEY")
+        for_claude = paf_watcher._scrubbed_reviewer_env("claude").get("GEMINI_API_KEY")
+        os.environ["GEMINI_API_KEY"] = "env-key"
+        from_env = paf_watcher._scrubbed_reviewer_env("gemini").get("GEMINI_API_KEY")
+        os.environ.pop("GEMINI_API_KEY")
+        os.environ["PAF_GEMINI_KEY_FILE"] = str(key_dir / "absent.key")
+        no_file = paf_watcher._scrubbed_reviewer_env("gemini").get("GEMINI_API_KEY")
+    finally:
+        for k, v in saved_env.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+        shutil.rmtree(key_dir, ignore_errors=True)
+    if (from_file, for_claude, from_env, no_file) != ("file-key", None, "env-key", None):
+        print(f"FAIL 3-0 gemini key file: {(from_file, for_claude, from_env, no_file)}")
+        return 1
+    print("PASS 3-0 reviewer env takes GEMINI_API_KEY from the key file when unset, env wins, claude never gets it")
+
     # 3 & 4: Claim lock resolution (active claim by other host blocks; expired claim yields; earliest claim wins tie-break)
     now_utc = dt.datetime(2026, 11, 16, 8, 0, 0, tzinfo=dt.timezone.utc)
     future_iso = (now_utc + dt.timedelta(minutes=10)).isoformat()
