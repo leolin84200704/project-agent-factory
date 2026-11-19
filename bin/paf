@@ -17,7 +17,8 @@ Commands:
   paf install-watcher  Generate (and optionally load) macOS launchd StartInterval plist for `paf watch-prs`
   paf ship             Autonomous PR -> CI -> Consensus / Blind Review -> atomic merge -> post-merge verify -> auto-revert
   paf select-model     Assess task/PR complexity and select optimal Gemini 4 / Claude 5 models & efforts per role
-  paf factcheck        Run every claim's command and write a fact-check receipt (framework/FACT-CHECK.md)
+  paf factcheck        Run every claim's command, optionally dual-model verify, and write a receipt (framework/FACT-CHECK.md)
+  paf tests-fail-on-base  Prove new/modified tests fail on the base commit and pass on head
   paf audit            Audit agent/product repos for manifest, `.agent-verify.json`, script drift, and index bloat
   paf garden           Run codebase hygiene checks (dune_lint, stale merged branches, unmerged proposals)
 """
@@ -45,6 +46,7 @@ MEMORY_SCORING_PATH = FACTORY_ROOT / "framework" / "scripts" / "memory_scoring.p
 PAF_WATCHER_PATH = FACTORY_ROOT / "framework" / "scripts" / "paf_watcher.py"
 MODEL_ROUTER_PATH = FACTORY_ROOT / "framework" / "scripts" / "model_router.py"
 FACTCHECK_PATH = FACTORY_ROOT / "framework" / "scripts" / "factcheck.py"
+TESTS_FAIL_ON_BASE_PATH = FACTORY_ROOT / "framework" / "scripts" / "tests_fail_on_base.py"
 DUNE_LINT_PATH = FACTORY_ROOT / "framework" / "checks" / "dune_lint.py"
 GIT_BIN = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
 RESTRICTED_PRIVATE_REPO = "mind" + "-" + "state"
@@ -2677,12 +2679,7 @@ def cmd_select_model(args: argparse.Namespace) -> int:
 
 def cmd_factcheck(args: argparse.Namespace) -> int:
     mod = _load_module("factcheck", FACTCHECK_PATH)
-    argv = [str(args.claims), "--timeout", str(args.timeout)]
-    if args.out_dir:
-        argv += ["--out-dir", str(args.out_dir)]
-    if args.json:
-        argv.append("--json")
-    return int(mod.main(argv))
+    return int(mod.main(list(args.factcheck_argv)))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2898,13 +2895,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     s_fc = sub.add_parser(
         "factcheck",
-        help="run every claim's command and write a fact-check receipt (framework/FACT-CHECK.md)",
+        help="run every claim's command, optionally dual-model verify, and write a receipt (framework/FACT-CHECK.md)",
+        add_help=False,
     )
-    s_fc.add_argument("claims", type=Path, help="claims JSON file")
-    s_fc.add_argument("--timeout", type=int, default=120, help="seconds per command")
-    s_fc.add_argument("--out-dir", type=Path, default=None, help="receipt directory (default ~/.cache/paf/factcheck)")
-    s_fc.add_argument("--json", action="store_true", help="print the receipt as JSON")
-    s_fc.set_defaults(func=cmd_factcheck)
+    s_fc.set_defaults(func=cmd_factcheck, factcheck_argv=[])
+    sub.add_parser(
+        "tests-fail-on-base",
+        help="prove new/modified tests fail on the base commit and pass on head",
+        add_help=False,
+    )
 
     s_aud = sub.add_parser("audit", help="audit agent and product repos across workspace")
     s_aud.add_argument(
@@ -2924,6 +2923,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "factcheck":
+        # All options belong to framework/scripts/factcheck.py; pass them through untouched.
+        return int(_load_module("factcheck", FACTCHECK_PATH).main(raw[1:]))
+    if raw and raw[0] == "tests-fail-on-base":
+        return int(_load_module("tests_fail_on_base", TESTS_FAIL_ON_BASE_PATH).main(raw[1:]))
     parser = build_parser()
     args = parser.parse_args(argv)
     return int(args.func(args))

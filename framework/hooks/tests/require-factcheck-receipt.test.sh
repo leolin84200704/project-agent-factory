@@ -14,7 +14,7 @@ run() {  # run <expected_exit> <label> <tool_name> <tool_input-json> [mode]
   local want="$1" label="$2" tool="$3" ti="$4" mode="${5:-block}" got mark='ok  '
   n=$((n+1))
   jq -cn --arg t "$tool" --argjson ti "$ti" --arg s "sess-$n" \
-    '{session_id:$s, tool_name:$t, tool_input:$ti}' | PAF_FACTCHECK_MODE="$mode" "$HOOK" >/dev/null 2>&1; got=$?
+    '{session_id:$s, tool_name:$t, tool_input:$ti}' | PAF_FACTCHECK_MODE="$mode" PAF_FACTCHECK_REQUIRE_DUAL="${PAF_FACTCHECK_REQUIRE_DUAL:-0}" "$HOOK" >/dev/null 2>&1; got=$?
   if [ "$got" != "$want" ]; then mark='FAIL'; fails=$((fails+1)); fi
   printf '[%s] want=%s got=%s | %s\n' "$mark" "$want" "$got" "$label"
 }
@@ -54,6 +54,31 @@ receipt r-jira pass "VP-77"
 run 0 'matching receipt (bare key)' mcp__claude_ai_Atlassian_MCP__addOrEditJiraIssueComment '{"issueIdOrKey":"VP-77","commentBody":"x"}'
 receipt r-old pass "slack:C5"; touch -t 202001010000 "$PAF_FACTCHECK_DIR/r-old.json"
 run 2 'stale receipt ignored'      "$SLACK" '{"channel_id":"C5","message":"x"}'
+
+echo "--- require dual-model receipts ---"
+KEY="$TMP/consensus.key"; printf 'test-secret-0123456789abcdef\n' > "$KEY"; chmod 600 "$KEY"
+export PAF_CONSENSUS_KEY_FILE="$KEY"
+signed_receipt() {  # signed_receipt <name> <target> <dual true|false> <verifier_family> [bad]
+  python3 - "$PAF_FACTCHECK_DIR/$1.json" "$2" "$3" "$4" "${5:-}" <<'PY'
+import hashlib, hmac, json, sys
+path, target, dual, fam, bad = sys.argv[1:6]
+r = {"version": 2, "status": "pass", "target": target, "dual_model": dual == "true",
+     "verification": {"status": "pass" if dual == "true" else "fail", "family": fam, "author_family": "claude"}}
+canon = json.dumps(r, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+r["sig"] = "0" * 64 if bad else hmac.new(b"test-secret-0123456789abcdef", canon, hashlib.sha256).hexdigest()
+open(path, "w").write(json.dumps(r))
+PY
+}
+signed_receipt d-single C7 false gemini
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'single-model receipt refused' "$SLACK" '{"channel_id":"C7","message":"x"}'
+run 0 'single-model receipt ok when dual not required' "$SLACK" '{"channel_id":"C7","message":"x"}'
+signed_receipt d-dual C8 true gemini
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 0 'dual receipt with valid sig' "$SLACK" '{"channel_id":"C8","message":"x"}'
+signed_receipt d-same C9 true claude
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'same-family verifier refused' "$SLACK" '{"channel_id":"C9","message":"x"}'
+signed_receipt d-forged C10 true gemini bad
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'bad signature refused' "$SLACK" '{"channel_id":"C10","message":"x"}'
+if grep -q '"verification":"dual"' "$PAF_FACTCHECK_DIR/hook-log.jsonl"; then echo "[ok  ] log records dual"; else echo "[FAIL] log lacks dual"; fails=$((fails+1)); fi
 
 echo "--- warn mode: pauses once, re-run passes ---"
 P=$(jq -cn --arg t "$SLACK" '{session_id:"w", tool_name:$t, tool_input:{channel_id:"C6",message:"x"}}')

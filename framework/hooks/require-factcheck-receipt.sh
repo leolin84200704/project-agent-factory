@@ -24,6 +24,11 @@
 # appears in the tool call. Receipts live in PAF_FACTCHECK_DIR
 # (default ~/.cache/paf/factcheck).
 #
+# PAF_FACTCHECK_REQUIRE_DUAL=1 accepts only receipts that passed dual-model
+# verification (`paf factcheck --verify`): verifier family differs from the
+# author's, and the receipt's HMAC (consensus key) is valid. Every log line
+# records whether the matching receipt was dual or single.
+#
 # Modes (PAF_FACTCHECK_MODE):
 #   warn  (default) pause once per session and target with instructions; the same
 #         call re-run passes and is logged as an override. Use this for the
@@ -78,11 +83,30 @@ DIR="${PAF_FACTCHECK_DIR:-$HOME/.cache/paf/factcheck}"
 MAX_AGE="${PAF_FACTCHECK_MAX_AGE_MIN:-120}"
 mkdir -p "$DIR" 2>/dev/null
 
-MATCH=$(DIR="$DIR" MAX_AGE="$MAX_AGE" TI="$TI" python3 - <<'PY'
-import json, os, time
+REQUIRE_DUAL="${PAF_FACTCHECK_REQUIRE_DUAL:-0}"
+MATCH=$(DIR="$DIR" MAX_AGE="$MAX_AGE" TI="$TI" REQUIRE_DUAL="$REQUIRE_DUAL" python3 - <<'PY'
+import hashlib, hmac, json, os, time
 from pathlib import Path
 d = Path(os.environ["DIR"]); max_age = float(os.environ["MAX_AGE"]) * 60
-ti = os.environ["TI"]
+ti = os.environ["TI"]; require_dual = os.environ["REQUIRE_DUAL"] == "1"
+key_file = Path(os.environ.get("PAF_CONSENSUS_KEY_FILE") or Path.home() / ".config/paf/consensus.key")
+try:
+    secret = key_file.read_text().strip()
+except OSError:
+    secret = ""
+
+def dual_ok(r):
+    ver = r.get("verification") or {}
+    if not (r.get("dual_model") and ver.get("status") == "pass"):
+        return False
+    if not ver.get("family") or ver.get("family") == ver.get("author_family"):
+        return False
+    if not (secret and r.get("sig")):
+        return False
+    body = {k: v for k, v in r.items() if k not in ("sig", "receipt_path")}
+    canon = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hmac.compare_digest(hmac.new(secret.encode(), canon, hashlib.sha256).hexdigest(), r["sig"])
+
 now = time.time()
 for p in sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
     if now - p.stat().st_mtime > max_age:
@@ -95,15 +119,21 @@ for p in sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
         continue
     t = str(r.get("target") or "").strip()
     keys = {t, t.split(":", 1)[-1]} - {""}
-    if any(k in ti for k in keys):
-        print(p.name); break
+    if not any(k in ti for k in keys):
+        continue
+    dual = dual_ok(r)
+    if require_dual and not dual:
+        continue
+    print(f"{p.name}|{'dual' if dual else 'single'}"); break
 PY
 )
+DUAL="${MATCH##*|}"; [ "$DUAL" = "$MATCH" ] && DUAL=""
+MATCH="${MATCH%%|*}"
 
 log() {  # log <decision>
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg s "$SESSION" --arg t "$TOOL" \
-     --arg k "$KIND" --arg m "$MODE" --arg d "$1" --arg r "$MATCH" \
-     '{ts:$ts, session:$s, tool:$t, kind:$k, mode:$m, decision:$d, receipt:$r}' \
+     --arg k "$KIND" --arg m "$MODE" --arg d "$1" --arg r "$MATCH" --arg v "$DUAL" \
+     '{ts:$ts, session:$s, tool:$t, kind:$k, mode:$m, decision:$d, receipt:$r, verification:$v}' \
      >> "$DIR/hook-log.jsonl" 2>/dev/null
 }
 
@@ -135,6 +165,7 @@ Each verified claim needs a command (SELECT, grep, kubectl, gh, API call) that
 actually returns data. "None / missing / broken" claims need a control on a known
 positive. Identity and still-in-use claims need an independent cross-check.
 Set "target" to the channel id, issue key, PR or table so this hook can match it.
+Add --verify for dual-model verification (required when PAF_FACTCHECK_REQUIRE_DUAL=1).
 See ${FACTORY_ROOT}/framework/FACT-CHECK.md.
 MSG
 if [ "$MODE" = "warn" ]; then
