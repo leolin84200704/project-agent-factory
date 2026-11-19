@@ -78,7 +78,7 @@ STM 和 handoff 的 Verified facts 只放已驗證的內容，推論另列一欄
 
 ### 權威來源表（每個 instance 一份）
 借自 pstack 的 feature map：每一種資料（practice、provider、order……）寫明權威來源是哪張表、怎麼查，以及哪些欄位只是標籤或衍生值。
-`paf factcheck` 讀 `--sources` 或 `PAF_FACTCHECK_SOURCES`。來源寫成衍生欄位的事實直接失敗；來源不在表上的會記一筆，交給審查判斷。
+`paf factcheck` 依序讀 `--sources`、`PAF_FACTCHECK_SOURCES`，都沒有時，找目前所在 git repo 根目錄的 `ground-truth-sources.json` 或 `reference/ground-truth-sources.json`。所以 instance 只要把檔案放在 repo 裡，不用改 settings。來源寫成衍生欄位的事實直接失敗；來源不在表上的會記一筆，交給審查判斷。
 驗證模型做盲測時也靠這張表知道該去哪裡查。格式見 `framework/scripts/factcheck.py` 的 docstring。
 
 ### 程式碼修改

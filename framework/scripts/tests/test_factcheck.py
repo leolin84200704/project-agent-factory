@@ -187,6 +187,27 @@ class SourceMatchTest(unittest.TestCase):
         self.assertTrue(fc.sources_match("AGENTS.md", "/repo/AGENTS.md", Path("/repo")))
 
 
+class DiscoveryTest(Base):
+    def test_registry_found_in_repo_reference_dir(self):
+        repo = self.dir / "inst"
+        (repo / "reference").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        reg = repo / "reference" / "ground-truth-sources.json"
+        reg.write_text(json.dumps(REGISTRY))
+        (repo / "sub").mkdir()
+        self.assertEqual(fc.discover_sources(repo / "sub").resolve(), reg.resolve())
+        self.assertIsNone(fc.discover_sources(self.dir))
+
+    def test_env_overrides_discovery(self):
+        reg = self.dir / "explicit.json"
+        reg.write_text(json.dumps(REGISTRY))
+        os.environ["PAF_FACTCHECK_SOURCES"] = str(reg)
+        try:
+            self.assertEqual(fc.load_sources(None)["_path"], str(reg))
+        finally:
+            os.environ.pop("PAF_FACTCHECK_SOURCES", None)
+
+
 class ReadOnlyTest(unittest.TestCase):
     def ok(self, cmd):
         self.assertIsNone(fc.readonly_problem(cmd, REGISTRY), cmd)

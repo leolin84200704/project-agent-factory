@@ -38,7 +38,10 @@ Claims file (JSON):
   ]
 }
 
-Sources registry (JSON, --sources or PAF_FACTCHECK_SOURCES), kept per instance:
+Sources registry (JSON), kept per instance. Lookup order: --sources, then
+$PAF_FACTCHECK_SOURCES, then ground-truth-sources.json or
+reference/ground-truth-sources.json at the root of the git repo containing the
+current directory:
 {
   "phi": true,
   "runners": [{"prefix": "python3 /path/lis-readonly-query.py", "kind": "sql",
@@ -231,10 +234,28 @@ def run_summary(run: dict[str, Any] | None, phi: bool) -> dict[str, Any]:
 # ---------------------------------------------------------------- registry
 
 
+SOURCES_CANDIDATES = ("ground-truth-sources.json", "reference/ground-truth-sources.json")
+
+
+def discover_sources(start: Path | None = None) -> Path | None:
+    """Convention: the git repo containing the current directory holds its registry at one of
+    SOURCES_CANDIDATES. Lets an instance ship its registry without touching settings files."""
+    try:
+        top = subprocess.run(["git", "-C", str(start or Path.cwd()), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    for rel in SOURCES_CANDIDATES:
+        cand = Path(top) / rel
+        if cand.is_file():
+            return cand
+    return None
+
+
 def load_sources(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         env = os.environ.get("PAF_FACTCHECK_SOURCES", "").strip()
-        path = Path(env).expanduser() if env else None
+        path = Path(env).expanduser() if env else discover_sources()
     if path is None or not path.is_file():
         return None
     data = json.loads(path.read_text())
