@@ -120,6 +120,81 @@ def make_pr_json(
     }
 
 
+def _agy_settings_only_deny_key(argv: list, key_file: pathlib.Path) -> bool:
+    if "--settings" not in argv:
+        return False
+    try:
+        settings = json.loads(argv[argv.index("--settings") + 1])
+    except (ValueError, IndexError):
+        return False
+    perms = settings.get("permissions") or {}
+    return (
+        set(settings) == {"permissions"}
+        and set(perms) == {"deny"}
+        and f"read_file({key_file.resolve()})" in perms["deny"]
+    )
+
+
+def check_key_shield_modes() -> int:
+    """Shield is off by default and does not serialize sessions; PAF_SHIELD_KEY_DURING_REVIEW=1 restores it."""
+    import threading
+
+    sys.path.insert(0, str(REPO_ROOT / "framework" / "scripts"))
+    import paf_watcher  # type: ignore
+
+    failures = 0
+    d = _mkdtemp("paf-shield-")
+    key = d / "consensus.key"
+    key.write_text("k" * 64 + "\n", encoding="utf-8")
+    key.chmod(0o600)
+    old = os.environ.pop(paf_watcher.SHIELD_ENV, None)
+    try:
+        # Default: two reviews overlap, and a third session can read the key while both run.
+        inside = threading.Barrier(3, timeout=5)
+        seen: list = []
+
+        def review() -> None:
+            with paf_watcher._shield_key_file(key):
+                inside.wait()
+                seen.append(paf_watcher.load_consensus_secret(key, wait_sec=0.5))
+                inside.wait()
+
+        threads = [threading.Thread(target=review) for _ in range(2)]
+        for t in threads:
+            t.start()
+        try:
+            inside.wait()
+            mode_during = oct(stat.S_IMODE(key.stat().st_mode))
+            third = paf_watcher.load_consensus_secret(key, wait_sec=0.5)
+            inside.wait()
+            overlapped = True
+        except threading.BrokenBarrierError:
+            overlapped, mode_during, third = False, "", None
+        for t in threads:
+            t.join(5)
+        if not overlapped or mode_during != "0o600" or third != "k" * 64 or seen != ["k" * 64] * 2:
+            print(f"FAIL shield default: overlapped={overlapped} mode={mode_during} third={bool(third)} seen={len(seen)}")
+            failures += 1
+        else:
+            print("PASS shield default: two reviews overlap and a third session reads the key meanwhile")
+
+        # Opt-in: the old serial 0000 shield.
+        os.environ[paf_watcher.SHIELD_ENV] = "1"
+        with paf_watcher._shield_key_file(key):
+            mode_on = oct(stat.S_IMODE(key.stat().st_mode))
+        mode_after = oct(stat.S_IMODE(key.stat().st_mode))
+        if mode_on != "0o0" or mode_after != "0o600":
+            print(f"FAIL shield opt-in: {mode_on}->{mode_after}")
+            failures += 1
+        else:
+            print("PASS shield opt-in: PAF_SHIELD_KEY_DURING_REVIEW=1 sets 0000 during review and restores 0600")
+    finally:
+        os.environ.pop(paf_watcher.SHIELD_ENV, None)
+        if old is not None:
+            os.environ[paf_watcher.SHIELD_ENV] = old
+    return failures
+
+
 def main() -> int:
     failures = 0
 
@@ -672,7 +747,7 @@ def main() -> int:
         or "PAF_CONSENSUS_KEY_FILE" in agy_seen_env
         or "CLAUDECODE" in agy_seen_env
         or "--sandbox" not in agy_seen_args
-        or "--settings" in agy_seen_args                      # the reviewer is given no grant of its own
+        or not _agy_settings_only_deny_key(agy_seen_args, key_file)  # deny-only settings, no grant of its own
         or "--dangerously-skip-permissions" in agy_seen_args
         or "You have NO shell" not in " ".join(agy_seen_args)
         or not any(a.startswith("-p=") for a in agy_seen_args)
@@ -802,7 +877,8 @@ def main() -> int:
     # 9. Security hardening regressions (Round 1 Claude adversarial review):
     #    (a) Unreachable commit / failed detached worktree aborts fail-closed without claiming or stamping
     #    (b) Default repo (no `consensus` block in `.agent-verify.json`) still requires HMAC in `watch_repo_once`
-    #    (c) `consensus.key` is shielded to 0o000 during reviewer execution, restored to 0o600 after,
+    #    (c) `consensus.key` stays 0o600 during reviewer execution by default (the reviewer is confined
+    #        by its own CLI settings instead, so other paf sessions can keep signing and reviewing),
     #        Claude receives `--settings` with `Read(//...)` deny rules, and leaked key material in `prose` is blocked!
     mode_during_review = key_mode_dump.read_text(encoding="utf-8").strip() if key_mode_dump.is_file() else ""
     mode_after_review = oct(stat.S_IMODE(key_file.stat().st_mode))
@@ -916,7 +992,7 @@ def main() -> int:
     leaked_in_comments = any(first_secret[:16] in body for _, body in bus_leak.comments_posted)
 
     if (
-        mode_during_review != "0o0"
+        mode_during_review != "0o600"
         or mode_after_review != "0o600"
         or not has_claude_deny_setting
         or act_unreach.get("reviewed") != []
@@ -933,7 +1009,7 @@ def main() -> int:
         )
         failures += 1
     else:
-        print("PASS 9 blocks worktree/diff fail-open, enforces default watch HMAC, shields key 0000, and scrubs secret leaks")
+        print("PASS 9 blocks worktree/diff fail-open, enforces default watch HMAC, leaves key readable for parallel sessions, and scrubs secret leaks")
 
     # 10. Round 2 security & liveness regressions:
     #     (a) Claude `--allowedTools` is scoped to `Read(//<wt>/**)` with `--permission-mode dontAsk`,
@@ -1655,6 +1731,8 @@ print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": 
         failures += 1
     else:
         print("PASS 13 empty agy review names the denied tool calls instead of a JSON parse error")
+
+    failures += check_key_shield_modes()
 
     return 1 if failures else 0
 

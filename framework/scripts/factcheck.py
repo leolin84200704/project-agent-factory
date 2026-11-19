@@ -418,6 +418,21 @@ def readonly_problem(cmd: str, registry: dict[str, Any] | None) -> str | None:
 # ---------------------------------------------------------------- deterministic checks
 
 
+def _negative_no_match(kind: str, run: dict) -> bool:
+    """grep, rg and git grep exit 1 with no output when nothing matches.
+
+    For a negative claim that empty result is the expected answer, not a failed command,
+    so it does not count as an error. The control command still has to return data, and
+    exit 1 with any stdout or stderr (a real error) stays a failure.
+    """
+    return (
+        kind == "negative"
+        and run.get("exit_code") == 1
+        and not run.get("output_lines")
+        and not (run.get("stderr_excerpt") or "").strip()
+    )
+
+
 def check_claim(claim: dict[str, Any], timeout: int, cwd: Path | None, registry: dict[str, Any] | None) -> dict[str, Any]:
     cid = str(claim.get("id") or "").strip()
     label = claim.get("label", "verified")
@@ -468,7 +483,7 @@ def check_claim(claim: dict[str, Any], timeout: int, cwd: Path | None, registry:
 
     main = run_command(cmd, timeout, cwd)
     result["runs"]["command"] = main
-    if main["exit_code"] != 0:
+    if main["exit_code"] != 0 and not _negative_no_match(kind, main):
         problems.append(f"command exited {main['exit_code']}")
 
     if kind == "negative":
@@ -565,7 +580,9 @@ def call_verifier(family: str, model: str, effort: str | None, prompt: str, sche
             if family == "gemini":
                 cmd = [pw._ensure_executable_binary(os.environ.get("PAF_AGY_BIN", "agy"), "agy"),
                        "--output-format", "json", "--json-schema", schema_str,
-                       "--disable-slash-commands", "--sandbox", "--model", model, f"-p={prompt}"]
+                       "--disable-slash-commands", "--sandbox",
+                       "--settings", pw._agy_confinement_settings(None),
+                       "--model", model, f"-p={prompt}"]
                 if effort:
                     cmd[-1:-1] = ["--effort", effort]
                 proc = subprocess.run(cmd, cwd=empty_dir, env=pw._scrubbed_reviewer_env("gemini"),

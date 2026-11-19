@@ -305,11 +305,46 @@ def compute_key_id(secret: str) -> str:
     return hashlib.sha256(f"paf-key-id:v1:{secret}".encode("utf-8")).hexdigest()[:12]
 
 
+SHIELD_ENV = "PAF_SHIELD_KEY_DURING_REVIEW"
+
+
+def _key_shield_enabled() -> bool:
+    return (os.environ.get(SHIELD_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _agy_confinement_settings(key_file: Path | None) -> str:
+    """Session-only agy settings that deny reading the consensus key and its lock.
+
+    agy's headless sandbox already denies reads outside the workspace and every shell
+    command (probed 2026-11-19: a shell call stayed denied even with `command(**)`
+    allowed). These deny rules keep the key out of reach even if the user's own agy
+    settings allow reading it: in the same probe an exact-path `read_file(<path>)` allow
+    let agy read a canary file, and adding the same exact-path deny blocked it. A
+    `read_file(<dir>/**)` deny did not block it, so each path is listed literally.
+    """
+    target = resolve_key_file(key_file)
+    paths: list[str] = []
+    for cand in (target, target.expanduser().resolve(), _key_lock_path(target)):
+        sp = str(cand)
+        if sp not in paths:
+            paths.append(sp)
+    deny = [f"read_file({sp})" for sp in paths]
+    return json.dumps({"permissions": {"deny": deny}}, separators=(",", ":"))
+
+
 @contextlib.contextmanager
 def _shield_key_file(key_file: Path | None) -> Any:
-    """Acquire exclusive flock and set 0000 on consensus.key while untrusted model CLI runs."""
+    """Optionally set 0000 on consensus.key while an untrusted model CLI runs.
+
+    Off by default. Each reviewer CLI is confined instead (claude: allow rules scoped to
+    the worktree plus deny settings; agy: --sandbox plus `_agy_confinement_settings`), so
+    the key no longer has to be locked for the whole review. Holding an exclusive lock for
+    up to the review timeout serialized every paf session on the machine: one review at a
+    time, and no signing anywhere meanwhile. Set PAF_SHIELD_KEY_DURING_REVIEW=1 to restore
+    the serial 0000 shield as an extra layer.
+    """
     target = key_file.expanduser().resolve() if key_file is not None else None
-    if target is None or not os.path.lexists(target):
+    if target is None or not os.path.lexists(target) or not _key_shield_enabled():
         yield
         return
     lock_path = _key_lock_path(target)
@@ -993,6 +1028,7 @@ def run_agy_review(
     effort: str | None = None,
     resume_session_id: str | None = None,
     timeout_sec: int = 660,
+    key_file: Path | None = None,
 ) -> dict[str, Any]:
     exec_agy = _ensure_executable_binary(agy_bin, "agy")
     pre_ids = _snapshot_agy_brain_ids() if not resume_session_id else set()
@@ -1007,6 +1043,7 @@ def run_agy_review(
         "--disable-slash-commands",
         "--sandbox",
     ]
+    cmd.extend(["--settings", _agy_confinement_settings(key_file)])
     if resume_session_id:
         cmd.extend(["--conversation", resume_session_id])
     if model:
@@ -1153,6 +1190,7 @@ def run_agy_author_turn(
     effort: str | None = None,
     resume_session_id: str | None = None,
     timeout_sec: int = 1200,
+    key_file: Path | None = None,
 ) -> dict[str, Any]:
     exec_agy = _ensure_executable_binary(agy_bin, "agy")
     pre_ids = _snapshot_agy_brain_ids() if not resume_session_id else set()
@@ -1169,6 +1207,7 @@ def run_agy_author_turn(
         "--mode",
         "accept-edits",
     ]
+    cmd.extend(["--settings", _agy_confinement_settings(key_file)])
     if resume_session_id:
         cmd.extend(["--conversation", resume_session_id])
     if model:
@@ -2646,6 +2685,7 @@ def run_consensus_dialogue(
                                     effort=rev_effort,
                                     resume_session_id=resume_sid,
                                     timeout_sec=review_timeout_sec,
+                                    key_file=resolved_key,
                                 )
                             except BaseException as exc:
                                 sp_sid = str(getattr(exc, "spawned_session_id", "") or "").strip()
@@ -2824,6 +2864,7 @@ def run_consensus_dialogue(
                                     effort=auth_effort,
                                     resume_session_id=(session_ctx["author_session_id"] if author_session_started else None),
                                     timeout_sec=author_timeout_sec,
+                                    key_file=resolved_key,
                                 )
                             except BaseException as exc:
                                 sp_sid = str(getattr(exc, "spawned_session_id", "") or "").strip()
@@ -3409,6 +3450,7 @@ def watch_repo_once(
                                         model=rev_model,
                                         effort=rev_effort,
                                         timeout_sec=review_timeout_sec,
+                                        key_file=resolved_key,
                                     )
                                 elif cand_fam == "claude":
                                     review_result = run_claude_review(
