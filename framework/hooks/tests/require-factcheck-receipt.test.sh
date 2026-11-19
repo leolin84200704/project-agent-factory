@@ -29,6 +29,7 @@ run 0 'read-only SQL via MCP'      mcp__vibrant__lisportal_mysql_query '{"query"
 run 0 'plain bash'                 Bash '{"command":"ls -la"}'
 run 0 'grep for a write verb'      Bash '{"command":"grep -n \"DELETE FROM\" audit.sql"}'
 run 0 'gh pr view'                 Bash '{"command":"gh pr view 12"}'
+run 0 'cat heredoc into notes file' Bash '{"command":"cat >> stm.md <<EOF\n- the parser ran INSERT INTO t\nEOF"}'
 run 0 'mode off'                   "$SLACK" '{"channel_id":"C1","message":"hi"}' off
 
 echo "--- no receipt, block mode: BLOCKED ---"
@@ -39,6 +40,8 @@ run 2 'write SQL via MCP'          mcp__vibrant__mysql_query '{"query":"UPDATE t
 run 2 'gh pr create'               Bash '{"command":"gh pr create --title x --body y"}'
 run 2 'mysql client with INSERT'   Bash '{"command":"mysql -h h -e \"INSERT INTO t VALUES (1)\""}'
 run 2 'write in heredoc body'      Bash '{"command":"python3 - <<PY\ncur.execute(\"DELETE FROM t WHERE id=1\")\nPY"}'
+run 2 'node heredoc with UPDATE'   Bash '{"command":"node <<JS\ndb.query(\"UPDATE t SET a=1 WHERE id=2\")\nJS"}'
+run 2 'cat heredoc piped to mysql' Bash '{"command":"cat <<SQL | mysql -h h\nDELETE FROM t WHERE id=1\nSQL"}'
 
 echo "--- receipts ---"
 receipt r-fail fail "slack:C2"
