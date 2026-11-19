@@ -24,8 +24,10 @@
       "python3 framework/scripts/tests/test_paf_cli.py",
       "python3 framework/scripts/tests/test_paf_watcher.py",
       "python3 framework/scripts/tests/test_model_router.py",
+      "python3 framework/scripts/tests/test_factcheck.py",
       "bash framework/hooks/tests/validate-git-push.test.sh",
       "bash framework/hooks/tests/validate-outbound-placeholders.test.sh",
+      "bash framework/hooks/tests/require-factcheck-receipt.test.sh",
       "bash framework/hooks/tests/remind-engineering-lessons.test.sh",
       "bash framework/hooks/tests/protect-verification-assets.test.sh",
       "bash framework/githooks/tests/githooks.test.sh"
@@ -36,6 +38,7 @@
       "python3 framework/scripts/tests/test_paf_cli.py",
       "python3 framework/scripts/tests/test_paf_watcher.py",
       "python3 framework/scripts/tests/test_model_router.py",
+      "python3 framework/scripts/tests/test_factcheck.py",
       "bash framework/hooks/tests/protect-verification-assets.test.sh"
     ]
   }

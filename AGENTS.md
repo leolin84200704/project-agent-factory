@@ -88,6 +88,7 @@
 4. **Confirm Before Over-engineering** — 需求不清先確認精確範圍，寧可先做最小改動。
 5. **Memory References the World** — 記憶描述的是寫入當下的世界；回答「現況」問題前必須對 ground truth（ticket 系統 / GitHub / repo / prod）驗證。協議見 `framework/RETRIEVAL.md`。
    - **每一則對外 comment、每一個判斷都要有真實世界的依據**（Leo 指令 2026-11-04）：要寫進 Jira comment 或拿來下結論的「事實」，發出前當場對 ground truth 重驗（讀該服務的 code、查該服務自己的 DB、看 prod log），不能只憑 STM／journal 裡自己先前的紀錄，也不能拿 A 系統的表去推 B 系統的行為。當日實例：VP-19145 comment 199351 說 pricing `getLegacyBundleDetails` 對 official bundle 會失敗，依據是 10-15 從舊表 `lis_re.official_bundle_details` 看到 owner 為 null；pricing 自己的 `promotions` 表存的是 `customer_id = -1`，API 其實正常，被 Rui 當場指正。
+6. **每一個回答、每一則對外文字、每一次 DB 寫入都要事實查核**（Leo 指令 2026-11-18，VP-19079）：每一個事實都要有收據，也就是實際跑過的工具（SELECT、grep、kubectl、gh、API）和撈到的資料；記憶、STM、推理、空的結果都不算。身分和歸屬要查主檔再用實際行為交叉驗證，「沒有／不存在／壞了」要先用同一個查法查一筆已知存在的東西，「全部」要對完整的集合核對。文字裡每個事實標成已驗證、推論（寫出從哪裡推的）或沒有查；推論和沒有查的內容不能當寫入依據，也不能在對外文字裡寫成事實。發對外文字或寫 DB 之前跑 `paf factcheck`，`require-factcheck-receipt.sh` 會在送出時檢查收據。十類錯誤與各自的檢查見 `framework/FACT-CHECK.md`。當日實例：OptiMantra practice ID 清單用串接設定表上的診所名稱判斷歸屬、用「串接開著」推論在用，48875 和 56180 都是停用的個人帳號，清單已經送出才發現。
 
 ## Git 紀律與雙信任區閉環（High-Trust Baseline）
 - 動手前先建 branch（或獨立 git worktree）；commit message 帶 ticket/issue id
