@@ -137,6 +137,16 @@ class DeterministicTest(Base):
         code, r = self.check([c(category="C", kind="negative", command=FAILS, control_command=HAS_DATA)])
         self.assertEqual(code, 1)
 
+    def test_negative_claim_fails_when_command_returns_data(self):
+        # grep finds a match: the claim says "absent", the data says present.
+        found = f"grep -n 1 {self.dir / 'one.txt'}"
+        code, r = self.check([c(category="C", kind="negative", command=found, control_command=HAS_DATA)])
+        self.assertEqual(code, 1)
+        self.assertTrue(any("contradicts the claim" in p for p in self.problems(r, "c1")))
+        # grep -c prints 0 and exits 1 when nothing matches; that output still counts as data.
+        count = f"grep -c no-such-text {self.dir / 'one.txt'}"
+        self.assertEqual(self.check([c(category="C", kind="negative", command=count, control_command=HAS_DATA)])[0], 1)
+
     def test_identity_needs_cross_check(self):
         self.assertEqual(self.check([c(category="D")])[0], 1)
         self.assertEqual(self.check([c(category="D", cross_check_command=EMPTY)])[0], 1)
@@ -407,6 +417,15 @@ class DualModelTest(Base):
         self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat empty.txt", "expect": "empty"}]})
         code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)], verify=True)
         self.assertEqual(code, 0, r)
+
+    def test_negative_grep_no_match_is_blind_equivalent(self):
+        # Both sides run a grep that finds nothing (exit 1, no output); that agrees without an audit.
+        grep = "grep -n no-such-text one.txt"
+        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": grep, "expect": "empty"}]})
+        code, r = self.check([c(category="C", kind="negative", command=f"grep -n no-such-text {self.dir / 'one.txt'}",
+                                control_command=HAS_DATA)], verify=True)
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind-equivalent")
 
     def test_same_family_refused_and_verifier_error_fails_closed(self):
         self.set_scenario(blind={"claims": []})

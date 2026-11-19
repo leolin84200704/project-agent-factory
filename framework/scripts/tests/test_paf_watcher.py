@@ -41,7 +41,7 @@ _HERMETIC_NO_KEY = _mkdtemp("paf-hermetic-nokey-") / "absent.key"
 # nothing and the suite crashed. Same list as test_paf_cli.py. Removed from this process as well, because
 # some cases call the watcher module directly.
 _SCRUBBED_CALLER_ENV = ("PAF_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDECODE", "AGY_CONVERSATION_ID",
-                        "PAF_AUTHOR_FAMILY", "PAF_CONSENSUS_KEY")
+                        "PAF_AUTHOR_FAMILY", "PAF_CONSENSUS_KEY", "PAF_SHIELD_KEY_DURING_REVIEW")
 for _k in _SCRUBBED_CALLER_ENV:
     os.environ.pop(_k, None)
 
@@ -178,13 +178,22 @@ def check_key_shield_modes() -> int:
         else:
             print("PASS shield default: two reviews overlap and a third session reads the key meanwhile")
 
-        # Opt-in: the old serial 0000 shield.
+        # Explicit 0 stays off.
+        os.environ[paf_watcher.SHIELD_ENV] = "0"
+        with paf_watcher._shield_key_file(key):
+            mode_zero = oct(stat.S_IMODE(key.stat().st_mode))
+        # Opt-in: the old serial 0000 shield, and a concurrent reader is refused while it is up.
         os.environ[paf_watcher.SHIELD_ENV] = "1"
+        refused = False
         with paf_watcher._shield_key_file(key):
             mode_on = oct(stat.S_IMODE(key.stat().st_mode))
+            try:
+                paf_watcher.load_consensus_secret(key, wait_sec=0.05)
+            except paf_watcher.ConsensusKeyError:
+                refused = True
         mode_after = oct(stat.S_IMODE(key.stat().st_mode))
-        if mode_on != "0o0" or mode_after != "0o600":
-            print(f"FAIL shield opt-in: {mode_on}->{mode_after}")
+        if mode_zero != "0o600" or mode_on != "0o0" or mode_after != "0o600" or not refused:
+            print(f"FAIL shield opt-in: zero={mode_zero} on={mode_on} after={mode_after} refused={refused}")
             failures += 1
         else:
             print("PASS shield opt-in: PAF_SHIELD_KEY_DURING_REVIEW=1 sets 0000 during review and restores 0600")
@@ -192,6 +201,28 @@ def check_key_shield_modes() -> int:
         os.environ.pop(paf_watcher.SHIELD_ENV, None)
         if old is not None:
             os.environ[paf_watcher.SHIELD_ENV] = old
+
+    # agy deny settings list the key and its lock both as given and resolved through a symlink.
+    real = d / "real"
+    real.mkdir()
+    (real / "consensus.key").write_text("k" * 64 + "\n", encoding="utf-8")
+    link = d / "link"
+    link.symlink_to(real, target_is_directory=True)
+    given = link / "consensus.key"
+    deny = json.loads(paf_watcher._agy_confinement_settings(given, allow_write=True))["permissions"]["deny"]
+    want = []
+    for base in (link, real.resolve()):
+        for name in ("consensus.key", ".consensus.key.lock"):
+            for action in ("read_file", "write_file"):
+                want.append(f"{action}({os.path.abspath(base / name)})")
+    default_key = str(paf_watcher.DEFAULT_KEY_FILE)
+    read_only = json.loads(paf_watcher._agy_confinement_settings(given))["permissions"]["deny"]
+    missing = [w for w in want if w not in deny]
+    if missing or f"read_file({default_key})" not in deny or any(r.startswith("write_file(") for r in read_only):
+        print(f"FAIL agy deny paths: missing={missing} default_in={f'read_file({default_key})' in deny}")
+        failures += 1
+    else:
+        print("PASS agy deny settings cover the key and lock as given, resolved, and at the default path")
     return failures
 
 
@@ -1374,6 +1405,9 @@ trace = pathlib.Path({str(trace_log)!r})
 home = pathlib.Path(os.environ["HOME"])
 expected_sid = {expected_agy_sid!r}
 assert "--mode" in args and args[args.index("--mode") + 1] == "accept-edits", f"Expected --mode accept-edits: {{args}}"
+_deny = json.loads(args[args.index("--settings") + 1])["permissions"]["deny"]
+_key = {str(pathlib.Path(key_file).resolve())!r}
+assert f"read_file({{_key}})" in _deny and f"write_file({{_key}})" in _deny, f"author agy lacks key deny: {{_deny}}"
 
 if n == 1:
     assert "--conversation" not in args, f"Author Turn 1 must not pass --conversation: {{args}}"
@@ -1652,12 +1686,14 @@ print(json.dumps({"type": "result", "is_error": False, "session_id": "", "struct
     empty_sid_claude.chmod(0o755)
     # Note: `run_claude_review` falls back to `init_session_id` if `reported_sid` is empty, so test `gemini` reviewer returning empty `conversation_id`!
     empty_sid_agy = dlg_mock_bin / "mock_agy_empty_sid"
+    empty_sid_agy_args = dlg_mock_bin / "empty_sid_agy_args.json"
     empty_sid_agy.write_text(
-        """#!/usr/bin/env python3
-import json
-print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": {
+        f"""#!/usr/bin/env python3
+import json, sys
+open({str(empty_sid_agy_args)!r}, "w").write(json.dumps(sys.argv[1:]))
+print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output": {{
     "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "ok"
-}}))
+}}}}))
 """,
         encoding="utf-8",
     )
@@ -1687,6 +1723,8 @@ print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": 
         )
     except RuntimeError as exc:
         empty_sid_rejected = "empty session_id" in str(exc)
+    dlg_review_args = json.loads(empty_sid_agy_args.read_text()) if empty_sid_agy_args.is_file() else []
+    dlg_review_confined = _agy_settings_only_deny_key(dlg_review_args, pathlib.Path(key_file))
 
     if (
         not nb3_ok
@@ -1699,12 +1737,14 @@ print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": 
         or stale_active is not False
         or evicted_after != {}
         or not empty_sid_rejected
+        or not dlg_review_confined
     ):
         print(
             f"FAIL 12 interlock & hardening:\n"
             f"  nb3_ok={nb3_ok} nb4_ok={nb4_ok} nonce_sid={matched_nonce_sid!r}\n"
             f"  watch_locked={watch_while_locked} dup_blocked={dup_lock_blocked}\n"
             f"  stale_active={stale_active} evicted_after={evicted_after} empty_sid_rejected={empty_sid_rejected}"
+            f" dlg_review_confined={dlg_review_confined}"
         )
         failures += 1
     else:

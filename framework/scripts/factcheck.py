@@ -487,6 +487,8 @@ def check_claim(claim: dict[str, Any], timeout: int, cwd: Path | None, registry:
         problems.append(f"command exited {main['exit_code']}")
 
     if kind == "negative":
+        if main["output_lines"]:
+            problems.append("negative claim's command returned data, which contradicts the claim")
         control = claim.get("control_command")
         if not control:
             problems.append("negative claim needs control_command: the same probe on a known positive must return data")
@@ -722,7 +724,11 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
         blind_expects_empty = b.get("expect") == "empty"
         author_negative = r["kind"] == "negative"
         if author_negative and blind_expects_empty:
-            entry["result_match"] = run["exit_code"] == 0 and not run["has_data"] and not author_run["has_data"]
+            entry["result_match"] = (
+                (run["exit_code"] == 0 or _negative_no_match("negative", run))
+                and not run["output_lines"]
+                and not author_run["output_lines"]
+            )
         elif not author_negative and not blind_expects_empty:
             entry["result_match"] = run["has_data"] and run["normalized_sha256"] == author_run["normalized_sha256"]
         else:

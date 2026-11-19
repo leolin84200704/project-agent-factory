@@ -312,23 +312,35 @@ def _key_shield_enabled() -> bool:
     return (os.environ.get(SHIELD_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _agy_confinement_settings(key_file: Path | None) -> str:
+def _agy_confinement_settings(key_file: Path | None, *, allow_write: bool = False) -> str:
     """Session-only agy settings that deny reading the consensus key and its lock.
 
-    agy's headless sandbox already denies reads outside the workspace and every shell
-    command (probed 2026-11-19: a shell call stayed denied even with `command(**)`
+    agy's headless sandbox already denies reads and writes outside the workspace and every
+    shell command (probed 2026-11-19: a shell call stayed denied even with `command(**)`
     allowed). These deny rules keep the key out of reach even if the user's own agy
     settings allow reading it: in the same probe an exact-path `read_file(<path>)` allow
     let agy read a canary file, and adding the same exact-path deny blocked it. A
-    `read_file(<dir>/**)` deny did not block it, so each path is listed literally.
+    `read_file(<dir>/**)` deny did not block it, so each path is listed literally, both as
+    given and resolved (a symlinked ~/.config would otherwise slip through). For author
+    turns that may edit files, `write_file` (the action agy reports for its Edit tool) is
+    denied on the same paths.
     """
-    target = resolve_key_file(key_file)
+    raw: list[Path] = [DEFAULT_KEY_FILE]
+    env_val = (os.environ.get("PAF_CONSENSUS_KEY_FILE") or "").strip()
+    if env_val:
+        raw.append(Path(env_val))
+    if key_file is not None:
+        raw.append(Path(key_file))
     paths: list[str] = []
-    for cand in (target, target.expanduser().resolve(), _key_lock_path(target)):
-        sp = str(cand)
-        if sp not in paths:
-            paths.append(sp)
-    deny = [f"read_file({sp})" for sp in paths]
+    for rp in raw:
+        given = Path(os.path.abspath(os.path.expanduser(str(rp))))
+        for cand in (given, given.resolve()):
+            for item in (cand, _key_lock_path(cand)):
+                sp = str(item)
+                if sp not in paths:
+                    paths.append(sp)
+    actions = ["read_file"] + (["write_file"] if allow_write else [])
+    deny = [f"{a}({sp})" for sp in paths for a in actions]
     return json.dumps({"permissions": {"deny": deny}}, separators=(",", ":"))
 
 
@@ -1207,7 +1219,7 @@ def run_agy_author_turn(
         "--mode",
         "accept-edits",
     ]
-    cmd.extend(["--settings", _agy_confinement_settings(key_file)])
+    cmd.extend(["--settings", _agy_confinement_settings(key_file, allow_write=True)])
     if resume_session_id:
         cmd.extend(["--conversation", resume_session_id])
     if model:
