@@ -644,13 +644,24 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
 # ---------------------------------------------------------------- signing
 
 
-def _consensus_secret() -> tuple[str | None, str]:
-    try:
-        pw = _watcher()
-        secret = pw.load_consensus_secret(None)
-        return secret, (pw.compute_key_id(secret) if secret else "")
-    except Exception:
-        return None, ""
+def _consensus_secret(wait_sec: float | None = None) -> tuple[str | None, str, str]:
+    """(secret, key_id, reason_if_missing). Waits while `paf watch-prs` shields the key for a review."""
+    import time
+    wait = float(os.environ.get("PAF_FACTCHECK_KEY_WAIT_SEC", "90")) if wait_sec is None else wait_sec
+    deadline = time.monotonic() + wait
+    pw = _watcher()
+    while True:
+        try:
+            secret = pw.load_consensus_secret(None)
+        except Exception as exc:  # ConsensusKeyError: shielded, unreadable or truncated
+            reason = str(exc)
+            if "shielded" in reason and time.monotonic() < deadline:
+                time.sleep(3)
+                continue
+            return None, "", reason[:200]
+        if not secret:
+            return None, "", "no consensus key (run `paf init-consensus-key`)"
+        return secret, pw.compute_key_id(secret), ""
 
 
 def canonical_receipt(receipt: dict[str, Any]) -> bytes:
@@ -659,9 +670,10 @@ def canonical_receipt(receipt: dict[str, Any]) -> bytes:
 
 
 def sign_receipt(receipt: dict[str, Any]) -> None:
-    secret, key_id = _consensus_secret()
+    secret, key_id, reason = _consensus_secret()
     if not secret:
         receipt["signed"] = False
+        receipt["unsigned_reason"] = reason
         return
     receipt["signed"] = True
     receipt["key_id"] = key_id
@@ -773,7 +785,8 @@ def print_summary(receipt: dict[str, Any]) -> None:
         print(f"  inferred (write them as inferences, naming the source): {', '.join(receipt['inferred'])}")
     if receipt["unchecked"]:
         print(f"  unchecked (say so in the text; never state as fact): {', '.join(receipt['unchecked'])}")
-    print(f"receipt: {receipt['receipt_path']}{' (signed)' if receipt.get('signed') else ''}")
+    sig_note = " (signed)" if receipt.get("signed") else f" (UNSIGNED: {receipt.get('unsigned_reason', '')})"
+    print(f"receipt: {receipt['receipt_path']}{sig_note}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

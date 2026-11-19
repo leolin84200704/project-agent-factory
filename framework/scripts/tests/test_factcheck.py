@@ -334,9 +334,24 @@ class SigningTest(Base):
         expected = hmac.new(b"s3cret-for-test-0123456789abcdef", fc.canonical_receipt(saved), hashlib.sha256).hexdigest()
         self.assertEqual(saved["sig"], expected)
 
-    def test_unsigned_without_key(self):
+    def test_unsigned_without_key_says_why(self):
         code, r = self.check([c()])
         self.assertFalse(r["signed"])
+        self.assertIn("no consensus key", r["unsigned_reason"])
+
+    def test_shielded_key_is_waited_for_then_reported(self):
+        key = self.dir / "consensus.key"
+        key.write_text("s3cret-for-test-0123456789abcdef\n")
+        key.chmod(0o000)
+        os.environ["PAF_CONSENSUS_KEY_FILE"] = str(key)
+        os.environ["PAF_FACTCHECK_KEY_WAIT_SEC"] = "0"
+        try:
+            code, r = self.check([c()])
+        finally:
+            key.chmod(0o600)
+            os.environ.pop("PAF_FACTCHECK_KEY_WAIT_SEC", None)
+        self.assertFalse(r["signed"])
+        self.assertTrue(r["unsigned_reason"])
 
 
 class CliTest(Base):
