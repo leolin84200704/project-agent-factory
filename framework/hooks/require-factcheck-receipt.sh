@@ -14,7 +14,9 @@
 #     Outlook draft/send/forward, Teams, Jira comment/create/edit, Confluence
 #     create/update.
 #   - Bash: `gh pr|issue create|comment|edit|review`; a DB client invoked with
-#     a write statement, or a write statement inside a heredoc body.
+#     a write statement, or a write statement inside a heredoc body that feeds an
+#     interpreter (python, node, ruby, perl, ...). A heredoc written to a file with
+#     cat is prose, not a write.
 #   - MCP SQL tools (*mysql_query*) whose SQL is a write statement.
 #
 # A receipt matches when it passed, is younger than PAF_FACTCHECK_MAX_AGE_MIN
@@ -63,7 +65,10 @@ case "$TOOL" in
     elif printf '%s\n' "$SHELL_TEXT" | grep -qiE "${CMD_POS}(psql|mysql)([[:space:]]|$)" \
          && printf '%s\n%s\n' "$SHELL_TEXT" "$BODY_TEXT" | grep -qiE "$WRITE_RE"; then
       KIND="db-write"
-    elif printf '%s\n' "$BODY_TEXT" | grep -qiE "$WRITE_RE"; then
+    elif printf '%s\n' "$BODY_TEXT" | grep -qiE "$WRITE_RE" \
+         && printf '%s\n' "$SHELL_TEXT" | grep -qiE "${CMD_POS}(python[0-9.]*|node|ts-node|npx|bun|deno|ruby|perl|php|sqlite3)([[:space:]]|$)"; then
+      # A heredoc body only executes when it feeds an interpreter. `cat > notes.md <<EOF`
+      # that merely names a write verb is prose (first live false positive, 2026-11-18).
       KIND="db-write"
     fi ;;
 esac
