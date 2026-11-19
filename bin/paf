@@ -17,6 +17,7 @@ Commands:
   paf install-watcher  Generate (and optionally load) macOS launchd StartInterval plist for `paf watch-prs`
   paf ship             Autonomous PR -> CI -> Consensus / Blind Review -> atomic merge -> post-merge verify -> auto-revert
   paf select-model     Assess task/PR complexity and select optimal Gemini 4 / Claude 5 models & efforts per role
+  paf factcheck        Run every claim's command and write a fact-check receipt (framework/FACT-CHECK.md)
   paf audit            Audit agent/product repos for manifest, `.agent-verify.json`, script drift, and index bloat
   paf garden           Run codebase hygiene checks (dune_lint, stale merged branches, unmerged proposals)
 """
@@ -43,6 +44,7 @@ FACTORY_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_SCORING_PATH = FACTORY_ROOT / "framework" / "scripts" / "memory_scoring.py"
 PAF_WATCHER_PATH = FACTORY_ROOT / "framework" / "scripts" / "paf_watcher.py"
 MODEL_ROUTER_PATH = FACTORY_ROOT / "framework" / "scripts" / "model_router.py"
+FACTCHECK_PATH = FACTORY_ROOT / "framework" / "scripts" / "factcheck.py"
 DUNE_LINT_PATH = FACTORY_ROOT / "framework" / "checks" / "dune_lint.py"
 GIT_BIN = "/usr/bin/git" if os.path.isfile("/usr/bin/git") else "git"
 RESTRICTED_PRIVATE_REPO = "mind" + "-" + "state"
@@ -2673,6 +2675,16 @@ def cmd_select_model(args: argparse.Namespace) -> int:
     return int(_router_mod().run_from_namespace(args))
 
 
+def cmd_factcheck(args: argparse.Namespace) -> int:
+    mod = _load_module("factcheck", FACTCHECK_PATH)
+    argv = [str(args.claims), "--timeout", str(args.timeout)]
+    if args.out_dir:
+        argv += ["--out-dir", str(args.out_dir)]
+    if args.json:
+        argv.append("--json")
+    return int(mod.main(argv))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="paf", description=__doc__)
     sub = p.add_subparsers(dest="subcommand", required=True)
@@ -2883,6 +2895,16 @@ def build_parser() -> argparse.ArgumentParser:
     s_sel.add_argument("--role", choices=("router", "planner", "executor", "reviewer"), default=None)
     s_sel.add_argument("--json", action="store_true", help="Emit structured JSON routing plan")
     s_sel.set_defaults(func=cmd_select_model)
+
+    s_fc = sub.add_parser(
+        "factcheck",
+        help="run every claim's command and write a fact-check receipt (framework/FACT-CHECK.md)",
+    )
+    s_fc.add_argument("claims", type=Path, help="claims JSON file")
+    s_fc.add_argument("--timeout", type=int, default=120, help="seconds per command")
+    s_fc.add_argument("--out-dir", type=Path, default=None, help="receipt directory (default ~/.cache/paf/factcheck)")
+    s_fc.add_argument("--json", action="store_true", help="print the receipt as JSON")
+    s_fc.set_defaults(func=cmd_factcheck)
 
     s_aud = sub.add_parser("audit", help="audit agent and product repos across workspace")
     s_aud.add_argument(

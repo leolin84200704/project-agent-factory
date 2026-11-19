@@ -32,6 +32,11 @@
             "type": "command",
             "command": "{factory_path}/framework/hooks/validate-repo-language.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "{factory_path}/framework/hooks/require-factcheck-receipt.sh",
+            "timeout": 10
           }
         ]
       },
@@ -52,6 +57,16 @@
             "type": "command",
             "command": "{factory_path}/framework/hooks/validate-outbound-placeholders.sh",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__claude_ai_Microsoft_365__(outlook_(create_draft|create_reply_draft|create_reply_all_draft|update_draft|send_mail|send_draft|forward_mail)|teams_(send_chat_message|send_channel_message|reply_channel_message))|mcp__claude_ai_Slack__slack_(send_message|send_message_draft|schedule_message)|mcp__claude_ai_Atlassian_MCP__(addOrEditJiraIssueComment|createJiraIssue|editJiraIssue|createConfluenceContent|updateConfluenceContent)|mcp__.*mysql_query.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{factory_path}/framework/hooks/require-factcheck-receipt.sh",
+            "timeout": 10
           }
         ]
       }
