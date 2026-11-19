@@ -89,26 +89,70 @@ OUTPUT_EXCERPT = 400
 DEFAULT_VERIFIER_MODEL = {"gemini": "gemini-4-argon-high", "claude": "opus"}
 WATCHER_PATH = Path(__file__).resolve().parent / "paf_watcher.py"
 
-SHELL_OPERATORS = {";", "&&", "||", "|", ">", ">>", "<", "<<", "&", "(", ")", "|&"}
+# Verifier-proposed commands never reach a shell (run_command(..., shell=False)); these checks are a
+# second layer. Characters a shell would treat as operators are refused when they appear unquoted,
+# and the sequences below are refused anywhere in the command.
+SHELL_OPERATOR_CHARS = set(";&|<>()")
+FORBIDDEN_ANYWHERE = ("\n", "\r", "\x00", "`", "$(", "${")
 SQL_READ_RE = re.compile(r"^\s*(select|show|describe|desc|explain|with)\b", re.I)
 SQL_WRITE_RE = re.compile(
-    r"\b(insert|update|delete|replace|alter|drop|create|truncate|grant|revoke|rename|lock|call|load|handler)\b", re.I
+    r"\b(insert|update|delete|replace|alter|drop|create|truncate|grant|revoke|rename|lock|call|load|handler)\b"
+    r"|\binto\s+(outfile|dumpfile)\b",
+    re.I,
 )
+
+
+def _long_flag(tok: str, names: tuple[str, ...]) -> bool:
+    return tok.startswith("--") and tok.split("=", 1)[0] in names
+
+
+def _short_flag_has(tok: str, letters: str) -> bool:
+    """True if a short-flag token (or a combined group such as -iXPOST) contains one of `letters`."""
+    return tok.startswith("-") and not tok.startswith("--") and any(ch in letters for ch in tok[1:])
+
+
+def _gh_readonly(a: list[str]) -> bool:
+    if not a:
+        return False
+    if a[0] in ("pr", "issue", "run", "release"):
+        return len(a) > 1 and a[1] in ("view", "list", "diff", "checks")
+    if a[0] == "api":
+        # Fields or --input make gh send a POST; -X/--method set the verb explicitly.
+        return not any(
+            _long_flag(x, ("--method", "--field", "--raw-field", "--input")) or _short_flag_has(x, "XfF")
+            for x in a[1:]
+        )
+    return False
+
+
+def _git_readonly(a: list[str]) -> bool:
+    if not a or a[0] not in ("log", "show", "diff", "grep", "ls-files", "rev-parse", "blame", "status", "cat-file"):
+        return False
+    # --output writes a file; -O/--open-files-in-pager and --ext-diff run other programs.
+    return not any(
+        _long_flag(x, ("--output", "--open-files-in-pager", "--ext-diff")) or (a[0] == "grep" and x.startswith("-O"))
+        for x in a[1:]
+    )
+
+
+def _find_readonly(a: list[str]) -> bool:
+    return not any(
+        x in ("-exec", "-execdir", "-delete", "-ok", "-okdir", "-fls") or x.startswith("-fprint") for x in a
+    )
+
+
 READONLY_TOOLS: dict[str, Callable[[list[str]], bool]] = {
     "grep": lambda a: True,
-    "rg": lambda a: True,
+    "rg": lambda a: not any(_long_flag(x, ("--pre",)) for x in a),  # --pre runs a program per file
     "cat": lambda a: True,
     "head": lambda a: True,
     "tail": lambda a: True,
     "wc": lambda a: True,
     "ls": lambda a: True,
     "jq": lambda a: True,
-    "find": lambda a: not any(x in a for x in ("-exec", "-execdir", "-delete", "-ok", "-fprint")),
-    "git": lambda a: bool(a) and a[0] in ("log", "show", "diff", "grep", "ls-files", "rev-parse", "blame", "status", "cat-file"),
-    "gh": lambda a: bool(a) and (
-        (a[0] in ("pr", "issue", "run", "release") and len(a) > 1 and a[1] in ("view", "list", "diff", "checks"))
-        or (a[0] == "api" and not any(x in a for x in ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input")))
-    ),
+    "find": _find_readonly,
+    "git": _git_readonly,
+    "gh": _gh_readonly,
     "kubectl": lambda a: bool(a) and a[0] in ("get", "describe", "logs", "top"),
 }
 
@@ -181,9 +225,17 @@ def norm_source(s: str) -> str:
     return re.sub(r"\s+", " ", str(s or "").strip().lower().strip("`'\""))
 
 
+DOTTED_RE = r"[a-z0-9_]+\.[a-z0-9_]+(?:\.[a-z0-9_]+)?"
+
+
 def source_tables(s: str) -> set[str]:
     """schema.table tokens in a source string (a third dotted part is a column)."""
-    return {".".join(m.split(".")[:2]) for m in re.findall(r"[a-z0-9_]+\.[a-z0-9_]+(?:\.[a-z0-9_]+)?", norm_source(s))}
+    return {".".join(m.split(".")[:2]) for m in re.findall(DOTTED_RE, norm_source(s))}
+
+
+def table_level_refs(s: str) -> set[str]:
+    """schema.table tokens cited without a column part."""
+    return {m for m in re.findall(DOTTED_RE, norm_source(s)) if m.count(".") == 1}
 
 
 def normalized_output_sha(out: str) -> str:
@@ -191,13 +243,19 @@ def normalized_output_sha(out: str) -> str:
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
-def run_command(cmd: str, timeout: int, cwd: Path | None) -> dict[str, Any]:
+def run_command(cmd: str, timeout: int, cwd: Path | None, *, shell: bool = True) -> dict[str, Any]:
+    """Run a command and summarize it. The author's own commands run through the shell; commands
+    proposed by the verifier pass shell=False and run as a parsed argument list, so no shell ever
+    interprets verifier output."""
     started = dt.datetime.now(dt.timezone.utc)
     try:
-        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        args: str | list[str] = cmd if shell else shlex.split(cmd)
+        proc = subprocess.run(args, shell=shell, capture_output=True, text=True, timeout=timeout, cwd=cwd)
         code, out, err = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
         code, out, err = 124, "", f"timeout after {timeout}s"
+    except (OSError, ValueError, IndexError) as exc:  # missing binary, unparsable or empty argv without a shell
+        code, out, err = 127, "", str(exc)
     stripped = out.strip()
     return {
         "command": cmd,
@@ -268,9 +326,21 @@ def classify_source(source: str, registry: dict[str, Any] | None) -> tuple[str, 
     if registry is None:
         return "no-registry", ""
     ns = norm_source(source)
+    exact_authoritative = any(
+        norm_source(a.get("source", "")) == ns
+        for ent in registry.get("entities", []) for a in ent.get("authoritative", [])
+    )
+    cited_tables = table_level_refs(source)
     for ent in registry.get("entities", []):
         for d in ent.get("derived", []):
-            if norm_source(d.get("source", "")) and norm_source(d["source"]) in ns:
+            dn = norm_source(d.get("source", ""))
+            if not dn:
+                continue
+            # A table cited without a column is ambiguous when the registry marks a column of that
+            # table as derived; it fails unless the registry lists that exact source as authoritative.
+            table_hit = (not exact_authoritative and not _is_path(ns) and not _is_path(dn)
+                         and bool(cited_tables & source_tables(dn)))
+            if dn in ns or table_hit:
                 auth = ", ".join(a.get("source", "") for a in ent.get("authoritative", []))
                 return "derived", f"{d['source']} is derived ({d.get('note', '')}); use {auth}"
     tables = source_tables(source)
@@ -281,20 +351,47 @@ def classify_source(source: str, registry: dict[str, Any] | None) -> tuple[str, 
     return "unregistered", "source is not in the registry; the audit step judges it"
 
 
+def _unquoted_operator(cmd: str) -> str | None:
+    """First shell operator character outside single or double quotes, escaped or not."""
+    quote: str | None = None
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+        elif quote == '"':
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                quote = None
+        elif ch in SHELL_OPERATOR_CHARS:
+            return ch
+        elif ch == "\\":
+            if i + 1 < len(cmd) and cmd[i + 1] in SHELL_OPERATOR_CHARS:
+                return cmd[i + 1]
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+        i += 1
+    return None
+
+
 def readonly_problem(cmd: str, registry: dict[str, Any] | None) -> str | None:
     """None if a verifier-proposed command is read-only, else the reason it is refused."""
     if not cmd or not cmd.strip():
         return "empty command"
-    if "`" in cmd or "$(" in cmd:
-        return "command substitution is not allowed"
+    if any(s in cmd for s in FORBIDDEN_ANYWHERE):
+        return "newlines, command substitution and parameter expansion are not allowed"
+    op = _unquoted_operator(cmd)
+    if op:
+        return f"shell operator {op!r} (pipes, redirects, chaining, subshells) is not allowed"
     try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        tokens = list(lex)
+        tokens = shlex.split(cmd, posix=True)
     except ValueError as exc:
         return f"cannot parse command: {exc}"
-    if any(t in SHELL_OPERATORS for t in tokens):
-        return "shell operators (pipes, redirects, chaining) are not allowed"
+    if not tokens:
+        return "empty command"
     for runner in (registry or {}).get("runners", []):
         prefix = shlex.split(runner.get("prefix", ""))
         if prefix and tokens[: len(prefix)] == prefix:
@@ -302,10 +399,14 @@ def readonly_problem(cmd: str, registry: dict[str, Any] | None) -> str | None:
             if runner.get("kind") == "sql":
                 if not SQL_READ_RE.match(rest):
                     return "runner SQL must start with SELECT, SHOW, DESCRIBE, EXPLAIN or WITH"
+                if ";" in rest.strip().rstrip(";"):
+                    return "runner SQL must be a single statement"
                 if SQL_WRITE_RE.search(rest):
                     return "runner SQL contains a write keyword"
             return None
-    tool = os.path.basename(tokens[0])
+    tool = tokens[0]
+    if "/" in tool:
+        return "tools must be named bare (resolved from PATH), not by path"
     check = READONLY_TOOLS.get(tool)
     if check is None:
         return f"{tool!r} is not an allowed read-only tool or registered runner"
@@ -470,9 +571,17 @@ def call_verifier(family: str, model: str, effort: str | None, prompt: str, sche
                 proc = subprocess.run(cmd, cwd=empty_dir, env=pw._scrubbed_reviewer_env("gemini"),
                                       capture_output=True, text=True, timeout=timeout)
             else:
+                # The verifier needs no files. Read stays available only so the CLI can finish a
+                # structured-output turn; the allow rules and deny settings confine it to the empty
+                # directory, so it cannot open the claims file, PHI in the working tree, or the key.
+                key_file = Path(os.environ.get("PAF_CONSENSUS_KEY_FILE")
+                                or Path.home() / ".config" / "paf" / "consensus.key")
+                allow_rules, settings_json = pw._build_claude_confinement_settings(
+                    Path(empty_dir), key_file, allow_write=False)
                 cmd = [pw._ensure_executable_binary(os.environ.get("PAF_CLAUDE_BIN", "claude"), "claude"),
                        "-p", "--output-format", "json", "--json-schema", schema_str,
                        "--permission-mode", "dontAsk", "--setting-sources", "user", "--tools", "Read",
+                       "--allowedTools", ",".join(allow_rules), "--settings", settings_json,
                        "--strict-mcp-config", "--disable-slash-commands", "--max-turns", "4", "--model", model]
                 if effort:
                     cmd += ["--effort", effort]
@@ -505,8 +614,9 @@ def blind_prompt(claims: list[dict[str, Any]], registry: dict[str, Any] | None, 
         "For each statement below, name the authoritative source (the system of record, never a label, derived, "
         "cached or copied field; the registry lists which is which) and ONE read-only command that would prove or "
         "disprove it. Use only a registered runner from the registry, or grep/rg/cat/head/tail/wc/ls/jq/find, "
-        "read-only git, read-only gh, or kubectl get/describe/logs. No pipes, redirects, chaining or command "
-        "substitution. SQL must be a single SELECT/SHOW/DESCRIBE/EXPLAIN/WITH.\n"
+        "read-only git, read-only gh, or kubectl get/describe/logs. Commands run without a shell: no pipes, "
+        "redirects, chaining, newlines, variables or command substitution. SQL must be a single "
+        "SELECT/SHOW/DESCRIBE/EXPLAIN/WITH statement.\n"
         "Set expect='data' if the command returns rows/lines when the statement is true, or 'empty' if the "
         "statement is true only when nothing comes back (absence claims).\n"
         f"Commands run with working directory {cwd or '(unspecified)'}; use absolute paths for files elsewhere.\n"
@@ -588,14 +698,20 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
             entry["blind"]["refused"] = refused
             diverged.append(r)
             continue
-        run = run_command(b["command"], timeout, cwd)
+        run = run_command(b["command"], timeout, cwd, shell=False)
         entry["blind"]["run"] = strip_private(run)
         author_run = r["runs"]["command"]
         entry["source_match"] = sources_match(r["source"], b.get("source", ""), cwd)
-        if b.get("expect") == "empty" or r["kind"] == "negative":
+        blind_expects_empty = b.get("expect") == "empty"
+        author_negative = r["kind"] == "negative"
+        if author_negative and blind_expects_empty:
             entry["result_match"] = run["exit_code"] == 0 and not run["has_data"] and not author_run["has_data"]
-        else:
+        elif not author_negative and not blind_expects_empty:
             entry["result_match"] = run["has_data"] and run["normalized_sha256"] == author_run["normalized_sha256"]
+        else:
+            # The verifier reads the statement as the opposite kind of claim (presence vs absence);
+            # an equal-looking result proves nothing, so the audit step decides.
+            entry["result_match"] = False
         if entry["source_match"] and entry["result_match"]:
             entry["verdict"] = "pass"
             entry["by"] = "blind-equivalent"
@@ -637,7 +753,7 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
                 if refused:
                     item["refused"] = refused
                 else:
-                    run = run_command(cmd, timeout, cwd)
+                    run = run_command(cmd, timeout, cwd, shell=False)
                     item["run"] = strip_private(run)
                     if run["has_data"]:
                         disproved = True
@@ -761,6 +877,9 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
             run_result.pop("_stdout", None)
 
     ok = not global_problems and all(not r["problems"] for r in results)
+    # --verifier-cmd replaces the model CLI for tests. Such a receipt is never dual-model; the hook
+    # also refuses it when PAF_FACTCHECK_REQUIRE_DUAL=1.
+    override = bool(verification and any(c.get("cli") == "override" for c in verification.get("calls") or []))
     receipt: dict[str, Any] = {
         "version": 2,
         "target": target,
@@ -768,7 +887,8 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
         "sources_registry": (registry or {}).get("_path", ""),
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "status": "pass" if ok else "fail",
-        "dual_model": bool(verification and verification.get("status") == "pass"),
+        "dual_model": bool(verification and verification.get("status") == "pass") and not override,
+        "verifier_override": override,
         "problems": global_problems,
         "unchecked": [r["id"] for r in results if r["label"] == "unchecked"],
         "inferred": [r["id"] for r in results if r["label"] == "inferred"],
@@ -788,6 +908,8 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
 
 def print_summary(receipt: dict[str, Any]) -> None:
     dual = " dual-model" if receipt.get("dual_model") else ""
+    if receipt.get("verifier_override"):
+        dual = " (verifier overridden by --verifier-cmd; not dual-model)"
     print(f"fact-check {receipt['status'].upper()}{dual} target={receipt['target']}")
     for p in receipt["problems"]:
         print(f"  ! {p}")

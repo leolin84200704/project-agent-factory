@@ -175,6 +175,20 @@ class RegistryTest(Base):
         self.assertEqual(code, 0)
         self.assertEqual(r["claims"][0]["source_status"], "unregistered")
 
+    def test_table_level_citation_of_derived_column_fails(self):
+        code, r = self.check([c(source="lis_emr.ehr_integrations")], registry=REGISTRY)
+        self.assertEqual(code, 1)
+        self.assertTrue(any("not ground truth" in p for p in self.problems(r, "c1")))
+
+    def test_other_column_of_same_table_is_not_derived(self):
+        status, _ = fc.classify_source("lis_emr.ehr_integrations.integration_status", REGISTRY)
+        self.assertEqual(status, "unregistered")
+
+    def test_table_listed_as_authoritative_is_not_derived(self):
+        reg = json.loads(json.dumps(REGISTRY))
+        reg["entities"].append({"entity": "integration", "authoritative": [{"source": "lis_emr.ehr_integrations"}]})
+        self.assertEqual(fc.classify_source("lis_emr.ehr_integrations", reg)[0], "authoritative")
+
 
 class SourceMatchTest(unittest.TestCase):
     def test_tables(self):
@@ -223,6 +237,29 @@ class ReadOnlyTest(unittest.TestCase):
         self.ok("gh pr view 12")
         self.ok("gh api repos/o/r/pulls")
         self.ok("kubectl get pods -n x")
+        self.ok('grep -n "a|b;c" file.txt')
+        self.ok('q "SELECT 1;"')
+        self.ok("rg -n 'x$' src/")
+
+    def test_unspaced_operators_and_newlines_refused(self):
+        for cmd in ("cat a;rm -rf /", "cat a>b", "cat a|sh", "cat a&&rm -rf /", "cat a\\;rm x",
+                    "cat one.txt\nrm -rf /", "cat one.txt\rrm x", "cat ${HOME}/x", "cat `id`"):
+            self.bad(cmd)
+
+    def test_sql_runner_single_read_statement(self):
+        self.bad('q "SELECT 1; SELECT 2"')
+        self.bad('q "SELECT 1; SET autocommit=0"')
+        self.bad("q \"SELECT * INTO OUTFILE '/tmp/x' FROM t\"")
+        self.bad("q \"SELECT * FROM t INTO DUMPFILE '/tmp/x'\"")
+
+    def test_write_flags_on_allowed_tools_refused(self):
+        for cmd in ("gh api -XDELETE repos/o/r", "gh api --method=POST repos/o/r", "gh api -iXPOST repos/o/r",
+                    "gh api repos/o/r -fname=x", "gh api repos/o/r --field=name=x", "gh api graphql --input=q.json",
+                    "find . -fprint0 /tmp/x", "find . -fprintf /tmp/x %p", "find . -fls /tmp/x",
+                    "find . -okdir rm {} +", "rg --pre=sh x", "rg --pre sh x",
+                    "git log --output=/tmp/x", "git diff --ext-diff", "git grep -Osh x",
+                    "/tmp/planted/cat one.txt"):
+            self.bad(cmd)
 
     def test_refused(self):
         self.bad('q "UPDATE t SET a=1"')
@@ -248,9 +285,39 @@ class DualModelTest(Base):
         self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]})
         code, r = self.check([c()], verify=True)
         self.assertEqual(code, 0, r)
-        self.assertTrue(r["dual_model"])
+        self.assertEqual(r["verification"]["status"], "pass")
         self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind-equivalent")
         self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind"])
+        # The fake verifier replaces the model CLI, so the receipt must not claim dual-model.
+        self.assertFalse(r["dual_model"])
+        self.assertTrue(r["verifier_override"])
+
+    def test_negative_claim_with_blind_expecting_data_goes_to_audit(self):
+        # The author says "nothing exists"; the verifier wrote a presence probe (expect=data) that came
+        # back empty. That is the verifier's probe failing, not agreement.
+        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat empty.txt", "expect": "data"}]},
+                          audit={"claims": []})
+        code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)], verify=True)
+        self.assertEqual(code, 1)
+        e = r["verification"]["claims"]["c1"]
+        self.assertFalse(e["result_match"])
+        self.assertNotEqual(e.get("by"), "blind-equivalent")
+        self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
+
+    def test_positive_claim_with_blind_expecting_empty_goes_to_audit(self):
+        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "empty"}]},
+                          audit={"claims": []})
+        code, r = self.check([c(command="cat one.txt")], verify=True)
+        self.assertEqual(code, 1)
+        self.assertFalse(r["verification"]["claims"]["c1"]["result_match"])
+
+    def test_verifier_commands_run_without_a_shell(self):
+        run = fc.run_command("echo $HOME", 5, self.dir, shell=False)
+        self.assertEqual(run["output_excerpt"], "$HOME")
+        run = fc.run_command("cat one.txt;touch pwned", 5, self.dir, shell=False)
+        self.assertNotEqual(run["exit_code"], 0)
+        self.assertFalse((self.dir / "pwned").exists())
+        self.assertEqual(fc.run_command("no-such-binary-xyz", 5, self.dir, shell=False)["exit_code"], 127)
 
     def test_blind_prompt_hides_author_evidence(self):
         self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]})
@@ -339,6 +406,65 @@ class DualModelTest(Base):
         self.set_scenario(blind={"claims": []}, audit={"claims": []})
         code, r = self.check([c()], verify=True)
         self.assertEqual(code, 1)
+
+
+class ClaudeVerifierConfinementTest(Base):
+    def test_claude_verifier_is_confined_to_an_empty_directory(self):
+        argv_log = self.dir / "argv.json"
+        fake = self.dir / "fake_claude"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "sys.stdin.read()\n"
+            f"json.dump({{'argv': sys.argv[1:], 'cwd': os.getcwd()}}, open({str(argv_log)!r}, 'w'))\n"
+            "print(json.dumps({'structured_output': {'claims': []}}))\n"
+        )
+        fake.chmod(0o755)
+        os.environ["PAF_CLAUDE_BIN"] = str(fake)
+        try:
+            payload, meta = fc.call_verifier("claude", "opus", None, "prompt", fc.BLIND_SCHEMA, None)
+        finally:
+            os.environ.pop("PAF_CLAUDE_BIN", None)
+        self.assertEqual(payload, {"claims": []})
+        self.assertEqual(meta["cli"], "claude")
+        seen = json.loads(argv_log.read_text())
+        argv = seen["argv"]
+        self.assertIn("--allowedTools", argv)
+        self.assertIn("--settings", argv)
+        allowed = argv[argv.index("--allowedTools") + 1]
+        self.assertIn("paf-factcheck-verifier-", allowed)
+        self.assertNotIn(str(self.dir.resolve()), allowed)
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        deny = settings["permissions"]["deny"]
+        self.assertIn("Read(~/.config/**)", deny)
+        self.assertIn("paf-factcheck-verifier-", seen["cwd"])
+
+
+class HookIntegrationTest(Base):
+    HOOK = ROOT / "framework" / "hooks" / "require-factcheck-receipt.sh"
+
+    def hook(self, require_dual: str) -> int:
+        payload = json.dumps({"session_id": "s", "tool_name": "mcp__claude_ai_Slack__slack_send_message",
+                              "tool_input": {"channel_id": "C1", "message": "x"}})
+        env = dict(os.environ, PAF_FACTCHECK_DIR=str(self.dir / "receipts"), PAF_FACTCHECK_MODE="block",
+                   PAF_FACTCHECK_REQUIRE_DUAL=require_dual, TMPDIR=str(self.dir))
+        return subprocess.run(["bash", str(self.HOOK)], input=payload, env=env,
+                              capture_output=True, text=True).returncode
+
+    def test_signed_override_receipt_refused_when_dual_required(self):
+        key = self.dir / "consensus.key"
+        key.write_text("s3cret-for-test-0123456789abcdef\n")
+        key.chmod(0o600)
+        os.environ["PAF_CONSENSUS_KEY_FILE"] = str(key)
+        self.scenario.write_text(json.dumps({"blind": {"claims": [
+            {"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]}, "audit": {"claims": []}}))
+        code, r = self.check([c()], target="slack:C1", verify=True)
+        self.assertEqual(code, 0, r)
+        self.assertTrue(r["signed"])
+        self.assertEqual(r["verification"]["status"], "pass")
+        # The same receipt is accepted when dual is not required, so a refusal below is about dual.
+        self.assertEqual(self.hook("0"), 0)
+        self.assertEqual(self.hook("1"), 2)
 
 
 class SigningTest(Base):
