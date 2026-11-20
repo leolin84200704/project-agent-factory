@@ -786,7 +786,8 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
         "calls": [],
     }
     if not targets:
-        ver["status"] = "pass"
+        ver["status"] = "fail"
+        ver["error"] = "dual-model verification requires at least one passing verified claim"
         return ver
 
     for r in targets:
@@ -1042,6 +1043,8 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
             if r["label"] == "verified" and r["id"] in verification.get("claims", {}):
                 r["verifier_verdict"] = verification["claims"][r["id"]].get("verdict")
     elif verification and verification.get("status") == "fail":
+        if not verification.get("claims") and verification.get("error"):
+            global_problems.append(f"dual-model verification failed: {verification['error']}")
         for r in results:
             e = (verification.get("claims") or {}).get(r["id"])
             if e and e.get("verdict") != "pass":
@@ -1059,7 +1062,15 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
     ok = not global_problems and all(not r["problems"] for r in results)
     # --verifier-cmd replaces the model CLI for tests. Such a receipt is never dual-model; the hook
     # also refuses it when PAF_FACTCHECK_REQUIRE_DUAL=1.
-    override = bool(verification and any(c.get("cli") == "override" for c in verification.get("calls") or []))
+    calls = (verification.get("calls") or []) if verification else []
+    override = any(c.get("cli") == "override" for c in calls if isinstance(c, dict))
+    steps_run = {c.get("step") for c in calls if isinstance(c, dict) and c.get("cli") != "override"}
+    has_required_steps = "audit" in steps_run and (eff_tier != "high" or "blind" in steps_run)
+    has_verified_claims = bool(verification and verification.get("claims"))
+    dual_model = bool(
+        ok and verification and verification.get("status") == "pass"
+        and not override and has_required_steps and has_verified_claims
+    )
     receipt: dict[str, Any] = {
         "version": 2,
         "target": target,
@@ -1069,7 +1080,7 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
         "sources_registry": (registry or {}).get("_path", ""),
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "status": "pass" if ok else "fail",
-        "dual_model": bool(verification and verification.get("status") == "pass") and not override,
+        "dual_model": dual_model,
         "verifier_override": override,
         "problems": global_problems,
         "unchecked": [r["id"] for r in results if r["label"] == "unchecked"],

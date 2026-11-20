@@ -119,6 +119,12 @@ def dual_ok(r):
         return False
     if not ver.get("family") or ver.get("family") == ver.get("author_family"):
         return False
+    if not ver.get("claims") or not isinstance(ver.get("claims"), dict):
+        return False
+    calls = ver.get("calls") or []
+    real_steps = {c.get("step") for c in calls if isinstance(c, dict) and c.get("cli") != "override"}
+    if not real_steps:
+        return False
     if not (secret and r.get("sig")):
         return False
     body = {k: v for k, v in r.items() if k not in ("sig", "receipt_path")}
@@ -126,13 +132,20 @@ def dual_ok(r):
     return hmac.compare_digest(hmac.new(secret.encode(), canon, hashlib.sha256).hexdigest(), r["sig"])
 
 def effective_tier(r, dual):
-    raw = str(r.get("tier") or "").strip().lower()
-    if raw in tier_rank:
-        return raw if (raw == "low" or dual) else "low"
     if not dual:
         return "low"
     calls = (r.get("verification") or {}).get("calls") or []
-    return "high" if any(c.get("step") == "blind" for c in calls if isinstance(c, dict)) else "standard"
+    real_steps = {c.get("step") for c in calls if isinstance(c, dict) and c.get("cli") != "override"}
+    if "blind" in real_steps and "audit" in real_steps:
+        proven = "high"
+    elif "audit" in real_steps or "blind" in real_steps:
+        proven = "standard"
+    else:
+        return "low"
+    raw = str(r.get("tier") or "").strip().lower()
+    if raw in tier_rank:
+        return raw if tier_rank[raw] <= tier_rank[proven] else proven
+    return proven
 
 now = time.time()
 rejected_tier = ""

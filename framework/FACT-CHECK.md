@@ -86,7 +86,7 @@ STM 和 handoff 的 Verified facts 只放已驗證的內容，推論另列一欄
 驗證模型做盲測時也靠這張表知道該去哪裡查。格式見 `framework/scripts/factcheck.py` 的 docstring。
 
 ### 程式碼修改（同樣套用三要素）
-- 查法就是測試。`paf tests-fail-on-base --test-cmd "<cmd>"` 會把新增或修改的測試複製到 base commit 的臨時 worktree，並自動掛載本機未追蹤且位於 repo 內的依賴目錄（`.venv`、`venv`、`node_modules` 或 `--link-dir`，拒絕跳出 repo 的路徑或外部 symlink），證明在 base 上失敗、在 head 上通過。依改動類型支援 `--change-type auto|bugfix|feature|refactor|docs|config`：純重構仍須包含改動或新增的測試檔，並證明 base 與 head 兩邊皆通過（行為不變）；純文件或純設定只有在 diff 完全沒有程式碼與治理／權限檔（`.agent-verify.json`、`.github/workflows/*`、`launchd/*`、`CORE.md` 等）時才豁免。
+- 查法就是測試。`paf tests-fail-on-base --test-cmd "<cmd>"` 會把新增或修改的測試複製到 base commit 的臨時 worktree，並自動掛載本機未追蹤且位於 repo 內的頂層依賴目錄（`.venv`、`venv`、`node_modules` 或 `--link-dir`，拒絕跳出 repo 的路徑或外部 symlink），證明在 base 上失敗、在 head 上通過。依改動類型支援 `--change-type auto|bugfix|feature|refactor|docs|config`：凡是改到治理或權限檔（`.agent-verify.json`、`.mcp.json`、`.github/workflows/*`、`.github/actions/*`、`launchd/*`、`CORE.md` 等），`refactor`、`docs`、`config` 與 `auto` 一律拒絕豁免；一般程式檔的純重構須包含改動或新增的測試檔，並證明 base 與 head 兩邊皆通過（行為不變）；純文件或純設定只有在 diff 完全沒有程式碼與治理／權限檔時才豁免。
 - `paf drive-consensus` 與 `paf watch-prs` 的審查 JSON schema（`REVIEW_JSON_SCHEMA`）強制三個必填欄位：`test_source_is_ground_truth`（測試打到真實程式碼或環境邊界，沒有把核心邏輯 mock 掉，環境相關改動具備 staging 或實測證據）、`tests_prove_change`（測試能證明宣稱的效果）、`test_counterexamples`（每個新／改測試的具體反例，任一項 `blocking: true` 或前兩欄任一為 `false` 時，程式機械強制翻成 `request_changes`）。
 
 ## 機制

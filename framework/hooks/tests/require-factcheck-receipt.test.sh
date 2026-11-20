@@ -58,12 +58,29 @@ run 2 'stale receipt ignored'      "$SLACK" '{"channel_id":"C5","message":"x"}'
 echo "--- require dual-model receipts ---"
 KEY="$TMP/consensus.key"; printf 'test-secret-0123456789abcdef\n' > "$KEY"; chmod 600 "$KEY"
 export PAF_CONSENSUS_KEY_FILE="$KEY"
-signed_receipt() {  # signed_receipt <name> <target> <dual true|false> <verifier_family> [bad] [tier]
-  python3 - "$PAF_FACTCHECK_DIR/$1.json" "$2" "$3" "$4" "${5:-}" "${6:-}" <<'PY'
+signed_receipt() {  # signed_receipt <name> <target> <dual true|false> <verifier_family> [bad] [tier] [steps]
+  python3 - "$PAF_FACTCHECK_DIR/$1.json" "$2" "$3" "$4" "${5:-}" "${6:-}" "${7:-auto}" <<'PY'
 import hashlib, hmac, json, sys
-path, target, dual, fam, bad, tier = sys.argv[1:7]
-r = {"version": 2, "status": "pass", "target": target, "dual_model": dual == "true",
-     "verification": {"status": "pass" if dual == "true" else "fail", "family": fam, "author_family": "claude"}}
+path, target, dual, fam, bad, tier, steps_arg = sys.argv[1:8]
+is_dual = dual == "true"
+if steps_arg == "none":
+    calls = []
+    claims = {}
+elif steps_arg == "auto":
+    if not is_dual:
+        calls, claims = [], {}
+    elif tier == "high":
+        calls = [{"step": "blind", "cli": fam}, {"step": "audit", "cli": fam}]
+        claims = {"c1": {"verdict": "pass"}}
+    else:
+        calls = [{"step": "audit", "cli": fam}]
+        claims = {"c1": {"verdict": "pass"}}
+else:
+    calls = [{"step": s, "cli": fam} for s in steps_arg.split(",") if s]
+    claims = {"c1": {"verdict": "pass"}} if calls else {}
+r = {"version": 2, "status": "pass", "target": target, "dual_model": is_dual,
+     "verification": {"status": "pass" if is_dual else "fail", "family": fam, "author_family": "claude",
+                      "calls": calls, "claims": claims}}
 if tier:
     r["tier"] = tier
 canon = json.dumps(r, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -83,15 +100,21 @@ PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'bad signature refused' "$SLACK" '{"channel_i
 signed_receipt d-std-db "db:orders" true gemini "" standard
 PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'db-write refuses standard-tier receipt' mcp__vibrant__mysql_query '{"query":"UPDATE orders SET status=1 WHERE id=2"}'
 if grep -q '"decision":"blocked".*"tier":"standard".*"required_tier":"high"' "$PAF_FACTCHECK_DIR/hook-log.jsonl"; then echo "[ok  ] log records rejected tier and required_tier"; else echo "[FAIL] log lacks rejected tier"; fails=$((fails+1)); fi
-# Tampering with tier on an otherwise validly signed dual receipt invalidates HMAC.
-python3 - "$PAF_FACTCHECK_DIR/d-std-db.json" "$PAF_FACTCHECK_DIR/d-tampered-tier.json" <<'PY'
+# Tampering with ONLY tier on a validly signed dual receipt invalidates HMAC.
+signed_receipt d-tamper-src "db:tampered_tbl" true gemini "" standard
+python3 - "$PAF_FACTCHECK_DIR/d-tamper-src.json" <<'PY'
 import json, sys
-r = json.loads(open(sys.argv[1]).read())
-r["target"] = "db:tampered_tbl"
+p = sys.argv[1]
+r = json.loads(open(p).read())
 r["tier"] = "high"
-open(sys.argv[2], "w").write(json.dumps(r))
+open(p, "w").write(json.dumps(r))
 PY
-PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'tampered tier breaks HMAC' mcp__vibrant__mysql_query '{"query":"UPDATE tampered_tbl SET status=1 WHERE id=2"}'
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'tampered tier alone breaks HMAC' mcp__vibrant__mysql_query '{"query":"UPDATE tampered_tbl SET status=1 WHERE id=2"}'
+# Signed receipt declaring high tier with zero verifier calls or audit-only calls is refused for db-write.
+signed_receipt d-empty-calls "db:empty_calls_tbl" true gemini "" high none
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'zero-call high-tier receipt refused' mcp__vibrant__mysql_query '{"query":"UPDATE empty_calls_tbl SET status=1 WHERE id=2"}'
+signed_receipt d-audit-only-high "db:audit_only_tbl" true gemini "" high audit
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'audit-only receipt claiming high tier capped at standard' mcp__vibrant__mysql_query '{"query":"UPDATE audit_only_tbl SET status=1 WHERE id=2"}'
 signed_receipt d-high-db "db:orders" true gemini "" high
 PAF_FACTCHECK_REQUIRE_DUAL=1 run 0 'db-write accepts high-tier receipt' mcp__vibrant__mysql_query '{"query":"UPDATE orders SET status=1 WHERE id=2"}'
 # Setting min-tier explicitly requires dual-signed receipt of that tier even when REQUIRE_DUAL=0.

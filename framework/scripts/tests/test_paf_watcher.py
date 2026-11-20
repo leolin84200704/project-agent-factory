@@ -1879,6 +1879,34 @@ print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output":
         },
         first_secret,
     )
+    # End-to-end watch_repo_once fails closed when reviewer omits the new required verification fields.
+    missing_fields_agy = mock_bin / "agy_missing_verif_fields"
+    missing_fields_agy.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'missing fields'}\n"
+        "print(json.dumps({'conversation_id': 'agy-miss-14', 'status': 'DONE', 'response': json.dumps(resp)}))\n",
+        encoding="utf-8",
+    )
+    missing_fields_agy.chmod(0o755)
+    bus_miss = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo1,
+        prs={42: make_pr_json(sha1, author_comment, [])},
+        etag='W/"etag-miss-14"',
+        key_file=key_file,
+    )
+    act_miss = paf_watcher.watch_repo_once(
+        repo=repo1,
+        repo_slug="leolin84200704/demo",
+        host_id="personal-mac",
+        families=("gemini",),
+        state_dir=_mkdtemp("paf-watch-miss14-"),
+        key_file=key_file,
+        bus=bus_miss,
+        claude_bin=str(fake_claude),
+        agy_bin=str(missing_fields_agy),
+        claim_settle_sec=0.0,
+    )
     if (
         not s14_ok
         or r_mock["verdict"] != "request_changes"
@@ -1892,8 +1920,10 @@ print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output":
         or "### Verification Audit" not in fmt_ce
         or "middle_name=None crashes" not in fmt_ce
         or not ce_secret_hit
+        or act_miss.get("reviewed") != []
+        or any("paf-consensus" in body for _, body in bus_miss.comments_posted)
     ):
-        print(f"FAIL 14 structured verification gate: s14_ok={s14_ok} r_mock={r_mock} r_ce={r_ce} r_note={r_note} r_drift={r_drift} secret={ce_secret_hit}")
+        print(f"FAIL 14 structured verification gate: s14_ok={s14_ok} r_mock={r_mock} r_ce={r_ce} r_note={r_note} r_drift={r_drift} secret={ce_secret_hit} act_miss={act_miss}")
         failures += 1
     else:
         print("PASS 14 structured PR review gate enforces ground-truth source, test proof, blocking counterexamples, and secret scanning")

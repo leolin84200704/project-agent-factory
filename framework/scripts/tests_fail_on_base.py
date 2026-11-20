@@ -40,14 +40,15 @@ CHANGE_TYPES = ("auto", "bugfix", "feature", "refactor", "docs", "config")
 DOC_EXTS = frozenset({".md", ".txt", ".rst", ".adoc"})
 CONFIG_EXTS = frozenset({".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".plist", ".example"})
 CONFIG_NAMES = frozenset({".gitignore", ".editorconfig", ".env.example", ".npmrc", ".nvmrc"})
-# Governance and permission-granting files can never self-exempt via --change-type docs or config.
+# Governance and permission-granting files can never self-exempt via --change-type docs, config, or refactor.
 GOVERNANCE_PATH_RE = re.compile(
     r"(^|/)(CORE\.md|AGENTS\.md|CLAUDE\.md|GEMINI\.md|WORK-LOOP\.md|PERMISSIONS\.md|FEEDBACK\.md|"
-    r"\.agent-verify\.json|run-regression\.py|dune_lint\.py|paf_watcher\.py|model_router\.py|pre-tool-guard\.py)$|"
+    r"\.agent-verify\.json|\.mcp\.json|\.gitlab-ci\.ya?ml|"
+    r"run-regression\.py|dune_lint\.py|paf_watcher\.py|model_router\.py|pre-tool-guard\.py)$|"
     r"^bin/paf$|"
     r"(^|/)(\.claude/settings[^/]*\.json|\.gemini/settings[^/]*\.json|\.gemini/config/|"
-    r"framework/templates/settings[^/]*\.json|"
-    r"\.github/workflows/[^/]+\.ya?ml|"
+    r"framework/templates/|"
+    r"\.github/(workflows|actions)/|"
     r"hooks/|githooks/|framework/githooks/|framework/hooks/|"
     r"DailyJob/|launchd/|skills/)",
     re.IGNORECASE,
@@ -96,7 +97,7 @@ def _is_config_or_doc_file(rel: str) -> bool:
 
 
 def _link_dependency_dirs(repo: Path, wt: Path, rel_dirs: list[str]) -> list[tuple[Path, str]]:
-    """Symlink untracked dependency dirs from `repo` into `wt` without escaping `repo`."""
+    """Symlink untracked top-level dependency dirs from `repo` into `wt`, rejecting top-level escapes."""
     created: list[tuple[Path, str]] = []
     repo_root = repo.resolve()
     wt_root = wt.resolve()
@@ -172,6 +173,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         print(f"tests-fail-on-base EXEMPT (config-only: {len(all_files)} file(s))")
         return 0
+
+    if args.change_type == "refactor":
+        gov_files = [f for f in all_files if _is_governance_file(f)]
+        if gov_files:
+            print(f"tests-fail-on-base REFUSED: --change-type refactor rejected because governance files changed: {', '.join(gov_files[:5])}")
+            return 1
 
     if args.change_type == "auto" and not tests and all_files and all(_is_doc_file(f) for f in all_files):
         print(f"tests-fail-on-base EXEMPT (docs-only: {len(all_files)} file(s))")

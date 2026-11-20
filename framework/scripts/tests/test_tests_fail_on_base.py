@@ -107,6 +107,14 @@ class FailOnBaseTest(unittest.TestCase):
         proc_bad = self.run_cmd(f"{sys.executable} test_old.py", extra=["--change-type", "refactor"])
         self.assertEqual(proc_bad.returncode, 1, proc_bad.stdout + proc_bad.stderr)
 
+        # Governance file edits can never self-exempt under --change-type refactor.
+        (self.repo / "calc.py").write_text("def add(a, b):\n    out = a - b\n    return out\n")
+        (self.repo / "CORE.md").write_text("# Weakened rule\n")
+        proc_gov_ref = self.run_cmd(f"{sys.executable} test_old.py", extra=["--change-type", "refactor"])
+        self.assertEqual(proc_gov_ref.returncode, 1, proc_gov_ref.stdout)
+        self.assertIn("REFUSED", proc_gov_ref.stdout)
+        (self.repo / "CORE.md").unlink()
+
     def test_docs_and_config_exemptions_and_anti_gaming_refusal(self):
         (self.repo / "README.md").write_text("# Docs\n")
         sh(self.repo, "add", "README.md")
@@ -125,7 +133,9 @@ class FailOnBaseTest(unittest.TestCase):
         # Governance and permission files must NEVER self-exempt under config, docs, or auto.
         for gov_rel, content, ctype in (
             (".agent-verify.json", '{"zone":"autonomous"}\n', "config"),
+            (".mcp.json", '{"mcpServers":{}}\n', "config"),
             (".github/workflows/ci.yml", "name: ci\n", "config"),
+            (".github/actions/setup/action.yml", "name: setup\n", "config"),
             ("launchd/com.test.plist", "<plist/>\n", "config"),
             ("CORE.md", "# Core rule edit\n", "docs"),
         ):

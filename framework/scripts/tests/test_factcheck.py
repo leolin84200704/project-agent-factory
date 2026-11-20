@@ -421,22 +421,27 @@ class DualModelTest(Base):
 
     def test_negative_claim_with_blind_expecting_data_sets_result_match_false(self):
         # The author says "nothing exists"; the verifier wrote a presence probe (expect=data) that came
-        # back empty. That is the verifier's probe failing, not agreement.
+        # back empty. Even with an approving audit payload, the polarity mismatch must fail closed.
         self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat empty.txt", "expect": "data"}]},
-                          audit={"claims": []})
+                          audit={"claims": [_ok_audit()]})
         code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)],
                              verify=True, tier="high")
         self.assertEqual(code, 1)
         e = r["verification"]["claims"]["c1"]
         self.assertFalse(e["result_match"])
+        self.assertTrue(e["blind_contradicted"])
+        self.assertTrue(any("blind probe contradicted" in p for p in self.problems(r, "c1")))
         self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
 
     def test_positive_claim_with_blind_expecting_empty_sets_result_match_false(self):
         self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "empty"}]},
-                          audit={"claims": []})
+                          audit={"claims": [_ok_audit()]})
         code, r = self.check([c(command="cat one.txt")], verify=True, tier="high")
         self.assertEqual(code, 1)
-        self.assertFalse(r["verification"]["claims"]["c1"]["result_match"])
+        e = r["verification"]["claims"]["c1"]
+        self.assertFalse(e["result_match"])
+        self.assertTrue(e["blind_contradicted"])
+        self.assertTrue(any("blind probe contradicted" in p for p in self.problems(r, "c1")))
 
     def test_verifier_commands_run_without_a_shell(self):
         run = fc.run_command("echo $HOME", 5, self.dir, shell=False)
@@ -612,6 +617,24 @@ class DualModelTest(Base):
         self.assertEqual(r["verification"]["status"], "error")
         self.assertIn("simulated router import failure", r["verification"]["error"])
         self.assertTrue(Path(r["receipt_path"]).is_file())
+
+    def test_unchecked_only_claims_cannot_pass_dual_model_tier(self):
+        # A claims file with zero verified claims must fail dual-model tiers instead of writing a
+        # signed high-tier receipt with zero verifier calls.
+        self.set_scenario(blind={"claims": []}, audit={"claims": []})
+        code, r = self.check([{"id": "u1", "label": "unchecked", "text": "unverified guess"}],
+                             target="db:orders", verify=True, tier="high")
+        self.assertEqual(code, 1)
+        self.assertEqual(r["status"], "fail")
+        self.assertFalse(r["dual_model"])
+        self.assertEqual(r["verification"]["calls"], [])
+        self.assertEqual(self.prompts_seen(), [])
+        self.assertTrue(any("at least one passing verified claim" in p for p in r["problems"]))
+
+    def test_unknown_tier_in_claims_spec_fails(self):
+        code, r = self.check([c()], spec_extra={"tier": "bogus"})
+        self.assertEqual(code, 1)
+        self.assertTrue(any("unknown tier" in p for p in r["problems"]))
 
 
 class ClaudeVerifierConfinementTest(Base):
