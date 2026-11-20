@@ -186,6 +186,8 @@ MODEL_CATALOG: dict[str, dict[str, Any]] = {
     },
 }
 
+# Gemini Carbon stays in the catalog for explicit overrides but no tier routes to it: its first token takes
+# two minutes or more. The critical tier uses Argon (High).
 TIER_ROUTING_TABLE: dict[str, dict[str, dict[str, str]]] = {
     "trivial": {
         "router": {"claude": "claude_haiku_low", "gemini": "gemini_hydrogen_low"},
@@ -207,9 +209,9 @@ TIER_ROUTING_TABLE: dict[str, dict[str, dict[str, str]]] = {
     },
     "critical": {
         "router": {"claude": "claude_haiku_low", "gemini": "gemini_hydrogen_low"},
-        "planner": {"claude": "claude_fable_high", "gemini": "gemini_carbon_high"},
+        "planner": {"claude": "claude_fable_high", "gemini": "gemini_argon_high"},
         "executor": {"claude": "claude_opus_xhigh", "gemini": "gemini_argon_high"},
-        "reviewer": {"claude": "claude_opus_xhigh", "gemini": "gemini_carbon_high"},
+        "reviewer": {"claude": "claude_opus_xhigh", "gemini": "gemini_argon_high"},
     },
 }
 

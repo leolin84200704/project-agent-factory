@@ -154,7 +154,7 @@ def main() -> int:
     else:
         print("PASS 4 governance/engine changes and contested round 2 escalate to Opus / Argon / Hydrogen-XHigh")
 
-    # 5. Critical tier: DB schema migration / auth / HMAC / round 3 escalates to Carbon / Fable / Opus-XHigh
+    # 5. Critical tier: DB schema migration / auth / HMAC / round 3 escalates to Argon (High) / Fable / Opus-XHigh
     p_crit = mr.select_task_models(
         title="[DB] Drop legacy token column and rotate OAuth HMAC verification",
         description="ALTER TABLE users DROP COLUMN legacy_oauth_token; update payment auth guard",
@@ -166,15 +166,15 @@ def main() -> int:
     if (
         p_crit["tier"] != "critical"
         or p_crit["planner"]["claude"]["cli_model"] != "fable"
-        or p_crit["planner"]["gemini"]["cli_model"] != "gemini-4-carbon-high"
-        or p_crit["reviewer"]["primary"]["cli_model"] != "gemini-4-carbon-high"
+        or p_crit["planner"]["gemini"]["cli_model"] != "gemini-4-argon-high"
+        or p_crit["reviewer"]["primary"]["cli_model"] != "gemini-4-argon-high"
         or p_crit["reviewer"]["claude"]["cli_model"] != "fable"
         or not p_crit["reasons"]
     ):
         print(f"FAIL 5 critical routing mismatch: {json.dumps(p_crit, indent=2)}")
         failures += 1
     else:
-        print("PASS 5 DB schema/auth/HMAC task escalates planner & reviewer to Fable and Gemini 4 Carbon (High)")
+        print("PASS 5 DB schema/auth/HMAC task escalates planner & reviewer to Fable and Gemini 4 Argon (High)")
 
     # 6. `paf select-model` CLI inspects live git diff on a temporary repository
     tmp_repo = _mkdtemp("paf-model-router-repo-")
@@ -255,7 +255,7 @@ def main() -> int:
         or cli_triv_json.get("tier") != "trivial"
         or cli_crit.returncode != 0
         or cli_crit_json.get("tier") != "critical"
-        or cli_crit_json.get("reviewer", {}).get("primary", {}).get("cli_model") != "gemini-4-carbon-high"
+        or cli_crit_json.get("reviewer", {}).get("primary", {}).get("cli_model") != "gemini-4-argon-high"
     ):
         print(
             f"FAIL 6 paf select-model git diff detection:\n"
@@ -299,7 +299,7 @@ def main() -> int:
     )
     fake_claude.chmod(0o755)
 
-    # 7a: Claude-authored critical migration PR -> Gemini watcher auto-selects `gemini-4-carbon-high`
+    # 7a: Claude-authored critical migration PR -> Gemini watcher auto-selects `gemini-4-argon-high`
     m_claude_auth = {
         "v": 1,
         "role": "author",
@@ -388,7 +388,7 @@ def main() -> int:
     claude_effort_val = claude_seen[claude_seen.index("--effort") + 1] if "--effort" in claude_seen else ""
 
     if (
-        agy_model_val != "gemini-4-carbon-high"
+        agy_model_val != "gemini-4-argon-high"
         or claude_model_val != "opus"
         or claude_effort_val != "xhigh"
     ):
@@ -639,12 +639,12 @@ def main() -> int:
         or pr_tamper_plan["tier"] != "critical"
         or pr_tamper_plan["reviewer"]["claude"]["cli_model"] != "opus"
         or pr_tamper_plan["reviewer"]["claude"]["effort"] != "xhigh"
-        or pr_tamper_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-carbon-high"
+        or pr_tamper_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-argon-high"
         or direct_guard_plan["tier"] != "trivial"
         or direct_guard_plan["reviewer_tier"] != "critical"
         or direct_guard_plan["reviewer"]["claude"]["cli_model"] != "opus"
         or direct_guard_plan["reviewer"]["claude"]["effort"] != "xhigh"
-        or direct_guard_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-carbon-high"
+        or direct_guard_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-argon-high"
         or direct_guard_plan["executor"]["gemini"]["cli_model"] != "gemini-4-hydrogen-low"
         or escalate_override_plan["reviewer"]["claude"]["cli_model"] != "fable"
     ):
