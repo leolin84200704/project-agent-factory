@@ -121,6 +121,11 @@ def make_pr_json(
 
 
 def _agy_settings_only_deny_key(argv: list, key_file: pathlib.Path) -> bool:
+    """agy got deny-only settings that name the key both as the caller gave it and resolved.
+
+    agy's exact-path rules do not follow symlinks, so a caller that resolves the key before
+    handing it to the agy runner drops the as-given path. Pass a symlinked key_file to catch that.
+    """
     if "--settings" not in argv:
         return False
     try:
@@ -128,9 +133,11 @@ def _agy_settings_only_deny_key(argv: list, key_file: pathlib.Path) -> bool:
     except (ValueError, IndexError):
         return False
     perms = settings.get("permissions") or {}
+    given = os.path.abspath(os.path.expanduser(str(key_file)))
     return (
         set(settings) == {"permissions"}
         and set(perms) == {"deny"}
+        and f"read_file({given})" in perms["deny"]
         and f"read_file({key_file.resolve()})" in perms["deny"]
     )
 
@@ -223,6 +230,19 @@ def check_key_shield_modes() -> int:
         failures += 1
     else:
         print("PASS agy deny settings cover the key and lock as given, resolved, and at the default path")
+
+    # The launchd watcher passes --key-file as given (absolute, not resolved), so the daemon's agy
+    # deny rules still see the symlinked path.
+    plist = plistlib.loads(
+        paf_watcher.build_launchd_plist(paf_bin=PAF_BIN, repo_dirs=[d], host_id="h", key_file=given)
+    )
+    prog = plist.get("ProgramArguments") or []
+    plist_key = prog[prog.index("--key-file") + 1] if "--key-file" in prog else ""
+    if plist_key != os.path.abspath(given):
+        print(f"FAIL launchd --key-file resolved the symlink: {plist_key!r} != {os.path.abspath(given)!r}")
+        failures += 1
+    else:
+        print("PASS launchd --key-file keeps the key path as given")
     return failures
 
 
@@ -661,6 +681,16 @@ def main() -> int:
     #     stamps HMAC signature outside the model subprocess (with PAF_CONSENSUS_KEY_FILE scrubbed from model env!),
     #     and does NOT re-review the same SHA on the next tick
     #   - `work-mac` sees the valid HMAC-signed `gemini` approve + green CI and triggers `merge-consensus`
+    # The same key reached through a symlinked directory. The orchestrators get this path so the agy
+    # checks below see whether the as-given path survives to agy's deny rules. On Linux /tmp is not a
+    # symlink, so without it only macOS (/var -> /private/var) would make the two paths differ.
+    # key_file.parent, not key_dir: test 3-0 reuses the name key_dir for a Gemini key dir it deletes.
+    key_link_dir = _mkdtemp("paf-key-link-") / "link"
+    key_link_dir.symlink_to(key_file.parent, target_is_directory=True)
+    key_link = key_link_dir / "consensus.key"
+    if not key_link.is_file() or key_link.resolve() != key_file.resolve():
+        print(f"FAIL 4-6 setup: symlinked key {key_link} does not reach the consensus key {key_file}")
+        return 1
     mock_bin = _mkdtemp("paf-mock-cli-")
     env_dump = mock_bin / "agy_env.json"
     args_dump = mock_bin / "agy_args.json"
@@ -717,7 +747,7 @@ def main() -> int:
             host_id="personal-mac",
             families=("claude", "gemini"),
             state_dir=state_dir,
-            key_file=key_file,
+            key_file=key_link,
             bus=bus,
             claude_bin=str(fake_claude),
             agy_bin=str(fake_agy),
@@ -778,7 +808,7 @@ def main() -> int:
         or "PAF_CONSENSUS_KEY_FILE" in agy_seen_env
         or "CLAUDECODE" in agy_seen_env
         or "--sandbox" not in agy_seen_args
-        or not _agy_settings_only_deny_key(agy_seen_args, key_file)  # deny-only settings, no grant of its own
+        or not _agy_settings_only_deny_key(agy_seen_args, key_link)  # deny-only settings, no grant of its own
         or "--dangerously-skip-permissions" in agy_seen_args
         or "You have NO shell" not in " ".join(agy_seen_args)
         or not any(a.startswith("-p=") for a in agy_seen_args)
@@ -1405,9 +1435,11 @@ trace = pathlib.Path({str(trace_log)!r})
 home = pathlib.Path(os.environ["HOME"])
 expected_sid = {expected_agy_sid!r}
 assert "--mode" in args and args[args.index("--mode") + 1] == "accept-edits", f"Expected --mode accept-edits: {{args}}"
-_deny = json.loads(args[args.index("--settings") + 1])["permissions"]["deny"]
-_key = {str(pathlib.Path(key_file).resolve())!r}
-assert f"read_file({{_key}})" in _deny and f"write_file({{_key}})" in _deny, f"author agy lacks key deny: {{_deny}}"
+_perms = json.loads(args[args.index("--settings") + 1])["permissions"]
+assert set(_perms) == {{"deny"}}, f"author agy settings must be deny-only: {{_perms}}"
+_deny = _perms["deny"]
+for _key in {[os.path.abspath(key_link), str(key_link.resolve())]!r}:
+    assert f"read_file({{_key}})" in _deny and f"write_file({{_key}})" in _deny, f"author agy lacks key deny for {{_key}}: {{_deny}}"
 
 if n == 1:
     assert "--conversation" not in args, f"Author Turn 1 must not pass --conversation: {{args}}"
@@ -1473,7 +1505,7 @@ print(json.dumps({{"status": "DONE", "conversation_id": sid, "structured_output"
             caller_session_id="caller-interactive-sess-001",
             host_id="personal-mac",
             state_dir=dlg_state,
-            key_file=key_file,
+            key_file=key_link,
             bus=dlg_bus,
             claude_bin=str(dlg_claude),
             agy_bin=str(dlg_agy),
@@ -1716,7 +1748,7 @@ print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output":
             author_family="claude",
             host_id="personal-mac",
             state_dir=ilock_state,
-            key_file=key_file,
+            key_file=key_link,
             bus=ilock_bus,
             claude_bin=str(empty_sid_claude),
             agy_bin=str(empty_sid_agy),
@@ -1724,7 +1756,7 @@ print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output":
     except RuntimeError as exc:
         empty_sid_rejected = "empty session_id" in str(exc)
     dlg_review_args = json.loads(empty_sid_agy_args.read_text()) if empty_sid_agy_args.is_file() else []
-    dlg_review_confined = _agy_settings_only_deny_key(dlg_review_args, pathlib.Path(key_file))
+    dlg_review_confined = _agy_settings_only_deny_key(dlg_review_args, key_link)
 
     if (
         not nb3_ok

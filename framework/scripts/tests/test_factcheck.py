@@ -427,6 +427,25 @@ class DualModelTest(Base):
         self.assertEqual(code, 0, r)
         self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind-equivalent")
 
+    def assert_negative_blind_goes_to_audit(self, blind_command):
+        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": blind_command, "expect": "empty"}]},
+                          audit={"claims": []})
+        code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)], verify=True)
+        self.assertEqual(code, 1, r)
+        e = r["verification"]["claims"]["c1"]
+        self.assertIs(e["result_match"], False)
+        self.assertNotEqual(e.get("by"), "blind-equivalent")
+        self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
+
+    def test_negative_blind_probe_with_data_goes_to_audit(self):
+        # The verifier's absence probe exits 0 but returns a row, which contradicts the claim.
+        self.assert_negative_blind_goes_to_audit("grep -n 1 one.txt")
+
+    def test_negative_blind_probe_that_errors_goes_to_audit(self):
+        # cat on a missing file exits 1 with no stdout but with stderr: an error, not grep's no-match.
+        self.assertFalse((self.dir / "missing.txt").exists())
+        self.assert_negative_blind_goes_to_audit("cat missing.txt")
+
     def test_same_family_refused_and_verifier_error_fails_closed(self):
         self.set_scenario(blind={"claims": []})
         code, r = self.check([c()], verify=True, author_family="claude", verifier_family="claude")
@@ -486,7 +505,12 @@ class AgyVerifierConfinementTest(Base):
             "print(json.dumps({'status': 'SUCCESS', 'structured_output': {'claims': []}}))\n"
         )
         fake.chmod(0o755)
-        key = self.dir / "consensus.key"
+        real_dir = self.dir / "real"
+        real_dir.mkdir()
+        (self.dir / "link").symlink_to(real_dir, target_is_directory=True)
+        # The env names the key through a symlinked directory, so the path as given and the
+        # resolved path differ on every platform (not only where the temp dir is a symlink).
+        key = self.dir / "link" / "consensus.key"
         os.environ["PAF_AGY_BIN"] = str(fake)
         os.environ["PAF_CONSENSUS_KEY_FILE"] = str(key)
         try:
@@ -497,8 +521,11 @@ class AgyVerifierConfinementTest(Base):
         argv = json.loads(argv_log.read_text())
         self.assertIn("--sandbox", argv)
         settings = json.loads(argv[argv.index("--settings") + 1])
-        self.assertNotIn("allow", settings["permissions"])
-        self.assertIn(f"read_file({key.resolve()})", settings["permissions"]["deny"])
+        self.assertEqual(set(settings["permissions"]), {"deny"})
+        deny = settings["permissions"]["deny"]
+        self.assertNotEqual(os.path.abspath(key), str(key.resolve()))
+        self.assertIn(f"read_file({os.path.abspath(key)})", deny)
+        self.assertIn(f"read_file({key.resolve()})", deny)
 
 
 class HookIntegrationTest(Base):

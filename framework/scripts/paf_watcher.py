@@ -2445,6 +2445,9 @@ def run_consensus_dialogue(
     paf_bin = Path(paf_mod.__file__).resolve()
     resolved_host = resolve_host_id(host_id)
     resolved_key = resolve_key_file(key_file)
+    # agy matches deny rules by exact path and not across symlinks, so its confinement
+    # needs the caller's path as given; `_agy_confinement_settings` adds the resolved one.
+    agy_key_file = key_file if key_file is not None else resolved_key
     secret = load_consensus_secret(resolved_key)
     if repo_slug:
         slug = repo_slug
@@ -2697,7 +2700,7 @@ def run_consensus_dialogue(
                                     effort=rev_effort,
                                     resume_session_id=resume_sid,
                                     timeout_sec=review_timeout_sec,
-                                    key_file=resolved_key,
+                                    key_file=agy_key_file,
                                 )
                             except BaseException as exc:
                                 sp_sid = str(getattr(exc, "spawned_session_id", "") or "").strip()
@@ -2876,7 +2879,7 @@ def run_consensus_dialogue(
                                     effort=auth_effort,
                                     resume_session_id=(session_ctx["author_session_id"] if author_session_started else None),
                                     timeout_sec=author_timeout_sec,
-                                    key_file=resolved_key,
+                                    key_file=agy_key_file,
                                 )
                             except BaseException as exc:
                                 sp_sid = str(getattr(exc, "spawned_session_id", "") or "").strip()
@@ -3148,6 +3151,8 @@ def watch_repo_once(
 
         _prune_stale_worktrees(repo)
         resolved_key = resolve_key_file(key_file)
+        # agy deny rules need the caller's path as given (see run_consensus_dialogue).
+        agy_key_file = key_file if key_file is not None else resolved_key
         secret = load_consensus_secret(resolved_key)
         enabled_families = tuple(dict.fromkeys(normalize_family(f) for f in families if normalize_family(f)))
 
@@ -3462,7 +3467,7 @@ def watch_repo_once(
                                         model=rev_model,
                                         effort=rev_effort,
                                         timeout_sec=review_timeout_sec,
-                                        key_file=resolved_key,
+                                        key_file=agy_key_file,
                                     )
                                 elif cand_fam == "claude":
                                     review_result = run_claude_review(
@@ -3671,7 +3676,9 @@ def build_launchd_plist(
         str(st_dir),
     ]
     if key_file is not None:
-        prog_args.extend(["--key-file", str(key_file.expanduser().resolve())])
+        # Keep the path as given (absolute, not resolved): agy's exact-path deny rules for the
+        # key are derived from it, and resolve_key_file still resolves it for reading.
+        prog_args.extend(["--key-file", os.path.abspath(os.path.expanduser(str(key_file)))])
     for r in repo_dirs:
         prog_args.extend(["--repo-dir", str(r.expanduser().resolve())])
 
