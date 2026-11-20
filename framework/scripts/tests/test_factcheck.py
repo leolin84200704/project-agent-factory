@@ -121,6 +121,32 @@ class DeterministicTest(Base):
         self.assertEqual(self.check([c(category="C", kind="negative", command=EMPTY, control_command=EMPTY)])[0], 1)
         self.assertEqual(self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)])[0], 0)
 
+    def test_negative_grep_no_match_is_not_a_failed_command(self):
+        # grep exits 1 with no output when nothing matches; for a negative claim that is the answer.
+        none = f"grep -n no-such-text {self.dir / 'one.txt'}"
+        self.assertEqual(self.check([c(category="C", kind="negative", command=none, control_command=HAS_DATA)])[0], 0)
+        # The same exit code on a positive claim still fails.
+        code, r = self.check([c(command=none)])
+        self.assertEqual(code, 1)
+        self.assertTrue(any("exited 1" in p for p in self.problems(r, "c1")))
+        # Exit 1 with an error message (missing file) is a real failure even for a negative claim.
+        missing = f"grep -n x {self.dir / 'missing.txt'}"
+        code, r = self.check([c(category="C", kind="negative", command=f"{missing}; exit 1", control_command=HAS_DATA)])
+        self.assertEqual(code, 1)
+        # Exit codes other than 1 still fail.
+        code, r = self.check([c(category="C", kind="negative", command=FAILS, control_command=HAS_DATA)])
+        self.assertEqual(code, 1)
+
+    def test_negative_claim_fails_when_command_returns_data(self):
+        # grep finds a match: the claim says "absent", the data says present.
+        found = f"grep -n 1 {self.dir / 'one.txt'}"
+        code, r = self.check([c(category="C", kind="negative", command=found, control_command=HAS_DATA)])
+        self.assertEqual(code, 1)
+        self.assertTrue(any("contradicts the claim" in p for p in self.problems(r, "c1")))
+        # grep -c prints 0 and exits 1 when nothing matches; that output still counts as data.
+        count = f"grep -c no-such-text {self.dir / 'one.txt'}"
+        self.assertEqual(self.check([c(category="C", kind="negative", command=count, control_command=HAS_DATA)])[0], 1)
+
     def test_identity_needs_cross_check(self):
         self.assertEqual(self.check([c(category="D")])[0], 1)
         self.assertEqual(self.check([c(category="D", cross_check_command=EMPTY)])[0], 1)
@@ -392,6 +418,34 @@ class DualModelTest(Base):
         code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)], verify=True)
         self.assertEqual(code, 0, r)
 
+    def test_negative_grep_no_match_is_blind_equivalent(self):
+        # Both sides run a grep that finds nothing (exit 1, no output); that agrees without an audit.
+        grep = "grep -n no-such-text one.txt"
+        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": grep, "expect": "empty"}]})
+        code, r = self.check([c(category="C", kind="negative", command=f"grep -n no-such-text {self.dir / 'one.txt'}",
+                                control_command=HAS_DATA)], verify=True)
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind-equivalent")
+
+    def assert_negative_blind_goes_to_audit(self, blind_command):
+        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": blind_command, "expect": "empty"}]},
+                          audit={"claims": []})
+        code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)], verify=True)
+        self.assertEqual(code, 1, r)
+        e = r["verification"]["claims"]["c1"]
+        self.assertIs(e["result_match"], False)
+        self.assertNotEqual(e.get("by"), "blind-equivalent")
+        self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
+
+    def test_negative_blind_probe_with_data_goes_to_audit(self):
+        # The verifier's absence probe exits 0 but returns a row, which contradicts the claim.
+        self.assert_negative_blind_goes_to_audit("grep -n 1 one.txt")
+
+    def test_negative_blind_probe_that_errors_goes_to_audit(self):
+        # cat on a missing file exits 1 with no stdout but with stderr: an error, not grep's no-match.
+        self.assertFalse((self.dir / "missing.txt").exists())
+        self.assert_negative_blind_goes_to_audit("cat missing.txt")
+
     def test_same_family_refused_and_verifier_error_fails_closed(self):
         self.set_scenario(blind={"claims": []})
         code, r = self.check([c()], verify=True, author_family="claude", verifier_family="claude")
@@ -438,6 +492,40 @@ class ClaudeVerifierConfinementTest(Base):
         deny = settings["permissions"]["deny"]
         self.assertIn("Read(~/.config/**)", deny)
         self.assertIn("paf-factcheck-verifier-", seen["cwd"])
+
+
+class AgyVerifierConfinementTest(Base):
+    def test_agy_verifier_gets_key_deny_settings(self):
+        argv_log = self.dir / "agy_argv.json"
+        fake = self.dir / "fake_agy"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"json.dump(sys.argv[1:], open({str(argv_log)!r}, 'w'))\n"
+            "print(json.dumps({'status': 'SUCCESS', 'structured_output': {'claims': []}}))\n"
+        )
+        fake.chmod(0o755)
+        real_dir = self.dir / "real"
+        real_dir.mkdir()
+        (self.dir / "link").symlink_to(real_dir, target_is_directory=True)
+        # The env names the key through a symlinked directory, so the path as given and the
+        # resolved path differ on every platform (not only where the temp dir is a symlink).
+        key = self.dir / "link" / "consensus.key"
+        os.environ["PAF_AGY_BIN"] = str(fake)
+        os.environ["PAF_CONSENSUS_KEY_FILE"] = str(key)
+        try:
+            fc.call_verifier("gemini", "gemini-test", None, "prompt", fc.BLIND_SCHEMA, None)
+        finally:
+            os.environ.pop("PAF_AGY_BIN", None)
+            os.environ["PAF_CONSENSUS_KEY_FILE"] = self.env["PAF_CONSENSUS_KEY_FILE"]
+        argv = json.loads(argv_log.read_text())
+        self.assertIn("--sandbox", argv)
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(set(settings["permissions"]), {"deny"})
+        deny = settings["permissions"]["deny"]
+        self.assertNotEqual(os.path.abspath(key), str(key.resolve()))
+        self.assertIn(f"read_file({os.path.abspath(key)})", deny)
+        self.assertIn(f"read_file({key.resolve()})", deny)
 
 
 class HookIntegrationTest(Base):

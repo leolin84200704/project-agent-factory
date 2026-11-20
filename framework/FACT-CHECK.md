@@ -112,7 +112,7 @@ claims 檔列出這段文字或這次寫入依賴的每一個事實。腳本自�
 判定：
 - 已驗證的事實：要有 `source` 和 `command`；指令要 exit 0 而且有輸出；可加 `expect_regex`。
 - 來源在權威來源表上列為衍生欄位：失敗。
-- `kind: negative`（C 類）：主指令可以沒有輸出，但 `control_command` 必須有輸出。
+- `kind: negative`（C 類）：主指令必須沒有輸出，`control_command` 必須有輸出。grep、rg 找不到東西時會 exit 1 而且沒有任何輸出，負面陳述接受這種結果；exit 1 但有輸出或錯誤訊息（例如檔案不存在）仍然算失敗。用 `grep -n` 或 `grep -l`，不要用 `grep -c`，因為 `-c` 找不到時會印出 0，算成有輸出。
 - D 類：還要 `cross_check_command` 有輸出。
 - F 類：還要 `full_set_command` 有輸出。
 - 推論：`from` 裡的每一個 id 都要是通過的已驗證事實。

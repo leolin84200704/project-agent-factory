@@ -41,7 +41,7 @@ _HERMETIC_NO_KEY = _mkdtemp("paf-hermetic-nokey-") / "absent.key"
 # nothing and the suite crashed. Same list as test_paf_cli.py. Removed from this process as well, because
 # some cases call the watcher module directly.
 _SCRUBBED_CALLER_ENV = ("PAF_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDECODE", "AGY_CONVERSATION_ID",
-                        "PAF_AUTHOR_FAMILY", "PAF_CONSENSUS_KEY")
+                        "PAF_AUTHOR_FAMILY", "PAF_CONSENSUS_KEY", "PAF_SHIELD_KEY_DURING_REVIEW")
 for _k in _SCRUBBED_CALLER_ENV:
     os.environ.pop(_k, None)
 
@@ -118,6 +118,132 @@ def make_pr_json(
         "changedFiles": len(file_list),
         "reviewDecision": "",
     }
+
+
+def _agy_settings_only_deny_key(argv: list, key_file: pathlib.Path) -> bool:
+    """agy got deny-only settings that name the key both as the caller gave it and resolved.
+
+    agy's exact-path rules do not follow symlinks, so a caller that resolves the key before
+    handing it to the agy runner drops the as-given path. Pass a symlinked key_file to catch that.
+    """
+    if "--settings" not in argv:
+        return False
+    try:
+        settings = json.loads(argv[argv.index("--settings") + 1])
+    except (ValueError, IndexError):
+        return False
+    perms = settings.get("permissions") or {}
+    given = os.path.abspath(os.path.expanduser(str(key_file)))
+    return (
+        set(settings) == {"permissions"}
+        and set(perms) == {"deny"}
+        and f"read_file({given})" in perms["deny"]
+        and f"read_file({key_file.resolve()})" in perms["deny"]
+    )
+
+
+def check_key_shield_modes() -> int:
+    """Shield is off by default and does not serialize sessions; PAF_SHIELD_KEY_DURING_REVIEW=1 restores it."""
+    import threading
+
+    sys.path.insert(0, str(REPO_ROOT / "framework" / "scripts"))
+    import paf_watcher  # type: ignore
+
+    failures = 0
+    d = _mkdtemp("paf-shield-")
+    key = d / "consensus.key"
+    key.write_text("k" * 64 + "\n", encoding="utf-8")
+    key.chmod(0o600)
+    old = os.environ.pop(paf_watcher.SHIELD_ENV, None)
+    try:
+        # Default: two reviews overlap, and a third session can read the key while both run.
+        inside = threading.Barrier(3, timeout=5)
+        seen: list = []
+
+        def review() -> None:
+            with paf_watcher._shield_key_file(key):
+                inside.wait()
+                seen.append(paf_watcher.load_consensus_secret(key, wait_sec=0.5))
+                inside.wait()
+
+        threads = [threading.Thread(target=review) for _ in range(2)]
+        for t in threads:
+            t.start()
+        try:
+            inside.wait()
+            mode_during = oct(stat.S_IMODE(key.stat().st_mode))
+            third = paf_watcher.load_consensus_secret(key, wait_sec=0.5)
+            inside.wait()
+            overlapped = True
+        except threading.BrokenBarrierError:
+            overlapped, mode_during, third = False, "", None
+        for t in threads:
+            t.join(5)
+        if not overlapped or mode_during != "0o600" or third != "k" * 64 or seen != ["k" * 64] * 2:
+            print(f"FAIL shield default: overlapped={overlapped} mode={mode_during} third={bool(third)} seen={len(seen)}")
+            failures += 1
+        else:
+            print("PASS shield default: two reviews overlap and a third session reads the key meanwhile")
+
+        # Explicit 0 stays off.
+        os.environ[paf_watcher.SHIELD_ENV] = "0"
+        with paf_watcher._shield_key_file(key):
+            mode_zero = oct(stat.S_IMODE(key.stat().st_mode))
+        # Opt-in: the old serial 0000 shield, and a concurrent reader is refused while it is up.
+        os.environ[paf_watcher.SHIELD_ENV] = "1"
+        refused = False
+        with paf_watcher._shield_key_file(key):
+            mode_on = oct(stat.S_IMODE(key.stat().st_mode))
+            try:
+                paf_watcher.load_consensus_secret(key, wait_sec=0.05)
+            except paf_watcher.ConsensusKeyError:
+                refused = True
+        mode_after = oct(stat.S_IMODE(key.stat().st_mode))
+        if mode_zero != "0o600" or mode_on != "0o0" or mode_after != "0o600" or not refused:
+            print(f"FAIL shield opt-in: zero={mode_zero} on={mode_on} after={mode_after} refused={refused}")
+            failures += 1
+        else:
+            print("PASS shield opt-in: PAF_SHIELD_KEY_DURING_REVIEW=1 sets 0000 during review and restores 0600")
+    finally:
+        os.environ.pop(paf_watcher.SHIELD_ENV, None)
+        if old is not None:
+            os.environ[paf_watcher.SHIELD_ENV] = old
+
+    # agy deny settings list the key and its lock both as given and resolved through a symlink.
+    real = d / "real"
+    real.mkdir()
+    (real / "consensus.key").write_text("k" * 64 + "\n", encoding="utf-8")
+    link = d / "link"
+    link.symlink_to(real, target_is_directory=True)
+    given = link / "consensus.key"
+    deny = json.loads(paf_watcher._agy_confinement_settings(given, allow_write=True))["permissions"]["deny"]
+    want = []
+    for base in (link, real.resolve()):
+        for name in ("consensus.key", ".consensus.key.lock"):
+            for action in ("read_file", "write_file"):
+                want.append(f"{action}({os.path.abspath(base / name)})")
+    default_key = str(paf_watcher.DEFAULT_KEY_FILE)
+    read_only = json.loads(paf_watcher._agy_confinement_settings(given))["permissions"]["deny"]
+    missing = [w for w in want if w not in deny]
+    if missing or f"read_file({default_key})" not in deny or any(r.startswith("write_file(") for r in read_only):
+        print(f"FAIL agy deny paths: missing={missing} default_in={f'read_file({default_key})' in deny}")
+        failures += 1
+    else:
+        print("PASS agy deny settings cover the key and lock as given, resolved, and at the default path")
+
+    # The launchd watcher passes --key-file as given (absolute, not resolved), so the daemon's agy
+    # deny rules still see the symlinked path.
+    plist = plistlib.loads(
+        paf_watcher.build_launchd_plist(paf_bin=PAF_BIN, repo_dirs=[d], host_id="h", key_file=given)
+    )
+    prog = plist.get("ProgramArguments") or []
+    plist_key = prog[prog.index("--key-file") + 1] if "--key-file" in prog else ""
+    if plist_key != os.path.abspath(given):
+        print(f"FAIL launchd --key-file resolved the symlink: {plist_key!r} != {os.path.abspath(given)!r}")
+        failures += 1
+    else:
+        print("PASS launchd --key-file keeps the key path as given")
+    return failures
 
 
 def main() -> int:
@@ -555,6 +681,16 @@ def main() -> int:
     #     stamps HMAC signature outside the model subprocess (with PAF_CONSENSUS_KEY_FILE scrubbed from model env!),
     #     and does NOT re-review the same SHA on the next tick
     #   - `work-mac` sees the valid HMAC-signed `gemini` approve + green CI and triggers `merge-consensus`
+    # The same key reached through a symlinked directory. The orchestrators get this path so the agy
+    # checks below see whether the as-given path survives to agy's deny rules. On Linux /tmp is not a
+    # symlink, so without it only macOS (/var -> /private/var) would make the two paths differ.
+    # key_file.parent, not key_dir: test 3-0 reuses the name key_dir for a Gemini key dir it deletes.
+    key_link_dir = _mkdtemp("paf-key-link-") / "link"
+    key_link_dir.symlink_to(key_file.parent, target_is_directory=True)
+    key_link = key_link_dir / "consensus.key"
+    if not key_link.is_file() or key_link.resolve() != key_file.resolve():
+        print(f"FAIL 4-6 setup: symlinked key {key_link} does not reach the consensus key {key_file}")
+        return 1
     mock_bin = _mkdtemp("paf-mock-cli-")
     env_dump = mock_bin / "agy_env.json"
     args_dump = mock_bin / "agy_args.json"
@@ -611,7 +747,7 @@ def main() -> int:
             host_id="personal-mac",
             families=("claude", "gemini"),
             state_dir=state_dir,
-            key_file=key_file,
+            key_file=key_link,
             bus=bus,
             claude_bin=str(fake_claude),
             agy_bin=str(fake_agy),
@@ -672,7 +808,7 @@ def main() -> int:
         or "PAF_CONSENSUS_KEY_FILE" in agy_seen_env
         or "CLAUDECODE" in agy_seen_env
         or "--sandbox" not in agy_seen_args
-        or "--settings" in agy_seen_args                      # the reviewer is given no grant of its own
+        or not _agy_settings_only_deny_key(agy_seen_args, key_link)  # deny-only settings, no grant of its own
         or "--dangerously-skip-permissions" in agy_seen_args
         or "You have NO shell" not in " ".join(agy_seen_args)
         or not any(a.startswith("-p=") for a in agy_seen_args)
@@ -802,7 +938,8 @@ def main() -> int:
     # 9. Security hardening regressions (Round 1 Claude adversarial review):
     #    (a) Unreachable commit / failed detached worktree aborts fail-closed without claiming or stamping
     #    (b) Default repo (no `consensus` block in `.agent-verify.json`) still requires HMAC in `watch_repo_once`
-    #    (c) `consensus.key` is shielded to 0o000 during reviewer execution, restored to 0o600 after,
+    #    (c) `consensus.key` stays 0o600 during reviewer execution by default (the reviewer is confined
+    #        by its own CLI settings instead, so other paf sessions can keep signing and reviewing),
     #        Claude receives `--settings` with `Read(//...)` deny rules, and leaked key material in `prose` is blocked!
     mode_during_review = key_mode_dump.read_text(encoding="utf-8").strip() if key_mode_dump.is_file() else ""
     mode_after_review = oct(stat.S_IMODE(key_file.stat().st_mode))
@@ -916,7 +1053,7 @@ def main() -> int:
     leaked_in_comments = any(first_secret[:16] in body for _, body in bus_leak.comments_posted)
 
     if (
-        mode_during_review != "0o0"
+        mode_during_review != "0o600"
         or mode_after_review != "0o600"
         or not has_claude_deny_setting
         or act_unreach.get("reviewed") != []
@@ -933,7 +1070,7 @@ def main() -> int:
         )
         failures += 1
     else:
-        print("PASS 9 blocks worktree/diff fail-open, enforces default watch HMAC, shields key 0000, and scrubs secret leaks")
+        print("PASS 9 blocks worktree/diff fail-open, enforces default watch HMAC, leaves key readable for parallel sessions, and scrubs secret leaks")
 
     # 10. Round 2 security & liveness regressions:
     #     (a) Claude `--allowedTools` is scoped to `Read(//<wt>/**)` with `--permission-mode dontAsk`,
@@ -1298,6 +1435,11 @@ trace = pathlib.Path({str(trace_log)!r})
 home = pathlib.Path(os.environ["HOME"])
 expected_sid = {expected_agy_sid!r}
 assert "--mode" in args and args[args.index("--mode") + 1] == "accept-edits", f"Expected --mode accept-edits: {{args}}"
+_perms = json.loads(args[args.index("--settings") + 1])["permissions"]
+assert set(_perms) == {{"deny"}}, f"author agy settings must be deny-only: {{_perms}}"
+_deny = _perms["deny"]
+for _key in {[os.path.abspath(key_link), str(key_link.resolve())]!r}:
+    assert f"read_file({{_key}})" in _deny and f"write_file({{_key}})" in _deny, f"author agy lacks key deny for {{_key}}: {{_deny}}"
 
 if n == 1:
     assert "--conversation" not in args, f"Author Turn 1 must not pass --conversation: {{args}}"
@@ -1363,7 +1505,7 @@ print(json.dumps({{"status": "DONE", "conversation_id": sid, "structured_output"
             caller_session_id="caller-interactive-sess-001",
             host_id="personal-mac",
             state_dir=dlg_state,
-            key_file=key_file,
+            key_file=key_link,
             bus=dlg_bus,
             claude_bin=str(dlg_claude),
             agy_bin=str(dlg_agy),
@@ -1576,12 +1718,14 @@ print(json.dumps({"type": "result", "is_error": False, "session_id": "", "struct
     empty_sid_claude.chmod(0o755)
     # Note: `run_claude_review` falls back to `init_session_id` if `reported_sid` is empty, so test `gemini` reviewer returning empty `conversation_id`!
     empty_sid_agy = dlg_mock_bin / "mock_agy_empty_sid"
+    empty_sid_agy_args = dlg_mock_bin / "empty_sid_agy_args.json"
     empty_sid_agy.write_text(
-        """#!/usr/bin/env python3
-import json
-print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": {
+        f"""#!/usr/bin/env python3
+import json, sys
+open({str(empty_sid_agy_args)!r}, "w").write(json.dumps(sys.argv[1:]))
+print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output": {{
     "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "ok"
-}}))
+}}}}))
 """,
         encoding="utf-8",
     )
@@ -1604,13 +1748,15 @@ print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": 
             author_family="claude",
             host_id="personal-mac",
             state_dir=ilock_state,
-            key_file=key_file,
+            key_file=key_link,
             bus=ilock_bus,
             claude_bin=str(empty_sid_claude),
             agy_bin=str(empty_sid_agy),
         )
     except RuntimeError as exc:
         empty_sid_rejected = "empty session_id" in str(exc)
+    dlg_review_args = json.loads(empty_sid_agy_args.read_text()) if empty_sid_agy_args.is_file() else []
+    dlg_review_confined = _agy_settings_only_deny_key(dlg_review_args, key_link)
 
     if (
         not nb3_ok
@@ -1623,12 +1769,14 @@ print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": 
         or stale_active is not False
         or evicted_after != {}
         or not empty_sid_rejected
+        or not dlg_review_confined
     ):
         print(
             f"FAIL 12 interlock & hardening:\n"
             f"  nb3_ok={nb3_ok} nb4_ok={nb4_ok} nonce_sid={matched_nonce_sid!r}\n"
             f"  watch_locked={watch_while_locked} dup_blocked={dup_lock_blocked}\n"
             f"  stale_active={stale_active} evicted_after={evicted_after} empty_sid_rejected={empty_sid_rejected}"
+            f" dlg_review_confined={dlg_review_confined}"
         )
         failures += 1
     else:
@@ -1655,6 +1803,8 @@ print(json.dumps({"status": "DONE", "conversation_id": "", "structured_output": 
         failures += 1
     else:
         print("PASS 13 empty agy review names the denied tool calls instead of a JSON parse error")
+
+    failures += check_key_shield_modes()
 
     return 1 if failures else 0
 

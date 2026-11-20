@@ -305,11 +305,58 @@ def compute_key_id(secret: str) -> str:
     return hashlib.sha256(f"paf-key-id:v1:{secret}".encode("utf-8")).hexdigest()[:12]
 
 
+SHIELD_ENV = "PAF_SHIELD_KEY_DURING_REVIEW"
+
+
+def _key_shield_enabled() -> bool:
+    return (os.environ.get(SHIELD_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _agy_confinement_settings(key_file: Path | None, *, allow_write: bool = False) -> str:
+    """Session-only agy settings that deny reading the consensus key and its lock.
+
+    agy's headless sandbox already denies reads and writes outside the workspace and every
+    shell command (probed 2026-11-19: a shell call stayed denied even with `command(**)`
+    allowed). These deny rules keep the key out of reach even if the user's own agy
+    settings allow reading it: in the same probe an exact-path `read_file(<path>)` allow
+    let agy read a canary file, and adding the same exact-path deny blocked it. A
+    `read_file(<dir>/**)` deny did not block it, so each path is listed literally, both as
+    given and resolved (a symlinked ~/.config would otherwise slip through). For author
+    turns that may edit files, `write_file` (the action agy reports for its Edit tool) is
+    denied on the same paths.
+    """
+    raw: list[Path] = [DEFAULT_KEY_FILE]
+    env_val = (os.environ.get("PAF_CONSENSUS_KEY_FILE") or "").strip()
+    if env_val:
+        raw.append(Path(env_val))
+    if key_file is not None:
+        raw.append(Path(key_file))
+    paths: list[str] = []
+    for rp in raw:
+        given = Path(os.path.abspath(os.path.expanduser(str(rp))))
+        for cand in (given, given.resolve()):
+            for item in (cand, _key_lock_path(cand)):
+                sp = str(item)
+                if sp not in paths:
+                    paths.append(sp)
+    actions = ["read_file"] + (["write_file"] if allow_write else [])
+    deny = [f"{a}({sp})" for sp in paths for a in actions]
+    return json.dumps({"permissions": {"deny": deny}}, separators=(",", ":"))
+
+
 @contextlib.contextmanager
 def _shield_key_file(key_file: Path | None) -> Any:
-    """Acquire exclusive flock and set 0000 on consensus.key while untrusted model CLI runs."""
+    """Optionally set 0000 on consensus.key while an untrusted model CLI runs.
+
+    Off by default. Each reviewer CLI is confined instead (claude: allow rules scoped to
+    the worktree plus deny settings; agy: --sandbox plus `_agy_confinement_settings`), so
+    the key no longer has to be locked for the whole review. Holding an exclusive lock for
+    up to the review timeout serialized every paf session on the machine: one review at a
+    time, and no signing anywhere meanwhile. Set PAF_SHIELD_KEY_DURING_REVIEW=1 to restore
+    the serial 0000 shield as an extra layer.
+    """
     target = key_file.expanduser().resolve() if key_file is not None else None
-    if target is None or not os.path.lexists(target):
+    if target is None or not os.path.lexists(target) or not _key_shield_enabled():
         yield
         return
     lock_path = _key_lock_path(target)
@@ -993,6 +1040,7 @@ def run_agy_review(
     effort: str | None = None,
     resume_session_id: str | None = None,
     timeout_sec: int = 660,
+    key_file: Path | None = None,
 ) -> dict[str, Any]:
     exec_agy = _ensure_executable_binary(agy_bin, "agy")
     pre_ids = _snapshot_agy_brain_ids() if not resume_session_id else set()
@@ -1007,6 +1055,7 @@ def run_agy_review(
         "--disable-slash-commands",
         "--sandbox",
     ]
+    cmd.extend(["--settings", _agy_confinement_settings(key_file)])
     if resume_session_id:
         cmd.extend(["--conversation", resume_session_id])
     if model:
@@ -1153,6 +1202,7 @@ def run_agy_author_turn(
     effort: str | None = None,
     resume_session_id: str | None = None,
     timeout_sec: int = 1200,
+    key_file: Path | None = None,
 ) -> dict[str, Any]:
     exec_agy = _ensure_executable_binary(agy_bin, "agy")
     pre_ids = _snapshot_agy_brain_ids() if not resume_session_id else set()
@@ -1169,6 +1219,7 @@ def run_agy_author_turn(
         "--mode",
         "accept-edits",
     ]
+    cmd.extend(["--settings", _agy_confinement_settings(key_file, allow_write=True)])
     if resume_session_id:
         cmd.extend(["--conversation", resume_session_id])
     if model:
@@ -2394,6 +2445,9 @@ def run_consensus_dialogue(
     paf_bin = Path(paf_mod.__file__).resolve()
     resolved_host = resolve_host_id(host_id)
     resolved_key = resolve_key_file(key_file)
+    # agy matches deny rules by exact path and not across symlinks, so its confinement
+    # needs the caller's path as given; `_agy_confinement_settings` adds the resolved one.
+    agy_key_file = key_file if key_file is not None else resolved_key
     secret = load_consensus_secret(resolved_key)
     if repo_slug:
         slug = repo_slug
@@ -2646,6 +2700,7 @@ def run_consensus_dialogue(
                                     effort=rev_effort,
                                     resume_session_id=resume_sid,
                                     timeout_sec=review_timeout_sec,
+                                    key_file=agy_key_file,
                                 )
                             except BaseException as exc:
                                 sp_sid = str(getattr(exc, "spawned_session_id", "") or "").strip()
@@ -2824,6 +2879,7 @@ def run_consensus_dialogue(
                                     effort=auth_effort,
                                     resume_session_id=(session_ctx["author_session_id"] if author_session_started else None),
                                     timeout_sec=author_timeout_sec,
+                                    key_file=agy_key_file,
                                 )
                             except BaseException as exc:
                                 sp_sid = str(getattr(exc, "spawned_session_id", "") or "").strip()
@@ -3095,6 +3151,8 @@ def watch_repo_once(
 
         _prune_stale_worktrees(repo)
         resolved_key = resolve_key_file(key_file)
+        # agy deny rules need the caller's path as given (see run_consensus_dialogue).
+        agy_key_file = key_file if key_file is not None else resolved_key
         secret = load_consensus_secret(resolved_key)
         enabled_families = tuple(dict.fromkeys(normalize_family(f) for f in families if normalize_family(f)))
 
@@ -3409,6 +3467,7 @@ def watch_repo_once(
                                         model=rev_model,
                                         effort=rev_effort,
                                         timeout_sec=review_timeout_sec,
+                                        key_file=agy_key_file,
                                     )
                                 elif cand_fam == "claude":
                                     review_result = run_claude_review(
@@ -3617,7 +3676,9 @@ def build_launchd_plist(
         str(st_dir),
     ]
     if key_file is not None:
-        prog_args.extend(["--key-file", str(key_file.expanduser().resolve())])
+        # Keep the path as given (absolute, not resolved): agy's exact-path deny rules for the
+        # key are derived from it, and resolve_key_file still resolves it for reading.
+        prog_args.extend(["--key-file", os.path.abspath(os.path.expanduser(str(key_file)))])
     for r in repo_dirs:
         prog_args.extend(["--repo-dir", str(r.expanduser().resolve())])
 
