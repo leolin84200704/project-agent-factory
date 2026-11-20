@@ -73,7 +73,7 @@
 1. **Gemini 4 Carbon**
    - 優勢是深層推理與假設驗證極強，能主動抓出並發競爭、權限繞過與資料一致性漏洞。
    - 劣勢是 `high` 模式首字延遲常超過兩分鐘且配額消耗大，拿來跑一般任務會拖慢整體回饋迴圈。
-   - 適用資料庫 schema 破壞性異動、金流與認證機制、跨服務疑難事故、以及 `critical` 等級 PR 把關。
+   - **暫時停用（Leo 指令 2026-11-19）**：路由表沒有任何等級會選到 Carbon，`critical` 等級的規劃與審查改用 Argon (High)。Gemini 這一側只用 Argon 或 Hydrogen；Carbon 留在型錄裡，只有明確指定 `--agy-model` 時才會用到。
 2. **Gemini 4 Argon**
    - 優勢是保留接近 Carbon 的多模組推理深度，同時把首字延遲降到三分之一左右。
    - 適用跨模組技術規劃、治理與核心工具鏈變更、以及 `complex` 等級 PR 雙模型審查。
@@ -111,7 +111,7 @@
 
 | 等級 (`tier`) | 觸發條件（任一成立即歸入該級，由高往低匹配） | 預估時間 | Router（前置分派） | Planner（規劃） | Executor（執行／修正） | Reviewer（異質檢測審查） |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`critical`** | DB migration / `ALTER` / `DROP`、`auth` / `security` / `crypto` / `billing` / `HMAC`、`PERMISSIONS.md`、`pre-tool-guard.py`、線上事故（`--incident`）、檔案數 `> 20`、變更行數 `> 1200`、點數 `>= 8`、或共識進入第 3 輪以上 | 10–25 分鐘 | `haiku (low)` / `hydrogen-low` | `fable (high)` / `carbon-high` | `opus (xhigh)` / `argon-high` | `opus (xhigh)`（或 `fable`） / `carbon-high` |
+| **`critical`** | DB migration / `ALTER` / `DROP`、`auth` / `security` / `crypto` / `billing` / `HMAC`、`PERMISSIONS.md`、`pre-tool-guard.py`、線上事故（`--incident`）、檔案數 `> 20`、變更行數 `> 1200`、點數 `>= 8`、或共識進入第 3 輪以上 | 10–25 分鐘 | `haiku (low)` / `hydrogen-low` | `fable (high)` / `argon-high` | `opus (xhigh)` / `argon-high` | `opus (xhigh)`（或 `fable`） / `argon-high` |
 | **`complex`** | 修改治理或核心引擎檔（`CORE.md`、`AGENTS.md`、`.agent-verify.json`、`bin/paf`、`paf_watcher.py`、hooks、workflows、skills）、跨倉或並發狀態機、檔案數 `9–20`、變更行數 `401–1200`、點數 `5–7`、或共識進入第 2 輪 | 5–12 分鐘 | `haiku (low)` / `hydrogen-low` | `opus (high)` / `argon-high` | `opus (high)` / `hydrogen-xhigh` | `opus (high)` / `argon-high` |
 | **`standard`** | 一般業務邏輯新增、單一服務 bug 修復、測試與腳本更新（未命中高風險路徑，檔案數 `<= 8` 且變更行數 `<= 400`） | 2–5 分鐘 | `haiku (low)` / `hydrogen-low` | `sonnet (high)` / `hydrogen-high` | `sonnet (high)` / `hydrogen-high` | `sonnet (high)` / `hydrogen-high` |
 | **`trivial`** | 純文件或說明檔（`.md` / `.txt` / `.rst` / `.adoc`）且檔案數 `<= 3`、變更行數 `<= 120`；或點數 `<= 1` 的純文案微調 | 0.5–2 分鐘 | `haiku (low)` / `hydrogen-low` | 與 Executor 合併（`sonnet-low` / `hydrogen-low`） | `sonnet (low)` / `hydrogen-medium` | `sonnet (medium)` / `hydrogen-high` |
@@ -131,7 +131,7 @@
    ```
 3. **`paf ship --consensus`、`paf drive-consensus` 與 `paf watch-prs` 自動執行**：
    - 未指定 `--claude-model` / `--agy-model`（或設為 `auto`）時，`paf_watcher.py` 每一輪都會呼叫 `model_router.select_pr_models()`，讀取 PR 標題、描述、變更檔案清單、實際 diff 行數與當前有效 `round`（跨呼叫與跨 commit 累計），自動為審查端與作者修正端選取模型與 `--effort`，並在 stderr 印出 `[paf model-router]` 稽核紀錄。若操作者顯式傳入 `--claude-model` 而未指定 `--claude-effort`，`haiku` 預設配對 `--effort low`，其餘模型名稱預設配對 `--effort high`。
-   - 若第 1 輪 `standard` 審查提出 `request_changes` 進入第 2 輪，路由器會自動把第 2 輪升階到 `complex`（`opus --effort high` / `gemini-4-argon-high`），第 3 輪升階到 `critical`（`opus --effort xhigh` / `gemini-4-carbon-high`），在同一條持久化 session 上集中火力收斂爭議。
+   - 若第 1 輪 `standard` 審查提出 `request_changes` 進入第 2 輪，路由器會自動把第 2 輪升階到 `complex`（`opus --effort high` / `gemini-4-argon-high`），第 3 輪升階到 `critical`（`opus --effort xhigh` / `gemini-4-argon-high`），在同一條持久化 session 上集中火力收斂爭議。
 4. **個別倉庫自訂上下限與安全不降級保護（`.agent-verify.json` 選填設定）**：
    倉庫可在 `.agent-verify.json`（或 `consensus.model_routing`）加入 `model_routing` 設定最低／最高等級、啟用 `fable` 最高階審查、或指定個別角色的 catalog key 覆寫（`overrides`）：
    ```json

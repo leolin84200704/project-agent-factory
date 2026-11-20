@@ -5,6 +5,7 @@
 ## Language & Writing Voice
 - Default to **Traditional Chinese (繁體中文)** when replying to Leo; use English only for technical or legal terms unless Leo explicitly asks for another language.
 - All code, comments, scripts, commit messages, and PR titles/bodies MUST be in **English** (zero CJK characters in code files; enforced by `validate-repo-language.sh` and `dune_lint.py`).
+- Code comments say only what the code cannot say for itself: how an external system behaves, a privacy or compliance rule, a concurrency or ordering reason, a unit or a format. No narration of what the code does, no change history, no ticket ids, PR numbers, dates or who asked. Those belong in the commit message and the PR description. New comments in an existing file follow this rule even when the older comments in that file do not.
 - Every local file or folder mentioned in a reply MUST be a clickable `file:///` Markdown link (`[basename](file:///absolute/path)` or `#L123`, URL-encoding spaces as `%20`). Leave half-width spaces around raw URLs.
 - **One-pass-readable prose** (applies to every reply and draft):
   - Inanimate subjects perform only literal actions (no metaphors or personification).
