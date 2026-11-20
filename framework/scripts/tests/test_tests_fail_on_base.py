@@ -86,11 +86,18 @@ class FailOnBaseTest(unittest.TestCase):
         wts = subprocess.run(["git", "-C", str(self.repo), "worktree", "list"], capture_output=True, text=True).stdout
         self.assertEqual(len(wts.strip().splitlines()), 1, wts)
 
-    def test_refactor_exempt_passes_when_behavior_preserved_and_fails_on_regression(self):
+    def test_refactor_requires_changed_test_file_and_fails_on_regression(self):
         (self.repo / "calc.py").write_text("def add(a, b):\n    out = a - b\n    return out\n")
+        sh(self.repo, "add", "calc.py")
+        sh(self.repo, "commit", "-qm", "refactor without touching tests")
+        # Refactor with zero added/modified test files must stay NO_TESTS (exit 3), never self-exempt.
+        proc_no_tests = self.run_cmd(f"{sys.executable} test_old.py", extra=["--change-type", "refactor"])
+        self.assertEqual(proc_no_tests.returncode, 3, proc_no_tests.stdout + proc_no_tests.stderr)
+        self.assertIn("NO_TESTS", proc_no_tests.stdout)
+
         (self.repo / "test_old.py").write_text("import calc\nassert calc.add(5, 2) == 3\n")
-        sh(self.repo, "add", "-A")
-        sh(self.repo, "commit", "-qm", "pure refactor")
+        sh(self.repo, "add", "test_old.py")
+        sh(self.repo, "commit", "-qm", "add equivalence test for refactor")
         proc = self.run_cmd(f"{sys.executable} test_old.py", extra=["--change-type", "refactor"])
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("EXEMPT", proc.stdout)
@@ -108,6 +115,31 @@ class FailOnBaseTest(unittest.TestCase):
         self.assertEqual(proc_auto.returncode, 0, proc_auto.stdout + proc_auto.stderr)
         self.assertIn("EXEMPT", proc_auto.stdout)
 
+        # Plain non-governance config file may use --change-type config.
+        (self.repo / "app.config.json").write_text('{"timeout": 5}\n')
+        proc_ok_cfg = self.run_cmd(None, extra=["--change-type", "config"])
+        self.assertEqual(proc_ok_cfg.returncode, 0, proc_ok_cfg.stdout + proc_ok_cfg.stderr)
+        self.assertIn("EXEMPT", proc_ok_cfg.stdout)
+        (self.repo / "app.config.json").unlink()
+
+        # Governance and permission files must NEVER self-exempt under config, docs, or auto.
+        for gov_rel, content, ctype in (
+            (".agent-verify.json", '{"zone":"autonomous"}\n', "config"),
+            (".github/workflows/ci.yml", "name: ci\n", "config"),
+            ("launchd/com.test.plist", "<plist/>\n", "config"),
+            ("CORE.md", "# Core rule edit\n", "docs"),
+        ):
+            p = self.repo / gov_rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+            proc_gov = self.run_cmd(None, extra=["--change-type", ctype])
+            self.assertEqual(proc_gov.returncode, 1, f"{gov_rel} should be refused under {ctype}: {proc_gov.stdout}")
+            self.assertIn("REFUSED", proc_gov.stdout)
+            if ctype == "docs":
+                proc_auto_gov = self.run_cmd(f"{sys.executable} test_old.py", extra=["--change-type", "auto"])
+                self.assertEqual(proc_auto_gov.returncode, 3, proc_auto_gov.stdout)
+            p.unlink()
+
         # Adding a code file makes --change-type docs and config fail closed.
         (self.repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
         proc_docs = self.run_cmd(None, extra=["--change-type", "docs"])
@@ -122,7 +154,27 @@ class FailOnBaseTest(unittest.TestCase):
         dep = self.repo / "node_modules" / "helper"
         dep.mkdir(parents=True)
         (dep / "mod.py").write_text("EXPECTED = 5\n")
-        (self.repo / ".gitignore").write_text("node_modules/\n")
+        (self.repo / ".gitignore").write_text("node_modules/\nvenv/\n")
+
+        # Distinguishing pair: a behavior-preserving test importing the untracked dep MUST pass on base
+        # (NOT_PROVEN) when linked, and fail on base (ImportError -> PROVEN) when --no-link-deps is set.
+        (self.repo / "test_dep.py").write_text(
+            "import sys\n"
+            "sys.path.insert(0, 'node_modules/helper')\n"
+            "import mod\n"
+            "assert mod.EXPECTED == 5\n"
+        )
+        proc_linked = self.run_cmd(f"{sys.executable} test_dep.py")
+        self.assertEqual(proc_linked.returncode, 1, proc_linked.stdout + proc_linked.stderr)
+        self.assertIn("NOT_PROVEN", proc_linked.stdout)
+        self.assertIn("linked_deps: node_modules", proc_linked.stdout)
+
+        proc_unlinked = self.run_cmd(f"{sys.executable} test_dep.py", extra=["--no-link-deps"])
+        self.assertEqual(proc_unlinked.returncode, 0, proc_unlinked.stdout + proc_unlinked.stderr)
+        self.assertIn("PROVEN", proc_unlinked.stdout)
+        (self.repo / "test_dep.py").unlink()
+
+        # Real bugfix test using the linked dependency succeeds cleanly and keeps original dep intact.
         self.commit_fix(
             "import sys, calc\n"
             "sys.path.insert(0, 'node_modules/helper')\n"
@@ -134,9 +186,17 @@ class FailOnBaseTest(unittest.TestCase):
         self.assertIn("linked_deps: node_modules", proc.stdout)
         self.assertTrue((dep / "mod.py").is_file())
 
-        # Path traversal in --link-dir is rejected.
+        # Path traversal in --link-dir and symlinks escaping the repo are both rejected.
         proc_bad = self.run_cmd(f"{sys.executable} test_add.py", extra=["--link-dir", "../outside"])
         self.assertEqual(proc_bad.returncode, 2, proc_bad.stdout + proc_bad.stderr)
+
+        outside = Path(self.tmp.name) / "outside_venv"
+        outside.mkdir()
+        (self.repo / "venv").symlink_to(outside, target_is_directory=True)
+        proc_escape = self.run_cmd(f"{sys.executable} test_add.py")
+        self.assertEqual(proc_escape.returncode, 2, proc_escape.stdout + proc_escape.stderr)
+        self.assertIn("escapes the repo", proc_escape.stdout)
+        (self.repo / "venv").unlink()
 
 
 if __name__ == "__main__":

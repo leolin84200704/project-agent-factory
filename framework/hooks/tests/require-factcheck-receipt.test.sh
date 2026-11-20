@@ -82,10 +82,24 @@ signed_receipt d-forged C10 true gemini bad
 PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'bad signature refused' "$SLACK" '{"channel_id":"C10","message":"x"}'
 signed_receipt d-std-db "db:orders" true gemini "" standard
 PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'db-write refuses standard-tier receipt' mcp__vibrant__mysql_query '{"query":"UPDATE orders SET status=1 WHERE id=2"}'
+if grep -q '"decision":"blocked".*"tier":"standard".*"required_tier":"high"' "$PAF_FACTCHECK_DIR/hook-log.jsonl"; then echo "[ok  ] log records rejected tier and required_tier"; else echo "[FAIL] log lacks rejected tier"; fails=$((fails+1)); fi
+# Tampering with tier on an otherwise validly signed dual receipt invalidates HMAC.
+python3 - "$PAF_FACTCHECK_DIR/d-std-db.json" "$PAF_FACTCHECK_DIR/d-tampered-tier.json" <<'PY'
+import json, sys
+r = json.loads(open(sys.argv[1]).read())
+r["target"] = "db:tampered_tbl"
+r["tier"] = "high"
+open(sys.argv[2], "w").write(json.dumps(r))
+PY
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'tampered tier breaks HMAC' mcp__vibrant__mysql_query '{"query":"UPDATE tampered_tbl SET status=1 WHERE id=2"}'
 signed_receipt d-high-db "db:orders" true gemini "" high
 PAF_FACTCHECK_REQUIRE_DUAL=1 run 0 'db-write accepts high-tier receipt' mcp__vibrant__mysql_query '{"query":"UPDATE orders SET status=1 WHERE id=2"}'
+# Setting min-tier explicitly requires dual-signed receipt of that tier even when REQUIRE_DUAL=0.
+PAF_FACTCHECK_REQUIRE_DUAL=0 PAF_FACTCHECK_MIN_TIER_DB=high run 0 'explicit min-tier accepts high-tier receipt' mcp__vibrant__mysql_query '{"query":"UPDATE orders SET status=1 WHERE id=2"}'
 signed_receipt d-spoof-tier "db:billing_accounts" false gemini "" high
-PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'unverified high-tier claim refused' mcp__vibrant__mysql_query '{"query":"UPDATE billing_accounts SET status=1 WHERE id=2"}'
+PAF_FACTCHECK_REQUIRE_DUAL=0 PAF_FACTCHECK_MIN_TIER_DB=high run 2 'explicit min-tier refuses unsigned/single high-tier receipt' mcp__vibrant__mysql_query '{"query":"UPDATE billing_accounts SET status=1 WHERE id=2"}'
+# Invalid min-tier typo fails closed instead of degrading to rank 0.
+PAF_FACTCHECK_REQUIRE_DUAL=0 PAF_FACTCHECK_MIN_TIER_DB=hgh run 2 'invalid min-tier typo fails closed' mcp__vibrant__mysql_query '{"query":"UPDATE orders SET status=1 WHERE id=2"}'
 if grep -q '"verification":"dual"' "$PAF_FACTCHECK_DIR/hook-log.jsonl"; then echo "[ok  ] log records dual"; else echo "[FAIL] log lacks dual"; fails=$((fails+1)); fi
 if grep -q '"tier":"high"' "$PAF_FACTCHECK_DIR/hook-log.jsonl"; then echo "[ok  ] log records tier"; else echo "[FAIL] log lacks tier"; fails=$((fails+1)); fi
 

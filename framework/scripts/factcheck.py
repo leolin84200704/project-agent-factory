@@ -93,7 +93,6 @@ DB_TARGET_PREFIXES = ("db:", "sql:", "mysql:", "psql:", "ddl:", "table:")
 HIGH_RISK_CATEGORIES = frozenset({"D", "F"})
 DEFAULT_TIMEOUT = 120
 OUTPUT_EXCERPT = 400
-DEFAULT_VERIFIER_MODEL = {"gemini": "gemini-4-argon-high", "claude": "opus"}
 WATCHER_PATH = Path(__file__).resolve().parent / "paf_watcher.py"
 ROUTER_PATH = Path(__file__).resolve().parent / "model_router.py"
 
@@ -806,6 +805,7 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
                 entry["source_match"] = False
                 entry["result_match"] = False
                 entry["hash_match"] = False
+                entry["blind_contradicted"] = False
                 continue
             entry["blind"] = {"source": b.get("source", ""), "command": b.get("command", ""), "expect": b.get("expect", "data")}
             refused = readonly_problem(b.get("command", ""), registry)
@@ -814,6 +814,7 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
                 entry["source_match"] = False
                 entry["result_match"] = False
                 entry["hash_match"] = False
+                entry["blind_contradicted"] = False
                 continue
             run = run_command(b["command"], timeout, cwd, shell=False)
             entry["blind"]["run"] = strip_private(run)
@@ -821,9 +822,12 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
             entry["source_match"] = sources_match(r["source"], b.get("source", ""), cwd)
             blind_expects_empty = b.get("expect") == "empty"
             author_negative = r["kind"] == "negative"
+            blind_ran_cleanly = run["exit_code"] == 0 or (
+                blind_expects_empty and _negative_no_match("negative", run)
+            )
             if author_negative and blind_expects_empty:
                 entry["result_match"] = (
-                    (run["exit_code"] == 0 or _negative_no_match("negative", run))
+                    blind_ran_cleanly
                     and not run["output_lines"]
                     and not author_run["output_lines"]
                 )
@@ -836,6 +840,9 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
                 # Verifier read the claim with opposite presence/absence polarity.
                 entry["result_match"] = False
                 entry["hash_match"] = False
+            # A blind probe that exited cleanly without runtime errors yet contradicted the author's
+            # polarity gates approval; a probe that errored (e.g. guessed column name) defers to audit.
+            entry["blind_contradicted"] = bool(blind_ran_cleanly and not entry["result_match"])
 
     # Audit always runs for both tiers so unfiltered queries and shared blind spots cannot bypass counterexamples.
     items = []
@@ -897,12 +904,14 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
                 if run["has_data"]:
                     disproved = True
             e["counterexamples"].append(ce_item)
+        blind_contradicted = bool(run_blind and e.get("blind_contradicted"))
         ok = (
             a.get("verdict") == "approve"
             and a.get("source_is_ground_truth") is True
             and a.get("command_proves_statement") is True
             and a.get("result_matches_statement") is True
             and not disproved
+            and not blind_contradicted
         )
         e["verdict"] = "pass" if ok else "fail"
         e["by"] = "blind+audit" if run_blind else "audit"
@@ -916,6 +925,8 @@ def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], r
                 reasons.append("verifier: result does not match the statement")
             if disproved:
                 reasons.append("a counterexample command returned data")
+            if blind_contradicted:
+                reasons.append("independent blind probe contradicted the author's result")
             if a.get("verdict") != "approve" and not reasons:
                 reasons.append("verifier rejected the claim")
             e["reason"] = "; ".join(reasons)
@@ -998,18 +1009,21 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
             global_problems.append("verifier must come from a different model family than the author")
         else:
             phi_mode = registry.get("phi", True) if (phi is None and registry) else (True if phi is None else phi)
-            routed_model, routed_effort, router_tier = select_verifier_model(
-                fam, eff_tier, is_db_write=_is_db_target(target)
-            )
-            eff_model = verifier_model or routed_model
-            eff_effort = verifier_effort if verifier_effort is not None else (None if verifier_model else routed_effort)
+            eff_model = verifier_model or ""
+            eff_effort = verifier_effort
+            router_tier = ""
             try:
+                routed_model, routed_effort, router_tier = select_verifier_model(
+                    fam, eff_tier, is_db_write=_is_db_target(target)
+                )
+                eff_model = verifier_model or routed_model
+                eff_effort = verifier_effort if verifier_effort is not None else (None if verifier_model else routed_effort)
                 verification = verify_claims(
                     results, claims, registry, fam, eff_model, eff_effort,
                     bool(phi_mode), timeout, cwd, verifier_cmd, tier=eff_tier, router_tier=router_tier,
                 )
                 verification["author_family"] = author_family
-            except Exception as exc:  # verifier outage or malformed output: fail closed
+            except Exception as exc:  # verifier or router outage or malformed output: fail closed
                 verification = {
                     "family": fam,
                     "model": eff_model,

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import re
 import shutil
 import subprocess
 import sys
@@ -39,6 +40,18 @@ CHANGE_TYPES = ("auto", "bugfix", "feature", "refactor", "docs", "config")
 DOC_EXTS = frozenset({".md", ".txt", ".rst", ".adoc"})
 CONFIG_EXTS = frozenset({".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".plist", ".example"})
 CONFIG_NAMES = frozenset({".gitignore", ".editorconfig", ".env.example", ".npmrc", ".nvmrc"})
+# Governance and permission-granting files can never self-exempt via --change-type docs or config.
+GOVERNANCE_PATH_RE = re.compile(
+    r"(^|/)(CORE\.md|AGENTS\.md|CLAUDE\.md|GEMINI\.md|WORK-LOOP\.md|PERMISSIONS\.md|FEEDBACK\.md|"
+    r"\.agent-verify\.json|run-regression\.py|dune_lint\.py|paf_watcher\.py|model_router\.py|pre-tool-guard\.py)$|"
+    r"^bin/paf$|"
+    r"(^|/)(\.claude/settings[^/]*\.json|\.gemini/settings[^/]*\.json|\.gemini/config/|"
+    r"framework/templates/settings[^/]*\.json|"
+    r"\.github/workflows/[^/]+\.ya?ml|"
+    r"hooks/|githooks/|framework/githooks/|framework/hooks/|"
+    r"DailyJob/|launchd/|skills/)",
+    re.IGNORECASE,
+)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -66,17 +79,24 @@ def changed_test_files(repo: Path, base: str, globs: tuple[str, ...]) -> list[st
     return out
 
 
+def _is_governance_file(rel: str) -> bool:
+    clean = re.sub(r"^(?:\./)+", "", str(rel or "").strip())
+    return bool(clean and GOVERNANCE_PATH_RE.search(clean))
+
+
 def _is_doc_file(rel: str) -> bool:
-    return Path(rel).suffix.lower() in DOC_EXTS
+    return not _is_governance_file(rel) and Path(rel).suffix.lower() in DOC_EXTS
 
 
 def _is_config_or_doc_file(rel: str) -> bool:
+    if _is_governance_file(rel):
+        return False
     p = Path(rel)
-    return _is_doc_file(rel) or p.suffix.lower() in CONFIG_EXTS or p.name in CONFIG_NAMES
+    return Path(rel).suffix.lower() in DOC_EXTS or p.suffix.lower() in CONFIG_EXTS or p.name in CONFIG_NAMES
 
 
 def _link_dependency_dirs(repo: Path, wt: Path, rel_dirs: list[str]) -> list[tuple[Path, str]]:
-    """Symlink untracked dependency dirs from `repo` into `wt` without crossing outside `repo`."""
+    """Symlink untracked dependency dirs from `repo` into `wt` without escaping `repo`."""
     created: list[tuple[Path, str]] = []
     repo_root = repo.resolve()
     wt_root = wt.resolve()
@@ -87,11 +107,14 @@ def _link_dependency_dirs(repo: Path, wt: Path, rel_dirs: list[str]) -> list[tup
         src = repo_root / rel_p
         if not src.exists():
             continue
+        resolved_src = src.resolve()
+        if not resolved_src.is_relative_to(repo_root):
+            raise ValueError(f"dependency dir symlink target escapes the repo: {rel!r} -> {resolved_src}")
         dst = wt_root / rel_p
         if dst.exists() or dst.is_symlink():
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.symlink_to(src.resolve(), target_is_directory=src.is_dir())
+        dst.symlink_to(resolved_src, target_is_directory=resolved_src.is_dir())
         created.append((dst, rel_p.as_posix()))
     return created
 
@@ -158,12 +181,14 @@ def main(argv: list[str] | None = None) -> int:
         print("tests-fail-on-base ERROR: --test-cmd is required for code changes")
         return 2
 
-    if args.change_type != "refactor" and not tests:
+    if not tests:
         print("tests-fail-on-base NO_TESTS: the branch adds or modifies no test files")
         return 3
 
     dep_dirs = ([] if args.no_link_deps else list(DEFAULT_DEP_DIRS)) + list(args.link_dir or [])
 
+    base_code = 2
+    base_tail = ""
     with tempfile.TemporaryDirectory(prefix="paf-fail-on-base-") as tmp:
         wt = Path(tmp) / "base"
         try:
@@ -180,8 +205,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             for t in tests:
                 dest = wt / t
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(repo / t, dest)
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(repo / t, dest)
+                except OSError as exc:
+                    print(f"tests-fail-on-base ERROR: cannot copy test file {t!r}: {exc}")
+                    return 2
             base_code, base_tail = run_tests(args.test_cmd, wt, args.timeout)
         finally:
             for link, _ in reversed(linked):

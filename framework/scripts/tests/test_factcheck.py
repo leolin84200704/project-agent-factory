@@ -575,6 +575,44 @@ class DualModelTest(Base):
         code, r = self.check([c()], verify=True, tier="high")
         self.assertEqual(code, 1)
 
+    def test_clean_blind_contradiction_blocks_even_when_audit_approves(self):
+        # Author's positive claim returned data, while a clean blind probe returned empty -> must fail closed
+        # even if the auditor returns approve.
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat empty.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit()]},
+        )
+        code, r = self.check([c(command="cat one.txt")], verify=True, tier="high")
+        self.assertEqual(code, 1)
+        self.assertTrue(r["verification"]["claims"]["c1"]["blind_contradicted"])
+        self.assertTrue(any("blind probe contradicted" in p for p in self.problems(r, "c1")))
+
+    def test_blind_runtime_error_defers_to_audit_when_approved(self):
+        # Blind command errored (missing file, exit != 0): not a clean contradiction, so audit decides.
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat missing.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit()]},
+        )
+        code, r = self.check([c(command="cat one.txt")], verify=True, tier="high")
+        self.assertEqual(code, 0, r)
+        self.assertFalse(r["verification"]["claims"]["c1"]["blind_contradicted"])
+
+    def test_router_error_fails_closed_with_receipt_and_no_hardcoded_default_dict(self):
+        self.assertFalse(hasattr(fc, "DEFAULT_VERIFIER_MODEL"))
+        orig = fc.select_verifier_model
+        def boom(*_a, **_kw):
+            raise RuntimeError("simulated router import failure")
+        fc.select_verifier_model = boom
+        try:
+            code, r = self.check([c()], verify=True, tier="standard")
+        finally:
+            fc.select_verifier_model = orig
+        self.assertEqual(code, 1)
+        self.assertEqual(r["status"], "fail")
+        self.assertEqual(r["verification"]["status"], "error")
+        self.assertIn("simulated router import failure", r["verification"]["error"])
+        self.assertTrue(Path(r["receipt_path"]).is_file())
+
 
 class ClaudeVerifierConfinementTest(Base):
     def test_claude_verifier_is_confined_to_an_empty_directory(self):

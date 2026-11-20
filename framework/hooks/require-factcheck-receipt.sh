@@ -96,13 +96,17 @@ REQ_TIER="$MIN_TIER_OUTBOUND"
 [ "$KIND" = "db-write" ] && REQ_TIER="$MIN_TIER_DB"
 
 MATCH=$(DIR="$DIR" MAX_AGE="$MAX_AGE" TI="$TI" REQUIRE_DUAL="$REQUIRE_DUAL" REQ_TIER="$REQ_TIER" python3 - <<'PY'
-import hashlib, hmac, json, os, time
+import hashlib, hmac, json, os, sys, time
 from pathlib import Path
 d = Path(os.environ["DIR"]); max_age = float(os.environ["MAX_AGE"]) * 60
 ti = os.environ["TI"]; require_dual = os.environ["REQUIRE_DUAL"] == "1"
 tier_rank = {"low": 0, "standard": 1, "high": 2}
 req_tier = os.environ.get("REQ_TIER", "low").strip().lower()
-req_rank = tier_rank.get(req_tier, 0)
+if req_tier not in tier_rank:
+    sys.stderr.write(f"require-factcheck-receipt: invalid minimum tier {req_tier!r} (expected low|standard|high); failing closed.\n")
+    print("|||invalid_min_tier")
+    sys.exit(0)
+req_rank = tier_rank[req_tier]
 key_file = Path(os.environ.get("PAF_CONSENSUS_KEY_FILE") or Path.home() / ".config/paf/consensus.key")
 try:
     secret = key_file.read_text().strip()
@@ -124,7 +128,6 @@ def dual_ok(r):
 def effective_tier(r, dual):
     raw = str(r.get("tier") or "").strip().lower()
     if raw in tier_rank:
-        # Unverified or unsigned receipts never satisfy standard/high tiers.
         return raw if (raw == "low" or dual) else "low"
     if not dual:
         return "low"
@@ -132,6 +135,7 @@ def effective_tier(r, dual):
     return "high" if any(c.get("step") == "blind" for c in calls if isinstance(c, dict)) else "standard"
 
 now = time.time()
+rejected_tier = ""
 for p in sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
     if now - p.stat().st_mtime > max_age:
         break
@@ -148,24 +152,36 @@ for p in sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
     dual = dual_ok(r)
     tier = effective_tier(r, dual)
     if (require_dual or req_rank > 0) and not dual:
+        if not rejected_tier:
+            rejected_tier = tier
         continue
     if tier_rank.get(tier, 0) < req_rank:
+        if not rejected_tier:
+            rejected_tier = tier
         continue
-    print(f"{p.name}|{'dual' if dual else 'single'}|{tier}"); break
+    print(f"{p.name}|{'dual' if dual else 'single'}|{tier}|")
+    sys.exit(0)
+if rejected_tier:
+    print(f"||{rejected_tier}|")
 PY
 )
-IFS='|' read -r MATCH DUAL TIER <<< "$MATCH"
+IFS='|' read -r MATCH DUAL TIER ERR_CODE <<< "$MATCH"
 
 log() {  # log <decision>
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg s "$SESSION" --arg t "$TOOL" \
-     --arg k "$KIND" --arg m "$MODE" --arg d "$1" --arg r "$MATCH" --arg v "$DUAL" --arg tr "$TIER" \
-     '{ts:$ts, session:$s, tool:$t, kind:$k, mode:$m, decision:$d, receipt:$r, verification:$v, tier:$tr}' \
+     --arg k "$KIND" --arg m "$MODE" --arg d "$1" --arg r "$MATCH" --arg v "$DUAL" --arg tr "$TIER" --arg rq "$REQ_TIER" \
+     '{ts:$ts, session:$s, tool:$t, kind:$k, mode:$m, decision:$d, receipt:$r, verification:$v, tier:$tr, required_tier:$rq}' \
      >> "$DIR/hook-log.jsonl" 2>/dev/null
 }
 
 if [ -n "$MATCH" ]; then
   log "pass"
   exit 0
+fi
+
+if [ "$ERR_CODE" = "invalid_min_tier" ]; then
+  log "blocked"
+  exit 2
 fi
 
 if [ "$MODE" = "warn" ]; then

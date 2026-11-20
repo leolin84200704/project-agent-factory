@@ -1855,6 +1855,20 @@ print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output":
         },
         "sid-14",
     )
+    r_drift = paf_watcher._normalize_structured_review(
+        {
+            "verdict": "approve",
+            "blocking_count": 0,
+            "needs_human_decision": False,
+            "test_source_is_ground_truth": True,
+            "tests_prove_change": True,
+            "test_counterexamples": json.dumps([
+                {"test_or_claim": "test_drift", "counterexample": "string blocking flag", "blocking": "true"}
+            ]),
+            "prose": "drift check",
+        },
+        "sid-14",
+    )
     fmt_ce = paf_watcher._format_review_comment_prose(r_ce)
     ce_secret_hit = paf_watcher._review_contains_secret(
         {
@@ -1872,11 +1886,14 @@ print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output":
         or r_ce["verdict"] != "request_changes"
         or r_ce["blocking_count"] < 1
         or r_note["verdict"] != "approve"
+        or r_drift["verdict"] != "request_changes"
+        or r_drift["blocking_count"] < 1
+        or r_drift["test_counterexamples"][0]["blocking"] is not True
         or "### Verification Audit" not in fmt_ce
         or "middle_name=None crashes" not in fmt_ce
         or not ce_secret_hit
     ):
-        print(f"FAIL 14 structured verification gate: s14_ok={s14_ok} r_mock={r_mock} r_ce={r_ce} r_note={r_note} secret={ce_secret_hit}")
+        print(f"FAIL 14 structured verification gate: s14_ok={s14_ok} r_mock={r_mock} r_ce={r_ce} r_note={r_note} r_drift={r_drift} secret={ce_secret_hit}")
         failures += 1
     else:
         print("PASS 14 structured PR review gate enforces ground-truth source, test proof, blocking counterexamples, and secret scanning")

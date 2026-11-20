@@ -86,7 +86,7 @@ STM 和 handoff 的 Verified facts 只放已驗證的內容，推論另列一欄
 驗證模型做盲測時也靠這張表知道該去哪裡查。格式見 `framework/scripts/factcheck.py` 的 docstring。
 
 ### 程式碼修改（同樣套用三要素）
-- 查法就是測試。`paf tests-fail-on-base --test-cmd "<cmd>"` 會把新增或修改的測試複製到 base commit 的臨時 worktree，並自動掛載本機未追蹤的依賴目錄（`.venv`、`venv`、`node_modules` 或 `--link-dir`），證明在 base 上失敗、在 head 上通過。依改動類型支援 `--change-type auto|bugfix|feature|refactor|docs|config`：純重構要求 base 與 head 兩邊皆通過（行為不變）；純文件或純設定只有在 diff 完全沒有程式碼檔案時才豁免。
+- 查法就是測試。`paf tests-fail-on-base --test-cmd "<cmd>"` 會把新增或修改的測試複製到 base commit 的臨時 worktree，並自動掛載本機未追蹤且位於 repo 內的依賴目錄（`.venv`、`venv`、`node_modules` 或 `--link-dir`，拒絕跳出 repo 的路徑或外部 symlink），證明在 base 上失敗、在 head 上通過。依改動類型支援 `--change-type auto|bugfix|feature|refactor|docs|config`：純重構仍須包含改動或新增的測試檔，並證明 base 與 head 兩邊皆通過（行為不變）；純文件或純設定只有在 diff 完全沒有程式碼與治理／權限檔（`.agent-verify.json`、`.github/workflows/*`、`launchd/*`、`CORE.md` 等）時才豁免。
 - `paf drive-consensus` 與 `paf watch-prs` 的審查 JSON schema（`REVIEW_JSON_SCHEMA`）強制三個必填欄位：`test_source_is_ground_truth`（測試打到真實程式碼或環境邊界，沒有把核心邏輯 mock 掉，環境相關改動具備 staging 或實測證據）、`tests_prove_change`（測試能證明宣稱的效果）、`test_counterexamples`（每個新／改測試的具體反例，任一項 `blocking: true` 或前兩欄任一為 `false` 時，程式機械強制翻成 `request_changes`）。
 
 ## 機制
@@ -126,8 +126,8 @@ claims 檔列出這段文字或這次寫入依賴的每一個事實。腳本自�
 對外送出的工具和 DB 寫入，要找到一張通過、120 分鐘內、`target` 字串出現在這次工具呼叫裡的收據。
 - `PAF_FACTCHECK_MODE=warn`（預設）：沒有收據時暫停一次，同一個呼叫重跑就放行，記為 override。
 - `PAF_FACTCHECK_MODE=block`：沒有收據就擋下。
-- `PAF_FACTCHECK_REQUIRE_DUAL=1`：只接受雙模型驗證通過、驗證模型和作者不同家族、HMAC 正確的收據，而且預設對外文字要求至少 `standard` 級、DB 寫入要求 `high` 級（可用 `PAF_FACTCHECK_MIN_TIER_OUTBOUND` 與 `PAF_FACTCHECK_MIN_TIER_DB` 覆寫）。
-- 每一次判定都寫進 `~/.cache/paf/factcheck/hook-log.jsonl`，包括這張收據是 dual 還是 single 以及對應的 `tier`。
+- `PAF_FACTCHECK_REQUIRE_DUAL=1`：只接受雙模型驗證通過、驗證模型和作者不同家族、HMAC 正確的收據，而且預設對外文字要求至少 `standard` 級、DB 寫入要求 `high` 級。也可單獨設定 `PAF_FACTCHECK_MIN_TIER_OUTBOUND` 或 `PAF_FACTCHECK_MIN_TIER_DB`（設成 `standard` 或 `high` 時同樣要求簽章過的雙模型收據；無效的值一律 fail-closed 擋下）。
+- 每一次判定都寫進 `~/.cache/paf/factcheck/hook-log.jsonl`，包括這張收據是 dual 還是 single、對應的 `tier`（若收據因等級不足被拒也會記下該收據的 `tier`）以及 `required_tier`。
 
 ### 升級條件（照 ENFORCEMENT-LADDER）
 warn 模式先跑兩週。之後看 hook-log：pass、paused、override 各幾次，override 裡有幾次事後證明真的沒有需要查的事實。

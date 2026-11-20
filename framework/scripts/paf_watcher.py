@@ -680,6 +680,20 @@ def _parse_last_json_dict(stdout: str) -> dict[str, Any]:
     raise RuntimeError(f"Model CLI output did not contain a valid JSON envelope: {stripped[:300]}")
 
 
+def _coerce_bool_field(val: Any, field_name: str) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and val in (0, 1):
+        return bool(val)
+    if isinstance(val, str):
+        low = val.strip().lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no"):
+            return False
+    raise RuntimeError(f"Structured review output missing boolean {field_name!r}")
+
+
 def _normalize_structured_review(raw: Any, session_id: str) -> dict[str, Any]:
     if isinstance(raw, str):
         raw = json.loads(raw)
@@ -688,11 +702,14 @@ def _normalize_structured_review(raw: Any, session_id: str) -> dict[str, Any]:
     verdict = str(raw.get("verdict") or "").strip().lower()
     if verdict not in ("approve", "request_changes"):
         raise RuntimeError(f"Invalid review verdict {verdict!r}")
-    if not isinstance(raw.get("test_source_is_ground_truth"), bool):
-        raise RuntimeError("Structured review output missing boolean 'test_source_is_ground_truth'")
-    if not isinstance(raw.get("tests_prove_change"), bool):
-        raise RuntimeError("Structured review output missing boolean 'tests_prove_change'")
+    test_source_ok = _coerce_bool_field(raw.get("test_source_is_ground_truth"), "test_source_is_ground_truth")
+    tests_prove_ok = _coerce_bool_field(raw.get("tests_prove_change"), "tests_prove_change")
     raw_ces = raw.get("test_counterexamples")
+    if isinstance(raw_ces, str):
+        try:
+            raw_ces = json.loads(raw_ces)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Structured review output has unparsable 'test_counterexamples': {exc}") from exc
     if not isinstance(raw_ces, list):
         raise RuntimeError("Structured review output missing list 'test_counterexamples'")
     counterexamples: list[dict[str, Any]] = []
@@ -701,16 +718,15 @@ def _normalize_structured_review(raw: Any, session_id: str) -> dict[str, Any]:
             raise RuntimeError(f"test_counterexamples[{idx}] must be an object")
         target = str(item.get("test_or_claim") or "").strip()
         ce_text = str(item.get("counterexample") or "").strip()
-        if not target or not ce_text or not isinstance(item.get("blocking"), bool):
-            raise RuntimeError(f"test_counterexamples[{idx}] requires test_or_claim, counterexample, and boolean blocking")
+        if not target or not ce_text:
+            raise RuntimeError(f"test_counterexamples[{idx}] requires non-empty test_or_claim and counterexample")
+        blocking_flag = _coerce_bool_field(item.get("blocking"), f"test_counterexamples[{idx}].blocking")
         counterexamples.append({
             "test_or_claim": target,
             "counterexample": ce_text,
-            "blocking": item["blocking"],
+            "blocking": blocking_flag,
         })
 
-    test_source_ok = raw["test_source_is_ground_truth"]
-    tests_prove_ok = raw["tests_prove_change"]
     blocking_ces = [c for c in counterexamples if c["blocking"]]
     blocking_count = int(raw.get("blocking_count") or 0)
     needs_human = bool(raw.get("needs_human_decision", False))
