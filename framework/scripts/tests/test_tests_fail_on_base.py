@@ -35,10 +35,14 @@ class FailOnBaseTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def run_cmd(self, test_cmd: str, via_paf: bool = False) -> subprocess.CompletedProcess:
+    def run_cmd(self, test_cmd: str | None = None, via_paf: bool = False, extra: list[str] | None = None) -> subprocess.CompletedProcess:
         argv = [sys.executable, str(PAF), "tests-fail-on-base"] if via_paf else [sys.executable, str(SCRIPT)]
-        return subprocess.run(argv + ["--repo", str(self.repo), "--base", "main", "--test-cmd", test_cmd],
-                              capture_output=True, text=True)
+        args = ["--repo", str(self.repo), "--base", "main"]
+        if test_cmd is not None:
+            args += ["--test-cmd", test_cmd]
+        if extra:
+            args += extra
+        return subprocess.run(argv + args, capture_output=True, text=True)
 
     def commit_fix(self, test_body: str) -> None:
         (self.repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
@@ -81,6 +85,58 @@ class FailOnBaseTest(unittest.TestCase):
         self.run_cmd(f"{sys.executable} test_add.py")
         wts = subprocess.run(["git", "-C", str(self.repo), "worktree", "list"], capture_output=True, text=True).stdout
         self.assertEqual(len(wts.strip().splitlines()), 1, wts)
+
+    def test_refactor_exempt_passes_when_behavior_preserved_and_fails_on_regression(self):
+        (self.repo / "calc.py").write_text("def add(a, b):\n    out = a - b\n    return out\n")
+        (self.repo / "test_old.py").write_text("import calc\nassert calc.add(5, 2) == 3\n")
+        sh(self.repo, "add", "-A")
+        sh(self.repo, "commit", "-qm", "pure refactor")
+        proc = self.run_cmd(f"{sys.executable} test_old.py", extra=["--change-type", "refactor"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("EXEMPT", proc.stdout)
+
+        # If the refactor broke behavior on head, it must still fail.
+        (self.repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+        proc_bad = self.run_cmd(f"{sys.executable} test_old.py", extra=["--change-type", "refactor"])
+        self.assertEqual(proc_bad.returncode, 1, proc_bad.stdout + proc_bad.stderr)
+
+    def test_docs_and_config_exemptions_and_anti_gaming_refusal(self):
+        (self.repo / "README.md").write_text("# Docs\n")
+        sh(self.repo, "add", "README.md")
+        sh(self.repo, "commit", "-qm", "docs only")
+        proc_auto = self.run_cmd(None, extra=["--change-type", "auto"])
+        self.assertEqual(proc_auto.returncode, 0, proc_auto.stdout + proc_auto.stderr)
+        self.assertIn("EXEMPT", proc_auto.stdout)
+
+        # Adding a code file makes --change-type docs and config fail closed.
+        (self.repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+        proc_docs = self.run_cmd(None, extra=["--change-type", "docs"])
+        self.assertEqual(proc_docs.returncode, 1, proc_docs.stdout)
+        self.assertIn("REFUSED", proc_docs.stdout)
+        proc_cfg = self.run_cmd(None, extra=["--change-type", "config"])
+        self.assertEqual(proc_cfg.returncode, 1, proc_cfg.stdout)
+        self.assertIn("REFUSED", proc_cfg.stdout)
+
+    def test_untracked_dependency_dir_is_symlinked_into_base_worktree(self):
+        # Untracked local dependency dir (mirrors .venv / node_modules) needed by the test runner.
+        dep = self.repo / "node_modules" / "helper"
+        dep.mkdir(parents=True)
+        (dep / "mod.py").write_text("EXPECTED = 5\n")
+        (self.repo / ".gitignore").write_text("node_modules/\n")
+        self.commit_fix(
+            "import sys, calc\n"
+            "sys.path.insert(0, 'node_modules/helper')\n"
+            "import mod\n"
+            "assert calc.add(2, 3) == mod.EXPECTED\n"
+        )
+        proc = self.run_cmd(f"{sys.executable} test_add.py")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("linked_deps: node_modules", proc.stdout)
+        self.assertTrue((dep / "mod.py").is_file())
+
+        # Path traversal in --link-dir is rejected.
+        proc_bad = self.run_cmd(f"{sys.executable} test_add.py", extra=["--link-dir", "../outside"])
+        self.assertEqual(proc_bad.returncode, 2, proc_bad.stdout + proc_bad.stderr)
 
 
 if __name__ == "__main__":

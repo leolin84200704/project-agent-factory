@@ -84,11 +84,25 @@ MAX_AGE="${PAF_FACTCHECK_MAX_AGE_MIN:-120}"
 mkdir -p "$DIR" 2>/dev/null
 
 REQUIRE_DUAL="${PAF_FACTCHECK_REQUIRE_DUAL:-0}"
-MATCH=$(DIR="$DIR" MAX_AGE="$MAX_AGE" TI="$TI" REQUIRE_DUAL="$REQUIRE_DUAL" python3 - <<'PY'
+DEFAULT_MIN_OUTBOUND="low"
+DEFAULT_MIN_DB="low"
+if [ "$REQUIRE_DUAL" = "1" ]; then
+  DEFAULT_MIN_OUTBOUND="standard"
+  DEFAULT_MIN_DB="high"
+fi
+MIN_TIER_OUTBOUND="${PAF_FACTCHECK_MIN_TIER_OUTBOUND:-$DEFAULT_MIN_OUTBOUND}"
+MIN_TIER_DB="${PAF_FACTCHECK_MIN_TIER_DB:-$DEFAULT_MIN_DB}"
+REQ_TIER="$MIN_TIER_OUTBOUND"
+[ "$KIND" = "db-write" ] && REQ_TIER="$MIN_TIER_DB"
+
+MATCH=$(DIR="$DIR" MAX_AGE="$MAX_AGE" TI="$TI" REQUIRE_DUAL="$REQUIRE_DUAL" REQ_TIER="$REQ_TIER" python3 - <<'PY'
 import hashlib, hmac, json, os, time
 from pathlib import Path
 d = Path(os.environ["DIR"]); max_age = float(os.environ["MAX_AGE"]) * 60
 ti = os.environ["TI"]; require_dual = os.environ["REQUIRE_DUAL"] == "1"
+tier_rank = {"low": 0, "standard": 1, "high": 2}
+req_tier = os.environ.get("REQ_TIER", "low").strip().lower()
+req_rank = tier_rank.get(req_tier, 0)
 key_file = Path(os.environ.get("PAF_CONSENSUS_KEY_FILE") or Path.home() / ".config/paf/consensus.key")
 try:
     secret = key_file.read_text().strip()
@@ -107,6 +121,16 @@ def dual_ok(r):
     canon = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return hmac.compare_digest(hmac.new(secret.encode(), canon, hashlib.sha256).hexdigest(), r["sig"])
 
+def effective_tier(r, dual):
+    raw = str(r.get("tier") or "").strip().lower()
+    if raw in tier_rank:
+        # Unverified or unsigned receipts never satisfy standard/high tiers.
+        return raw if (raw == "low" or dual) else "low"
+    if not dual:
+        return "low"
+    calls = (r.get("verification") or {}).get("calls") or []
+    return "high" if any(c.get("step") == "blind" for c in calls if isinstance(c, dict)) else "standard"
+
 now = time.time()
 for p in sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
     if now - p.stat().st_mtime > max_age:
@@ -122,18 +146,20 @@ for p in sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
     if not any(k in ti for k in keys):
         continue
     dual = dual_ok(r)
-    if require_dual and not dual:
+    tier = effective_tier(r, dual)
+    if (require_dual or req_rank > 0) and not dual:
         continue
-    print(f"{p.name}|{'dual' if dual else 'single'}"); break
+    if tier_rank.get(tier, 0) < req_rank:
+        continue
+    print(f"{p.name}|{'dual' if dual else 'single'}|{tier}"); break
 PY
 )
-DUAL="${MATCH##*|}"; [ "$DUAL" = "$MATCH" ] && DUAL=""
-MATCH="${MATCH%%|*}"
+IFS='|' read -r MATCH DUAL TIER <<< "$MATCH"
 
 log() {  # log <decision>
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg s "$SESSION" --arg t "$TOOL" \
-     --arg k "$KIND" --arg m "$MODE" --arg d "$1" --arg r "$MATCH" --arg v "$DUAL" \
-     '{ts:$ts, session:$s, tool:$t, kind:$k, mode:$m, decision:$d, receipt:$r, verification:$v}' \
+     --arg k "$KIND" --arg m "$MODE" --arg d "$1" --arg r "$MATCH" --arg v "$DUAL" --arg tr "$TIER" \
+     '{ts:$ts, session:$s, tool:$t, kind:$k, mode:$m, decision:$d, receipt:$r, verification:$v, tier:$tr}' \
      >> "$DIR/hook-log.jsonl" 2>/dev/null
 }
 
@@ -156,16 +182,20 @@ else
 fi
 
 FACTORY_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+RECOMMENDED_TIER="standard"
+[ "$KIND" = "db-write" ] && RECOMMENDED_TIER="high"
 cat >&2 <<MSG
-PAUSED: this ${KIND} has no passing fact-check receipt (AGENTS.md principle 6).
+PAUSED: this ${KIND} has no passing fact-check receipt (AGENTS.md principle 6, required tier: ${REQ_TIER}).
 Before sending text or writing data, list every fact it depends on in a claims
 file and run:
-  ${FACTORY_ROOT}/bin/paf factcheck <claims.json>
-Each verified claim needs a command (SELECT, grep, kubectl, gh, API call) that
-actually returns data. "None / missing / broken" claims need a control on a known
-positive. Identity and still-in-use claims need an independent cross-check.
+  ${FACTORY_ROOT}/bin/paf factcheck <claims.json> --tier ${RECOMMENDED_TIER}
+Each verified claim needs a predicate-filtered command (SELECT, grep, kubectl,
+gh, API call) that returns data only when the claim is true. "None / missing /
+broken" claims need a control on a known positive. Identity and still-in-use
+claims need an independent cross-check.
 Set "target" to the channel id, issue key, PR or table so this hook can match it.
-Add --verify for dual-model verification (required when PAF_FACTCHECK_REQUIRE_DUAL=1).
+Use --tier standard for outbound text (audit + counterexamples) and --tier high
+for DB writes or batch lists (blind + audit + counterexamples).
 See ${FACTORY_ROOT}/framework/FACT-CHECK.md.
 MSG
 if [ "$MODE" = "warn" ]; then

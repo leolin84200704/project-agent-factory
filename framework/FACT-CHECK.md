@@ -53,41 +53,45 @@ purpose: Define what counts as a checked fact, the ten ways facts went wrong, an
 推論和沒有查的內容，不能當 DB 寫入的依據，也不能在對外文字裡寫成事實。
 STM 和 handoff 的 Verified facts 只放已驗證的內容，推論另列一欄。
 
-## 雙模型驗證（Leo 定版 2026-11-19）
+## 雙模型驗證與分級（Leo 定版 2026-11-19；三級分級 2026-11-20）
 
-寫的模型不能自己判斷自己的來源是不是 ground truth，也不能自己判斷自己的查法能不能證明這句話。
-所以由另一個家族的模型驗證，分兩步，指令一律由腳本執行，驗證模型自己不跑任何東西：
+寫的模型不能自己判斷自己的來源是不是 ground truth，也不能自己判斷自己的查法和結果能不能證明這句話。
+由另一個家族的模型做驗證，指令一律由腳本執行，驗證模型自己不跑任何東西。驗證有兩種做法。
 
-1. **盲測**。驗證模型只拿到「事實」那句話和權威來源表，看不到作者的來源、指令和結果。
-   它自己提出來源和一條唯讀指令。腳本跑它的指令，比對兩邊的來源和結果。
-   來源相同、結果一樣（正規化後雜湊相同；「沒有」類的兩邊都沒有資料），這個事實就通過。
-2. **審查**，只給第一步沒對上的事實。驗證模型看到兩邊的三欄和執行摘要，回答三件事：
-   作者的來源是不是 ground truth、作者的查法能不能證明這句話、最多三條反例指令。
-   反例指令在這句話為真時必須沒有輸出，腳本跑了只要撈到資料，這個事實就被推翻。
-   前兩題都是「是」、反例都沒撈到東西，才算通過。
+- **做法 1（審查）**：驗證模型看作者的三欄和執行摘要，逐項回答四件事。
+  1. `source_is_ground_truth`：作者的來源是不是正式來源（system of record）。
+  2. `command_proves_statement`：這條指令是不是已經把宣稱的條件寫進去，做到宣稱為假時不會通過（不能寫沒帶過濾條件的 `SELECT`）。
+  3. `result_matches_statement`：實際執行結果和表述一不一致。非個資模式下直接核對輸出摘要；個資模式下確認指令已編碼條件，因此有資料或空結果本身即能證明一致。
+  4. `counterexample_commands`：最多三條唯讀反例指令，宣稱為真時必須沒有輸出，腳本跑了只要撈到資料就推翻。
+  前三題全為「是」而且反例都沒撈到資料，才算通過。
+- **做法 2（盲測執行後比較）**：驗證模型只拿到「事實」那句話和權威來源表，看不到作者的來源、指令和結果。它自己提出來源和一條帶條件的唯讀指令，由腳本實際執行後，比對兩邊的來源是否一致，以及條件成立與否的真值結果是否一致（不再要求不同欄位順序的輸出雜湊一字不差）。盲測完成後再進做法 1 審查與反例檢查，避免未過濾查詢或雙方共同盲點直接過關。
 
-先盲測再審查，是因為看得到作者答案的驗證者會被帶著走。驗證模型出錯或回傳格式不對，一律判定失敗。
+### 三級分級與模型路由
 
-### 誰來跑
-- 對外文字、DB 寫入、程式碼修改、會影響 Leo 決策的結論：一律 `paf factcheck --verify`。
-- 終端機裡一般的回答：三欄加收據即可，不強制雙模型。
+`paf factcheck` 依 `--tier low|standard|high` 或 `claims.json` 裡的 `tier` 分三級，未指定但帶 `--verify` 時自動判斷（DB 寫入目標或 D／F 類事實自動歸 `high`，其餘歸 `standard`）。模型與 effort 一律由 `framework/scripts/model_router.py` 依反家族自動選取，不再寫死高延遲模型。
+
+| 等級 | 適用情境 | 執行流程 | 驗證模型（`model_router.py`） |
+|---|---|---|---|
+| `low` | 終端機一般問答、內部低風險查詢 | 本機三欄加收據，不呼叫第二模型 | 無 |
+| `standard` | 一般對外文字（Slack、Email、Jira、PR 描述）、一般結論 | 做法 1（審查＋結果一致＋反例） | `standard` 級（`sonnet --effort high` / `gemini-4-hydrogen-high`） |
+| `high` | DB 寫入、批次資料清單、D 類歸屬與 F 類全集合陳述、高風險決策 | 做法 2（盲測）再接做法 1（審查＋反例） | DB 寫入走 `critical` 級，其餘走 `complex` 級（`opus --effort high/xhigh` / `gemini-4-argon-high`） |
 
 ### 唯讀與隱私
 - 驗證模型提出的每一條指令，執行前都要過唯讀檢查：只准登記過的查詢 runner（SQL 只能是一條 SELECT、SHOW、DESCRIBE、EXPLAIN、WITH）、grep、rg、cat、head、tail、wc、ls、jq、find（不含 -exec、-delete）、唯讀的 git、gh、kubectl；不准 pipe、redirect、串接和指令替換。沒過的指令不執行，記在收據裡。
-- **PHI**：權威來源表設 `"phi": true` 時（預設），查詢的輸出不會送給驗證模型，只送 exit code、行數和正規化後的雜湊值，結果比對在本機做。指令文字本身會送出去，所以指令裡不放病人姓名這類資料，用 ID 查。
+- **PHI**：權威來源表設 `"phi": true` 時（預設），查詢的輸出不會送給驗證模型，只送 exit code、行數和正規化後的雜湊值，結果比對在本機做。指令文字本身會送出去，所以指令裡不放病人姓名這類資料，用 ID 查，並且把宣稱的條件寫進過濾條件裡（例如 `WHERE clinic_id=56180 AND isActive=0`）。
 
 ### 權威來源表（每個 instance 一份）
 借自 pstack 的 feature map：每一種資料（practice、provider、order……）寫明權威來源是哪張表、怎麼查，以及哪些欄位只是標籤或衍生值。
 `paf factcheck` 依序讀 `--sources`、`PAF_FACTCHECK_SOURCES`，都沒有時，找目前所在 git repo 根目錄的 `ground-truth-sources.json` 或 `reference/ground-truth-sources.json`。所以 instance 只要把檔案放在 repo 裡，不用改 settings。來源寫成衍生欄位的事實直接失敗；來源不在表上的會記一筆，交給審查判斷。
 驗證模型做盲測時也靠這張表知道該去哪裡查。格式見 `framework/scripts/factcheck.py` 的 docstring。
 
-### 程式碼修改
-- 查法就是測試。`paf tests-fail-on-base --test-cmd "<cmd>"` 把這個分支新增或修改的測試，放到 base commit 上跑：在 base 上一定要失敗，在 head 上一定要通過。在 base 上也會過的測試，證明不了這次修改（「a check you've never seen fail proves nothing」，pstack guide 06）。
-- `paf drive-consensus` 的審查要求加了一條：審查方要針對每個新的測試，提出「測試會過、但 code 還是錯的」的具體情況。會讓真的 bug 上線的缺口算 blocking，並且要說出補哪個 test case 可以關掉它。
+### 程式碼修改（同樣套用三要素）
+- 查法就是測試。`paf tests-fail-on-base --test-cmd "<cmd>"` 會把新增或修改的測試複製到 base commit 的臨時 worktree，並自動掛載本機未追蹤的依賴目錄（`.venv`、`venv`、`node_modules` 或 `--link-dir`），證明在 base 上失敗、在 head 上通過。依改動類型支援 `--change-type auto|bugfix|feature|refactor|docs|config`：純重構要求 base 與 head 兩邊皆通過（行為不變）；純文件或純設定只有在 diff 完全沒有程式碼檔案時才豁免。
+- `paf drive-consensus` 與 `paf watch-prs` 的審查 JSON schema（`REVIEW_JSON_SCHEMA`）強制三個必填欄位：`test_source_is_ground_truth`（測試打到真實程式碼或環境邊界，沒有把核心邏輯 mock 掉，環境相關改動具備 staging 或實測證據）、`tests_prove_change`（測試能證明宣稱的效果）、`test_counterexamples`（每個新／改測試的具體反例，任一項 `blocking: true` 或前兩欄任一為 `false` 時，程式機械強制翻成 `request_changes`）。
 
 ## 機制
 
-### `paf factcheck <claims.json> [--verify]`
+### `paf factcheck <claims.json> [--verify] [--tier low|standard|high]`
 claims 檔列出這段文字或這次寫入依賴的每一個事實。腳本自己跑每一條指令，產生收據到 `~/.cache/paf/factcheck/`（`PAF_FACTCHECK_DIR` 可覆寫）。
 有 consensus key 時收據會帶 HMAC 簽章（和 PR 共識同一把 key），寫的人沒辦法自己捏造一張雙模型驗證過的收據。
 指令在 claims 檔所在的目錄執行。格式和判定規則寫在 `framework/scripts/factcheck.py` 的 docstring：
@@ -122,8 +126,8 @@ claims 檔列出這段文字或這次寫入依賴的每一個事實。腳本自�
 對外送出的工具和 DB 寫入，要找到一張通過、120 分鐘內、`target` 字串出現在這次工具呼叫裡的收據。
 - `PAF_FACTCHECK_MODE=warn`（預設）：沒有收據時暫停一次，同一個呼叫重跑就放行，記為 override。
 - `PAF_FACTCHECK_MODE=block`：沒有收據就擋下。
-- `PAF_FACTCHECK_REQUIRE_DUAL=1`：只接受雙模型驗證通過、驗證模型和作者不同家族、HMAC 正確的收據。
-- 每一次判定都寫進 `~/.cache/paf/factcheck/hook-log.jsonl`，包括這張收據是 dual 還是 single。
+- `PAF_FACTCHECK_REQUIRE_DUAL=1`：只接受雙模型驗證通過、驗證模型和作者不同家族、HMAC 正確的收據，而且預設對外文字要求至少 `standard` 級、DB 寫入要求 `high` 級（可用 `PAF_FACTCHECK_MIN_TIER_OUTBOUND` 與 `PAF_FACTCHECK_MIN_TIER_DB` 覆寫）。
+- 每一次判定都寫進 `~/.cache/paf/factcheck/hook-log.jsonl`，包括這張收據是 dual 還是 single 以及對應的 `tier`。
 
 ### 升級條件（照 ENFORCEMENT-LADDER）
 warn 模式先跑兩週。之後看 hook-log：pass、paused、override 各幾次，override 裡有幾次事後證明真的沒有需要查的事實。

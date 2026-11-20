@@ -7,17 +7,20 @@ that proves it. This script runs each command itself and writes a receipt. A
 claim passes only when the command actually returned data; memory, notes,
 reasoning, an empty result, or a failing command never count.
 
-With --verify, a model from a different family checks the claims in two steps
-(Leo, 2026-11-19):
-  1. Blind: the verifier sees only the statements and the sources registry,
-     never the author's commands or results. It proposes its own source and
-     read-only command for each statement. The script runs them and compares
-     sources and results with the author's.
-  2. Audit, for claims that did not match: the verifier sees both triples and
-     the run summaries, judges whether the author's source is ground truth and
-     whether the command proves the statement, and proposes counterexample
-     commands that must return nothing if the statement is true. The script
-     runs them.
+Verification is tiered (`low`, `standard`, `high`) and uses `model_router.py`
+to pick the verifier model and effort from the opposite model family:
+  - `low`: deterministic local receipt only (no verifier model call).
+  - `standard` (Approach 1 - Audit): the verifier inspects the author's triple
+    and run summary, judges `source_is_ground_truth`, `command_proves_statement`,
+    and `result_matches_statement`, and proposes counterexample commands that
+    must return nothing if the statement is true.
+  - `high` (Approach 2 - Blind + Approach 1 - Audit): the verifier first
+    proposes its own predicate-filtered source and read-only command blind
+    (without seeing the author's command or results). The script runs them,
+    compares source and predicate truth polarity, and then runs the full audit
+    and counterexample pass on every claim so shared blind spots and unfiltered
+    queries cannot slip through.
+
 The verifier never runs anything itself; every command it proposes passes a
 read-only check first. In hashes-only mode (the default) query output never
 reaches the verifier, only exit codes, line counts and hashes.
@@ -25,11 +28,12 @@ reaches the verifier, only exit codes, line counts and hashes.
 Claims file (JSON):
 {
   "target": "slack:C0B8YU8JZG8",
+  "tier": "standard",
   "claims": [
     {"id": "c1", "text": "56180 is an inactive NPI-type account", "category": "D",
      "source": "lis_core_v7.clinic",
-     "command": "q \\"SELECT clinic_name, clinic_type FROM lis_core_v7.clinic WHERE clinic_id=56180\\"",
-     "cross_check_command": "q \\"SELECT isActive FROM lis_core_v7.customer WHERE customer_id=12243\\""},
+     "command": "q \\"SELECT clinic_name, clinic_type FROM lis_core_v7.clinic WHERE clinic_id=56180 AND clinic_type='NPI'\\"",
+     "cross_check_command": "q \\"SELECT isActive FROM lis_core_v7.customer WHERE customer_id=12243 AND isActive=0\\""},
     {"id": "c2", "text": "56180 never had an order", "category": "C", "kind": "negative",
      "source": "lis_core_v7.order_info",
      "command": "...returns nothing...", "control_command": "...same query on a clinic with orders..."},
@@ -84,10 +88,14 @@ from typing import Any, Callable
 CATEGORIES = set("ABCDEFGHIJ")
 LABELS = ("verified", "inferred", "unchecked")
 FAMILIES = ("claude", "gemini")
+TIERS = ("low", "standard", "high")
+DB_TARGET_PREFIXES = ("db:", "sql:", "mysql:", "psql:", "ddl:", "table:")
+HIGH_RISK_CATEGORIES = frozenset({"D", "F"})
 DEFAULT_TIMEOUT = 120
 OUTPUT_EXCERPT = 400
 DEFAULT_VERIFIER_MODEL = {"gemini": "gemini-4-argon-high", "claude": "opus"}
 WATCHER_PATH = Path(__file__).resolve().parent / "paf_watcher.py"
+ROUTER_PATH = Path(__file__).resolve().parent / "model_router.py"
 
 # Verifier-proposed commands never reach a shell (run_command(..., shell=False)); these checks are a
 # second layer. Characters a shell would treat as operators are refused when they appear unquoted,
@@ -187,6 +195,7 @@ AUDIT_SCHEMA = {
                     "id": {"type": "string"},
                     "source_is_ground_truth": {"type": "boolean"},
                     "command_proves_statement": {"type": "boolean"},
+                    "result_matches_statement": {"type": "boolean"},
                     "counterexample_commands": {
                         "type": "array",
                         "items": {
@@ -198,7 +207,13 @@ AUDIT_SCHEMA = {
                     "verdict": {"type": "string", "enum": ["approve", "reject"]},
                     "reasoning": {"type": "string"},
                 },
-                "required": ["id", "source_is_ground_truth", "command_proves_statement", "verdict"],
+                "required": [
+                    "id",
+                    "source_is_ground_truth",
+                    "command_proves_statement",
+                    "result_matches_statement",
+                    "verdict",
+                ],
             },
         }
     },
@@ -532,6 +547,52 @@ def _watcher() -> Any:
     return mod
 
 
+def _router() -> Any:
+    spec = importlib.util.spec_from_file_location("model_router_for_factcheck", ROUTER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _is_db_target(target: str) -> bool:
+    return str(target or "").strip().lower().startswith(DB_TARGET_PREFIXES)
+
+
+def resolve_tier(spec: dict[str, Any], target: str, claims: list[dict[str, Any]],
+                 explicit_tier: str | None, verify: bool) -> tuple[str, bool, list[str]]:
+    """Return (effective_tier, should_verify, errors)."""
+    raw_tier = explicit_tier if explicit_tier is not None else spec.get("tier")
+    raw_str = str(raw_tier).strip().lower() if raw_tier is not None and str(raw_tier).strip() else None
+    if raw_str is not None and raw_str not in TIERS:
+        return "low", False, [f"unknown tier {raw_tier!r} (expected one of {TIERS})"]
+    if verify and raw_str == "low":
+        return "low", False, ["--verify cannot be combined with tier='low'; use 'standard' or 'high'"]
+    if raw_str == "low":
+        return "low", False, []
+    if raw_str in ("standard", "high"):
+        return raw_str, True, []
+    if not verify:
+        return "low", False, []
+    has_high_cat = any(
+        c.get("label", "verified") == "verified"
+        and str(c.get("category", "")).upper() in HIGH_RISK_CATEGORIES
+        for c in claims
+        if isinstance(c, dict)
+    )
+    inferred = "high" if (_is_db_target(target) or has_high_cat) else "standard"
+    return inferred, True, []
+
+
+def select_verifier_model(verifier_family: str, tier: str, *, is_db_write: bool = False) -> tuple[str, str, str]:
+    """Select (cli_model, effort, router_tier) via model_router.py for the opposite family."""
+    router_tier = "standard" if tier == "standard" else ("critical" if is_db_write else "complex")
+    opposite_author = "claude" if verifier_family == "gemini" else "gemini"
+    plan = _router().select_task_models(explicit_tier=router_tier, author_family=opposite_author)
+    entry = plan["reviewer"][verifier_family]
+    return str(entry["cli_model"]), str(entry["effort"]), router_tier
+
+
 def _parse_payload(stdout: str) -> dict[str, Any]:
     """Accept a bare JSON object or a CLI envelope (structured_output / response / result)."""
     text = stdout.strip()
@@ -631,8 +692,12 @@ def blind_prompt(claims: list[dict[str, Any]], registry: dict[str, Any] | None, 
         "author's sources, commands or results. You cannot run anything and must not call any tool; a script runs "
         "the commands you return.\n"
         "For each statement below, name the authoritative source (the system of record, never a label, derived, "
-        "cached or copied field; the registry lists which is which) and ONE read-only command that would prove or "
-        "disprove it. Use only a registered runner from the registry, or grep/rg/cat/head/tail/wc/ls/jq/find, "
+        "cached or copied field; the registry lists which is which) and ONE read-only predicate-filtered command "
+        "that proves or disproves it. Encode the asserted condition directly inside the query or filter (for "
+        "example WHERE clinic_id=56180 AND isActive=0, or grep matching the claimed value) so the command returns "
+        "rows/lines ONLY when the statement is true and returns nothing when the statement is false. Never write "
+        "an unfiltered SELECT that returns a row regardless of whether the statement holds.\n"
+        "Use only a registered runner from the registry, or grep/rg/cat/head/tail/wc/ls/jq/find, "
         "read-only git, read-only gh, or kubectl get/describe/logs. Commands run without a shell: no pipes, "
         "redirects, chaining, newlines, variables or command substitution. SQL must be a single "
         "SELECT/SHOW/DESCRIBE/EXPLAIN/WITH statement.\n"
@@ -644,25 +709,41 @@ def blind_prompt(claims: list[dict[str, Any]], registry: dict[str, Any] | None, 
     )
 
 
-def audit_prompt(items: list[dict[str, Any]], registry: dict[str, Any] | None, phi: bool) -> str:
+def audit_prompt(items: list[dict[str, Any]], registry: dict[str, Any] | None, phi: bool,
+                 *, has_blind: bool = False) -> str:
     blob = json.dumps(items, indent=1, ensure_ascii=False)
     privacy = (
         "Query output is withheld for privacy; you see exit codes, line counts and normalized hashes. Equal hashes "
-        "mean the two commands returned the same rows.\n" if phi else ""
+        "mean the two commands returned the same rows. Because output text is withheld, an unfiltered query that "
+        "returns a row even when the statement is false CANNOT prove the statement or verify result consistency: "
+        "set both command_proves_statement and result_matches_statement to false for any unfiltered query.\n"
+        if phi else
+        "Query output excerpts are included below. Inspect output_excerpt directly to verify whether the returned "
+        "values actually support the statement.\n"
+    )
+    intro = (
+        "You are an adversarial fact auditor from a different model family than the author. For each claim you see "
+        "the author's statement, source, command and run summary, together with your own independent (blind) "
+        "proposal and how both ran. Compare equivalence (whether sources match, both methods are sound, and truth "
+        "polarity agrees) and judge the author's version:\n"
+        if has_blind else
+        "You are an adversarial fact auditor from a different model family than the author. For each claim you see "
+        "the author's statement, source, command and run summary. Judge the author's version:\n"
     )
     return (
-        "You are an adversarial fact auditor from a different model family than the author. For each claim you see "
-        "the author's statement, source and command, your own independent (blind) proposal, and how both ran. They "
-        "did not agree on source or result, so judge the author's version:\n"
+        f"{intro}"
         "1. source_is_ground_truth: is the author's source the system of record for this fact (not a label, derived, "
         "cached or copied field, and not another system's copy)?\n"
-        "2. command_proves_statement: would that command's result actually prove the statement, or could it pass "
-        "while the statement is false (missing scope, wrong table, wrong environment, sampling, NULL handling, "
-        "time zone)?\n"
-        "3. counterexample_commands: up to 3 read-only commands that must return NOTHING if the statement is true. "
+        "2. command_proves_statement: does the command encode the asserted condition so that it ONLY passes when "
+        "the statement is true, or could it pass while the statement is false (unfiltered SELECT that returns a "
+        "row for any value, missing scope, wrong table, wrong environment, sampling, NULL handling, time zone)?\n"
+        "3. result_matches_statement: does the actual run result match what the statement claims? When output "
+        "excerpts are shown, verify the values directly. When output is withheld for privacy, this is true only if "
+        "the command encodes the predicate so returning data (or empty for negative claims) entails the statement.\n"
+        "4. counterexample_commands: up to 3 read-only commands that must return NOTHING if the statement is true. "
         "A script runs them; any output disproves the claim. Same command rules as before: registered runner or "
         "read-only tool, no pipes, redirects, chaining or substitution; SQL is one SELECT.\n"
-        "Set verdict='approve' only if 1 and 2 are both true. You cannot run anything; do not call tools.\n"
+        "Set verdict='approve' only if 1, 2 and 3 are all true. You cannot run anything; do not call tools.\n"
         f"{privacy}Return ONLY JSON matching the schema.\n\n"
         f"Sources registry:\n{_registry_for_prompt(registry)}\n\nClaims:\n{blob}\n"
     )
@@ -689,113 +770,155 @@ def sources_match(a: str, b: str, cwd: Path | None = None) -> bool:
 
 def verify_claims(results: list[dict[str, Any]], claims: list[dict[str, Any]], registry: dict[str, Any] | None,
                   family: str, model: str, effort: str | None, phi: bool, timeout: int, cwd: Path | None,
-                  verifier_cmd: str | None) -> dict[str, Any]:
+                  verifier_cmd: str | None, *, tier: str = "standard", router_tier: str = "") -> dict[str, Any]:
     by_id = {c.get("id"): c for c in claims}
     targets = [r for r in results if r["label"] == "verified" and not r["problems"]]
-    ver: dict[str, Any] = {"family": family, "model": model, "effort": effort or "",
-                           "phi_mode": "hashes-only" if phi else "full", "claims": {}, "calls": []}
+    run_blind = tier == "high"
+    verify_mode = "blind+audit" if run_blind else "audit"
+    ver: dict[str, Any] = {
+        "family": family,
+        "model": model,
+        "effort": effort or "",
+        "tier": tier,
+        "verify_mode": verify_mode,
+        "router_tier": router_tier,
+        "phi_mode": "hashes-only" if phi else "full",
+        "claims": {},
+        "calls": [],
+    }
     if not targets:
         ver["status"] = "pass"
         return ver
 
-    payload, meta = call_verifier(family, model, effort, blind_prompt(targets, registry, cwd), BLIND_SCHEMA, verifier_cmd)
-    ver["calls"].append({"step": "blind", **meta})
-    blind = {str(c.get("id")): c for c in payload.get("claims", []) if isinstance(c, dict)}
-
-    diverged: list[dict[str, Any]] = []
     for r in targets:
-        entry: dict[str, Any] = {"verdict": "pending"}
-        ver["claims"][r["id"]] = entry
-        b = blind.get(r["id"])
-        if not b:
-            entry["blind"] = {"missing": True}
-            diverged.append(r)
-            continue
-        entry["blind"] = {"source": b.get("source", ""), "command": b.get("command", ""), "expect": b.get("expect", "data")}
-        refused = readonly_problem(b.get("command", ""), registry)
-        if refused:
-            entry["blind"]["refused"] = refused
-            diverged.append(r)
-            continue
-        run = run_command(b["command"], timeout, cwd, shell=False)
-        entry["blind"]["run"] = strip_private(run)
-        author_run = r["runs"]["command"]
-        entry["source_match"] = sources_match(r["source"], b.get("source", ""), cwd)
-        blind_expects_empty = b.get("expect") == "empty"
-        author_negative = r["kind"] == "negative"
-        if author_negative and blind_expects_empty:
-            entry["result_match"] = (
-                (run["exit_code"] == 0 or _negative_no_match("negative", run))
-                and not run["output_lines"]
-                and not author_run["output_lines"]
-            )
-        elif not author_negative and not blind_expects_empty:
-            entry["result_match"] = run["has_data"] and run["normalized_sha256"] == author_run["normalized_sha256"]
-        else:
-            # The verifier reads the statement as the opposite kind of claim (presence vs absence);
-            # an equal-looking result proves nothing, so the audit step decides.
-            entry["result_match"] = False
-        if entry["source_match"] and entry["result_match"]:
-            entry["verdict"] = "pass"
-            entry["by"] = "blind-equivalent"
-        else:
-            diverged.append(r)
+        ver["claims"][r["id"]] = {"verdict": "pending"}
 
-    if diverged:
-        items = []
-        for r in diverged:
-            e = ver["claims"][r["id"]]
-            items.append({
-                "id": r["id"],
-                "statement": r["text"],
-                "kind": r["kind"],
-                "author": {"source": r["source"], "command": by_id[r["id"]].get("command", ""),
-                           "run": run_summary(r["runs"].get("command"), phi)},
-                "verifier_blind": {k: v for k, v in e.get("blind", {}).items() if k != "run"}
-                | {"run": run_summary(e.get("blind", {}).get("run"), phi) if e.get("blind", {}).get("run") else {"ran": False}},
-                "source_match": e.get("source_match"),
-                "result_match": e.get("result_match"),
-            })
-        payload, meta = call_verifier(family, model, effort, audit_prompt(items, registry, phi), AUDIT_SCHEMA, verifier_cmd)
-        ver["calls"].append({"step": "audit", **meta})
-        audits = {str(c.get("id")): c for c in payload.get("claims", []) if isinstance(c, dict)}
-        for r in diverged:
-            e = ver["claims"][r["id"]]
-            a = audits.get(r["id"])
-            if not a:
-                e["verdict"] = "fail"
-                e["reason"] = "verifier returned no audit for this claim"
+    if run_blind:
+        payload, meta = call_verifier(family, model, effort, blind_prompt(targets, registry, cwd), BLIND_SCHEMA, verifier_cmd)
+        ver["calls"].append({"step": "blind", **meta})
+        blind = {str(c.get("id")): c for c in payload.get("claims", []) if isinstance(c, dict)}
+
+        for r in targets:
+            entry = ver["claims"][r["id"]]
+            b = blind.get(r["id"])
+            if not b:
+                entry["blind"] = {"missing": True}
+                entry["source_match"] = False
+                entry["result_match"] = False
+                entry["hash_match"] = False
                 continue
-            e["audit"] = {k: a.get(k) for k in ("source_is_ground_truth", "command_proves_statement", "verdict", "reasoning")}
-            e["counterexamples"] = []
-            disproved = False
-            for ce in (a.get("counterexample_commands") or [])[:3]:
-                cmd = str((ce or {}).get("command") or "")
-                item: dict[str, Any] = {"command": cmd, "why": (ce or {}).get("why", "")}
-                refused = readonly_problem(cmd, registry)
-                if refused:
-                    item["refused"] = refused
-                else:
-                    run = run_command(cmd, timeout, cwd, shell=False)
-                    item["run"] = strip_private(run)
-                    if run["has_data"]:
-                        disproved = True
-                e["counterexamples"].append(item)
-            ok = (a.get("verdict") == "approve" and a.get("source_is_ground_truth") is True
-                  and a.get("command_proves_statement") is True and not disproved)
-            e["verdict"] = "pass" if ok else "fail"
-            e["by"] = "audit"
-            if not ok:
-                reasons = []
-                if a.get("source_is_ground_truth") is not True:
-                    reasons.append("verifier: source is not ground truth")
-                if a.get("command_proves_statement") is not True:
-                    reasons.append("verifier: command does not prove the statement")
-                if disproved:
-                    reasons.append("a counterexample command returned data")
-                if a.get("verdict") != "approve" and not reasons:
-                    reasons.append("verifier rejected the claim")
-                e["reason"] = "; ".join(reasons)
+            entry["blind"] = {"source": b.get("source", ""), "command": b.get("command", ""), "expect": b.get("expect", "data")}
+            refused = readonly_problem(b.get("command", ""), registry)
+            if refused:
+                entry["blind"]["refused"] = refused
+                entry["source_match"] = False
+                entry["result_match"] = False
+                entry["hash_match"] = False
+                continue
+            run = run_command(b["command"], timeout, cwd, shell=False)
+            entry["blind"]["run"] = strip_private(run)
+            author_run = r["runs"]["command"]
+            entry["source_match"] = sources_match(r["source"], b.get("source", ""), cwd)
+            blind_expects_empty = b.get("expect") == "empty"
+            author_negative = r["kind"] == "negative"
+            if author_negative and blind_expects_empty:
+                entry["result_match"] = (
+                    (run["exit_code"] == 0 or _negative_no_match("negative", run))
+                    and not run["output_lines"]
+                    and not author_run["output_lines"]
+                )
+                entry["hash_match"] = entry["result_match"]
+            elif not author_negative and not blind_expects_empty:
+                # Predicate queries with different column lists still prove equivalence when both return rows.
+                entry["result_match"] = bool(run["has_data"] and author_run["has_data"])
+                entry["hash_match"] = bool(run["has_data"] and run["normalized_sha256"] == author_run["normalized_sha256"])
+            else:
+                # Verifier read the claim with opposite presence/absence polarity.
+                entry["result_match"] = False
+                entry["hash_match"] = False
+
+    # Audit always runs for both tiers so unfiltered queries and shared blind spots cannot bypass counterexamples.
+    items = []
+    for r in targets:
+        e = ver["claims"][r["id"]]
+        item: dict[str, Any] = {
+            "id": r["id"],
+            "statement": r["text"],
+            "kind": r["kind"],
+            "author": {
+                "source": r["source"],
+                "command": by_id[r["id"]].get("command", ""),
+                "run": run_summary(r["runs"].get("command"), phi),
+            },
+        }
+        if run_blind:
+            item["verifier_blind"] = (
+                {k: v for k, v in e.get("blind", {}).items() if k != "run"}
+                | {"run": run_summary(e.get("blind", {}).get("run"), phi) if e.get("blind", {}).get("run") else {"ran": False}}
+            )
+            item["source_match"] = e.get("source_match")
+            item["result_match"] = e.get("result_match")
+            item["hash_match"] = e.get("hash_match")
+        items.append(item)
+
+    payload, meta = call_verifier(
+        family, model, effort, audit_prompt(items, registry, phi, has_blind=run_blind), AUDIT_SCHEMA, verifier_cmd
+    )
+    ver["calls"].append({"step": "audit", **meta})
+    audits = {str(c.get("id")): c for c in payload.get("claims", []) if isinstance(c, dict)}
+    for r in targets:
+        e = ver["claims"][r["id"]]
+        a = audits.get(r["id"])
+        if not a:
+            e["verdict"] = "fail"
+            e["reason"] = "verifier returned no audit for this claim"
+            continue
+        e["audit"] = {
+            k: a.get(k)
+            for k in (
+                "source_is_ground_truth",
+                "command_proves_statement",
+                "result_matches_statement",
+                "verdict",
+                "reasoning",
+            )
+        }
+        e["counterexamples"] = []
+        disproved = False
+        for ce in (a.get("counterexample_commands") or [])[:3]:
+            cmd = str((ce or {}).get("command") or "")
+            ce_item: dict[str, Any] = {"command": cmd, "why": (ce or {}).get("why", "")}
+            refused = readonly_problem(cmd, registry)
+            if refused:
+                ce_item["refused"] = refused
+            else:
+                run = run_command(cmd, timeout, cwd, shell=False)
+                ce_item["run"] = strip_private(run)
+                if run["has_data"]:
+                    disproved = True
+            e["counterexamples"].append(ce_item)
+        ok = (
+            a.get("verdict") == "approve"
+            and a.get("source_is_ground_truth") is True
+            and a.get("command_proves_statement") is True
+            and a.get("result_matches_statement") is True
+            and not disproved
+        )
+        e["verdict"] = "pass" if ok else "fail"
+        e["by"] = "blind+audit" if run_blind else "audit"
+        if not ok:
+            reasons = []
+            if a.get("source_is_ground_truth") is not True:
+                reasons.append("verifier: source is not ground truth")
+            if a.get("command_proves_statement") is not True:
+                reasons.append("verifier: command does not prove the statement")
+            if a.get("result_matches_statement") is not True:
+                reasons.append("verifier: result does not match the statement")
+            if disproved:
+                reasons.append("a counterexample command returned data")
+            if a.get("verdict") != "approve" and not reasons:
+                reasons.append("verifier rejected the claim")
+            e["reason"] = "; ".join(reasons)
 
     ver["status"] = "pass" if all(e.get("verdict") == "pass" for e in ver["claims"].values()) else "fail"
     return ver
@@ -844,7 +967,7 @@ def sign_receipt(receipt: dict[str, Any]) -> None:
 
 
 def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None = None, *,
-        sources: Path | None = None, verify: bool = False, author_family: str = "claude",
+        sources: Path | None = None, verify: bool = False, tier: str | None = None, author_family: str = "claude",
         verifier_family: str | None = None, verifier_model: str | None = None, verifier_effort: str | None = None,
         allow_same_family: bool = False, phi: bool | None = None,
         verifier_cmd: str | None = None) -> tuple[int, dict[str, Any]]:
@@ -862,8 +985,12 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
     if not claims:
         global_problems.append("claims file lists no claims")
 
+    eff_tier, should_verify, tier_errors = resolve_tier(spec, target, claims, tier, verify)
+    global_problems.extend(tier_errors)
+    verify_mode = "none" if not should_verify else ("blind+audit" if eff_tier == "high" else "audit")
+
     verification: dict[str, Any] | None = None
-    if verify:
+    if should_verify:
         fam = verifier_family or ("gemini" if author_family == "claude" else "claude")
         if fam not in FAMILIES:
             global_problems.append(f"unknown verifier family {fam!r}")
@@ -871,13 +998,29 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
             global_problems.append("verifier must come from a different model family than the author")
         else:
             phi_mode = registry.get("phi", True) if (phi is None and registry) else (True if phi is None else phi)
+            routed_model, routed_effort, router_tier = select_verifier_model(
+                fam, eff_tier, is_db_write=_is_db_target(target)
+            )
+            eff_model = verifier_model or routed_model
+            eff_effort = verifier_effort if verifier_effort is not None else (None if verifier_model else routed_effort)
             try:
-                verification = verify_claims(results, claims, registry, fam,
-                                             verifier_model or DEFAULT_VERIFIER_MODEL[fam], verifier_effort,
-                                             bool(phi_mode), timeout, cwd, verifier_cmd)
+                verification = verify_claims(
+                    results, claims, registry, fam, eff_model, eff_effort,
+                    bool(phi_mode), timeout, cwd, verifier_cmd, tier=eff_tier, router_tier=router_tier,
+                )
                 verification["author_family"] = author_family
             except Exception as exc:  # verifier outage or malformed output: fail closed
-                verification = {"family": fam, "status": "error", "error": str(exc)[:500], "author_family": author_family}
+                verification = {
+                    "family": fam,
+                    "model": eff_model,
+                    "effort": eff_effort or "",
+                    "tier": eff_tier,
+                    "verify_mode": verify_mode,
+                    "router_tier": router_tier,
+                    "status": "error",
+                    "error": str(exc)[:500],
+                    "author_family": author_family,
+                }
                 global_problems.append(f"dual-model verification failed: {str(exc)[:200]}")
 
     if verification and verification.get("status") == "pass":
@@ -906,6 +1049,8 @@ def run(claims_path: Path, timeout: int = DEFAULT_TIMEOUT, out_dir: Path | None 
     receipt: dict[str, Any] = {
         "version": 2,
         "target": target,
+        "tier": eff_tier,
+        "verify_mode": verify_mode,
         "claims_file": str(claims_path.resolve()),
         "sources_registry": (registry or {}).get("_path", ""),
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -933,7 +1078,9 @@ def print_summary(receipt: dict[str, Any]) -> None:
     dual = " dual-model" if receipt.get("dual_model") else ""
     if receipt.get("verifier_override"):
         dual = " (verifier overridden by --verifier-cmd; not dual-model)"
-    print(f"fact-check {receipt['status'].upper()}{dual} target={receipt['target']}")
+    tier = receipt.get("tier", "low")
+    mode = receipt.get("verify_mode", "none")
+    print(f"fact-check {receipt['status'].upper()}{dual} tier={tier} mode={mode} target={receipt['target']}")
     for p in receipt["problems"]:
         print(f"  ! {p}")
     ver = receipt.get("verification") or {}
@@ -961,7 +1108,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="seconds per command")
     ap.add_argument("--out-dir", type=Path, default=None, help="receipt directory (default ~/.cache/paf/factcheck)")
     ap.add_argument("--sources", type=Path, default=None, help="sources registry JSON (default $PAF_FACTCHECK_SOURCES)")
-    ap.add_argument("--verify", action="store_true", help="dual-model verification: blind proposal, then audit")
+    ap.add_argument("--verify", action="store_true", help="enable dual-model verification (tier inferred unless --tier is set)")
+    ap.add_argument("--tier", choices=TIERS, default=None,
+                    help="verification tier: low (local only), standard (audit + counterexamples), high (blind + audit + counterexamples)")
     ap.add_argument("--author-family", default="claude", choices=FAMILIES)
     ap.add_argument("--verifier-family", default=None, choices=FAMILIES)
     ap.add_argument("--verifier-model", default=None)
@@ -979,7 +1128,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     code, receipt = run(
-        args.claims, args.timeout, args.out_dir, sources=args.sources, verify=args.verify,
+        args.claims, args.timeout, args.out_dir, sources=args.sources, verify=args.verify, tier=args.tier,
         author_family=args.author_family, verifier_family=args.verifier_family, verifier_model=args.verifier_model,
         verifier_effort=args.verifier_effort, allow_same_family=args.allow_same_family, phi=args.phi,
         verifier_cmd=args.verifier_cmd,

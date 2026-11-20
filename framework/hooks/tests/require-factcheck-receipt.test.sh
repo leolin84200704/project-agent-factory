@@ -58,12 +58,14 @@ run 2 'stale receipt ignored'      "$SLACK" '{"channel_id":"C5","message":"x"}'
 echo "--- require dual-model receipts ---"
 KEY="$TMP/consensus.key"; printf 'test-secret-0123456789abcdef\n' > "$KEY"; chmod 600 "$KEY"
 export PAF_CONSENSUS_KEY_FILE="$KEY"
-signed_receipt() {  # signed_receipt <name> <target> <dual true|false> <verifier_family> [bad]
-  python3 - "$PAF_FACTCHECK_DIR/$1.json" "$2" "$3" "$4" "${5:-}" <<'PY'
+signed_receipt() {  # signed_receipt <name> <target> <dual true|false> <verifier_family> [bad] [tier]
+  python3 - "$PAF_FACTCHECK_DIR/$1.json" "$2" "$3" "$4" "${5:-}" "${6:-}" <<'PY'
 import hashlib, hmac, json, sys
-path, target, dual, fam, bad = sys.argv[1:6]
+path, target, dual, fam, bad, tier = sys.argv[1:7]
 r = {"version": 2, "status": "pass", "target": target, "dual_model": dual == "true",
      "verification": {"status": "pass" if dual == "true" else "fail", "family": fam, "author_family": "claude"}}
+if tier:
+    r["tier"] = tier
 canon = json.dumps(r, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 r["sig"] = "0" * 64 if bad else hmac.new(b"test-secret-0123456789abcdef", canon, hashlib.sha256).hexdigest()
 open(path, "w").write(json.dumps(r))
@@ -78,7 +80,14 @@ signed_receipt d-same C9 true claude
 PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'same-family verifier refused' "$SLACK" '{"channel_id":"C9","message":"x"}'
 signed_receipt d-forged C10 true gemini bad
 PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'bad signature refused' "$SLACK" '{"channel_id":"C10","message":"x"}'
+signed_receipt d-std-db "db:orders" true gemini "" standard
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'db-write refuses standard-tier receipt' mcp__vibrant__mysql_query '{"query":"UPDATE orders SET status=1 WHERE id=2"}'
+signed_receipt d-high-db "db:orders" true gemini "" high
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 0 'db-write accepts high-tier receipt' mcp__vibrant__mysql_query '{"query":"UPDATE orders SET status=1 WHERE id=2"}'
+signed_receipt d-spoof-tier "db:billing_accounts" false gemini "" high
+PAF_FACTCHECK_REQUIRE_DUAL=1 run 2 'unverified high-tier claim refused' mcp__vibrant__mysql_query '{"query":"UPDATE billing_accounts SET status=1 WHERE id=2"}'
 if grep -q '"verification":"dual"' "$PAF_FACTCHECK_DIR/hook-log.jsonl"; then echo "[ok  ] log records dual"; else echo "[FAIL] log lacks dual"; fails=$((fails+1)); fi
+if grep -q '"tier":"high"' "$PAF_FACTCHECK_DIR/hook-log.jsonl"; then echo "[ok  ] log records tier"; else echo "[FAIL] log lacks tier"; fails=$((fails+1)); fi
 
 echo "--- warn mode: pauses once, re-run passes ---"
 P=$(jq -cn --arg t "$SLACK" '{session_id:"w", tool_name:$t, tool_input:{channel_id:"C6",message:"x"}}')
