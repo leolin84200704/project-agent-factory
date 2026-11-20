@@ -68,14 +68,17 @@ class Base(unittest.TestCase):
                 os.environ[k] = v
         self.tmp.cleanup()
 
-    def check(self, claims, target="slack:C1", registry=None, **kw):
+    def check(self, claims, target="slack:C1", registry=None, spec_extra=None, **kw):
         path = self.dir / "claims.json"
-        path.write_text(json.dumps({"target": target, "claims": claims}))
+        doc = {"target": target, "claims": claims}
+        if spec_extra:
+            doc.update(spec_extra)
+        path.write_text(json.dumps(doc))
         sources = None
         if registry is not None:
             sources = self.dir / "sources.json"
             sources.write_text(json.dumps(registry))
-        if kw.get("verify"):
+        if kw.get("verify") or kw.get("tier") in ("standard", "high") or doc.get("tier") in ("standard", "high"):
             kw.setdefault("verifier_cmd", f"{sys.executable} {self.dir / 'fake_verifier.py'}")
         return fc.run(path, timeout=10, out_dir=self.dir / "receipts", sources=sources, **kw)
 
@@ -303,39 +306,142 @@ class ReadOnlyTest(unittest.TestCase):
         self.bad("")
 
 
+def _ok_audit(cid="c1", **extra):
+    base = {
+        "id": cid,
+        "source_is_ground_truth": True,
+        "command_proves_statement": True,
+        "result_matches_statement": True,
+        "verdict": "approve",
+    }
+    base.update(extra)
+    return base
+
+
 class DualModelTest(Base):
     def set_scenario(self, blind=None, audit=None, **extra):
         self.scenario.write_text(json.dumps({"blind": blind or {"claims": []}, "audit": audit or {"claims": []}, **extra}))
 
-    def test_blind_equivalent_passes_without_audit(self):
-        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]})
+    def test_standard_tier_runs_audit_directly_with_standard_router_model(self):
+        self.set_scenario(audit={"claims": [_ok_audit()]})
         code, r = self.check([c()], verify=True)
         self.assertEqual(code, 0, r)
+        self.assertEqual(r["tier"], "standard")
+        self.assertEqual(r["verify_mode"], "audit")
         self.assertEqual(r["verification"]["status"], "pass")
-        self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind-equivalent")
-        self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind"])
+        self.assertEqual(r["verification"]["router_tier"], "standard")
+        self.assertEqual(r["verification"]["model"], "gemini-4-hydrogen-high")
+        self.assertEqual(r["verification"]["effort"], "high")
+        self.assertEqual(r["verification"]["claims"]["c1"]["by"], "audit")
+        self.assertEqual([p["step"] for p in self.prompts_seen()], ["audit"])
         # The fake verifier replaces the model CLI, so the receipt must not claim dual-model.
         self.assertFalse(r["dual_model"])
         self.assertTrue(r["verifier_override"])
 
-    def test_negative_claim_with_blind_expecting_data_goes_to_audit(self):
+    def test_high_tier_always_runs_blind_and_audit_even_when_blind_matches(self):
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit(counterexample_commands=[{"command": "cat empty.txt"}])]},
+        )
+        code, r = self.check([c()], verify=True, tier="high")
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["tier"], "high")
+        self.assertEqual(r["verify_mode"], "blind+audit")
+        self.assertEqual(r["verification"]["router_tier"], "complex")
+        self.assertEqual(r["verification"]["model"], "gemini-4-argon-high")
+        self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind+audit")
+        self.assertTrue(r["verification"]["claims"]["c1"]["source_match"])
+        self.assertTrue(r["verification"]["claims"]["c1"]["result_match"])
+        self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
+
+    def test_high_tier_blocks_unfiltered_blind_match_when_audit_rejects_result_match(self):
+        # Both sides return the exact same row ("1"), yet the audit rejects result_matches_statement.
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit(result_matches_statement=False, verdict="approve")]},
+        )
+        code, r = self.check([c()], verify=True, tier="high")
+        self.assertEqual(code, 1)
+        self.assertTrue(any("result does not match" in p for p in self.problems(r, "c1")))
+        self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
+
+    def test_high_tier_positive_polarity_matches_even_with_different_column_output(self):
+        # Author outputs "1" and blind outputs "2"; both predicate queries returned rows from the same source.
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat two.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit()]},
+        )
+        code, r = self.check([c(command="cat one.txt")], verify=True, tier="high")
+        self.assertEqual(code, 0, r)
+        e = r["verification"]["claims"]["c1"]
+        self.assertTrue(e["source_match"])
+        self.assertTrue(e["result_match"])
+        self.assertFalse(e["hash_match"])
+
+    def test_auto_tier_infers_high_for_db_target_and_routes_critical_claude_verifier(self):
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit()]},
+        )
+        code, r = self.check([c()], target="db:lis_core_v7.clinic", verify=True, author_family="gemini")
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["tier"], "high")
+        self.assertEqual(r["verification"]["router_tier"], "critical")
+        self.assertEqual(r["verification"]["family"], "claude")
+        self.assertEqual(r["verification"]["model"], "opus")
+        self.assertEqual(r["verification"]["effort"], "xhigh")
+
+    def test_auto_tier_infers_high_for_category_d_or_f_claims(self):
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit()]},
+        )
+        code, r = self.check([c(category="D", cross_check_command=HAS_DATA)], target="slack:C1", verify=True)
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["tier"], "high")
+        self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
+
+    def test_tier_low_and_conflicting_verify_flag(self):
+        code, r = self.check([c()], tier="low")
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["tier"], "low")
+        self.assertEqual(r["verify_mode"], "none")
+        self.assertNotIn("verification", r)
+        self.assertEqual(self.prompts_seen(), [])
+        code2, r2 = self.check([c()], verify=True, tier="low")
+        self.assertEqual(code2, 1)
+        self.assertTrue(any("cannot be combined" in p for p in r2["problems"]))
+
+    def test_spec_tier_enables_dual_verification_without_explicit_verify_flag(self):
+        self.set_scenario(audit={"claims": [_ok_audit()]})
+        code, r = self.check([c()], spec_extra={"tier": "standard"})
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r["tier"], "standard")
+        self.assertEqual([p["step"] for p in self.prompts_seen()], ["audit"])
+
+    def test_negative_claim_with_blind_expecting_data_sets_result_match_false(self):
         # The author says "nothing exists"; the verifier wrote a presence probe (expect=data) that came
-        # back empty. That is the verifier's probe failing, not agreement.
+        # back empty. Even with an approving audit payload, the polarity mismatch must fail closed.
         self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat empty.txt", "expect": "data"}]},
-                          audit={"claims": []})
-        code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)], verify=True)
+                          audit={"claims": [_ok_audit()]})
+        code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)],
+                             verify=True, tier="high")
         self.assertEqual(code, 1)
         e = r["verification"]["claims"]["c1"]
         self.assertFalse(e["result_match"])
-        self.assertNotEqual(e.get("by"), "blind-equivalent")
+        self.assertTrue(e["blind_contradicted"])
+        self.assertTrue(any("blind probe contradicted" in p for p in self.problems(r, "c1")))
         self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
 
-    def test_positive_claim_with_blind_expecting_empty_goes_to_audit(self):
+    def test_positive_claim_with_blind_expecting_empty_sets_result_match_false(self):
         self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "empty"}]},
-                          audit={"claims": []})
-        code, r = self.check([c(command="cat one.txt")], verify=True)
+                          audit={"claims": [_ok_audit()]})
+        code, r = self.check([c(command="cat one.txt")], verify=True, tier="high")
         self.assertEqual(code, 1)
-        self.assertFalse(r["verification"]["claims"]["c1"]["result_match"])
+        e = r["verification"]["claims"]["c1"]
+        self.assertFalse(e["result_match"])
+        self.assertTrue(e["blind_contradicted"])
+        self.assertTrue(any("blind probe contradicted" in p for p in self.problems(r, "c1")))
 
     def test_verifier_commands_run_without_a_shell(self):
         run = fc.run_command("echo $HOME", 5, self.dir, shell=False)
@@ -345,54 +451,61 @@ class DualModelTest(Base):
         self.assertFalse((self.dir / "pwned").exists())
         self.assertEqual(fc.run_command("no-such-binary-xyz", 5, self.dir, shell=False)["exit_code"], 127)
 
-    def test_blind_prompt_hides_author_evidence(self):
-        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]})
-        self.check([c(command="echo secret-author-output-123", source="secret.authortable")], verify=True)
+    def test_blind_prompt_hides_author_evidence_and_requires_predicate_query(self):
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit()]},
+        )
+        self.check([c(command="echo secret-author-output-123", source="secret.authortable")], verify=True, tier="high")
         blind = self.prompts_seen()[0]["prompt"]
         self.assertIn(f"working directory {self.dir}", blind)
+        self.assertIn("predicate-filtered", blind)
         self.assertNotIn("secret-author-output-123", blind)
         self.assertNotIn("secret.authortable", blind)
 
     def test_divergence_goes_to_audit_and_passes_when_approved(self):
         self.set_scenario(
             blind={"claims": [{"id": "c1", "source": "other.place", "command": "cat two.txt", "expect": "data"}]},
-            audit={"claims": [{"id": "c1", "source_is_ground_truth": True, "command_proves_statement": True,
-                               "counterexample_commands": [{"command": "cat empty.txt", "why": "should be empty"}],
-                               "verdict": "approve"}]},
+            audit={"claims": [_ok_audit(counterexample_commands=[{"command": "cat empty.txt", "why": "should be empty"}])]},
         )
-        code, r = self.check([c()], verify=True)
+        code, r = self.check([c()], verify=True, tier="high")
         self.assertEqual(code, 0, r)
-        self.assertEqual(r["verification"]["claims"]["c1"]["by"], "audit")
+        self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind+audit")
         self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
 
     def test_counterexample_with_data_disproves(self):
         self.set_scenario(
-            blind={"claims": [{"id": "c1", "source": "other.place", "command": "cat two.txt", "expect": "data"}]},
-            audit={"claims": [{"id": "c1", "source_is_ground_truth": True, "command_proves_statement": True,
-                               "counterexample_commands": [{"command": "cat found.txt"}], "verdict": "approve"}]},
+            audit={"claims": [_ok_audit(counterexample_commands=[{"command": "cat found.txt"}])]},
         )
-        code, r = self.check([c()], verify=True)
+        code, r = self.check([c()], verify=True, tier="standard")
         self.assertEqual(code, 1)
         self.assertTrue(any("counterexample" in p for p in self.problems(r, "c1")))
 
-    def test_audit_rejects_source(self):
+    def test_audit_rejects_source_and_missing_result_match(self):
         self.set_scenario(
-            blind={"claims": [{"id": "c1", "source": "master.table", "command": "cat two.txt", "expect": "data"}]},
             audit={"claims": [{"id": "c1", "source_is_ground_truth": False, "command_proves_statement": True,
-                               "verdict": "reject"}]},
+                               "result_matches_statement": True, "verdict": "reject"}]},
         )
-        code, r = self.check([c(source="label.column")], verify=True)
+        code, r = self.check([c(source="label.column")], verify=True, tier="standard")
         self.assertEqual(code, 1)
         self.assertTrue(any("not ground truth" in p for p in self.problems(r, "c1")))
+
+        # Omitting result_matches_statement fails closed even when verdict is approve.
+        self.set_scenario(
+            audit={"claims": [{"id": "c1", "source_is_ground_truth": True, "command_proves_statement": True,
+                               "verdict": "approve"}]},
+        )
+        code2, r2 = self.check([c()], verify=True, tier="standard")
+        self.assertEqual(code2, 1)
+        self.assertTrue(any("result does not match" in p for p in self.problems(r2, "c1")))
 
     def test_write_command_from_verifier_is_refused_not_run(self):
         marker = self.dir / "should-not-exist"
         self.set_scenario(
             blind={"claims": [{"id": "c1", "source": SRC, "command": f"touch {marker}", "expect": "data"}]},
-            audit={"claims": [{"id": "c1", "source_is_ground_truth": True, "command_proves_statement": True,
-                               "counterexample_commands": [{"command": f"rm -rf {self.dir}"}], "verdict": "approve"}]},
+            audit={"claims": [_ok_audit(counterexample_commands=[{"command": f"rm -rf {self.dir}"}])]},
         )
-        code, r = self.check([c()], verify=True)
+        code, r = self.check([c()], verify=True, tier="high")
         self.assertFalse(marker.exists())
         self.assertTrue(self.dir.exists())
         e = r["verification"]["claims"]["c1"]
@@ -401,53 +514,59 @@ class DualModelTest(Base):
         self.assertEqual(code, 0)
 
     def test_phi_mode_keeps_output_out_of_audit_prompt(self):
-        self.set_scenario(
-            blind={"claims": [{"id": "c1", "source": "x.y", "command": "cat two.txt", "expect": "data"}]},
-            audit={"claims": [{"id": "c1", "source_is_ground_truth": True, "command_proves_statement": True, "verdict": "approve"}]},
-        )
-        self.check([c(command="cat phi.txt")], verify=True, registry=REGISTRY)
+        self.set_scenario(audit={"claims": [_ok_audit()]})
+        self.check([c(command="cat phi.txt")], verify=True, tier="standard", registry=REGISTRY)
         audit = [p for p in self.prompts_seen() if p["step"] == "audit"][0]["prompt"]
         self.assertNotIn("PATIENT-JANE-DOE", audit)
+        self.assertIn("result_matches_statement", audit)
         self.prompts.unlink()
-        self.check([c(command="cat phi.txt")], verify=True, phi=False)
+        self.check([c(command="cat phi.txt")], verify=True, tier="standard", phi=False)
         audit = [p for p in self.prompts_seen() if p["step"] == "audit"][0]["prompt"]
         self.assertIn("PATIENT-JANE-DOE", audit)
 
     def test_negative_claim_equivalent_when_both_empty(self):
-        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": "cat empty.txt", "expect": "empty"}]})
-        code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)], verify=True)
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat empty.txt", "expect": "empty"}]},
+            audit={"claims": [_ok_audit()]},
+        )
+        code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)],
+                             verify=True, tier="high")
         self.assertEqual(code, 0, r)
+        self.assertTrue(r["verification"]["claims"]["c1"]["result_match"])
 
-    def test_negative_grep_no_match_is_blind_equivalent(self):
-        # Both sides run a grep that finds nothing (exit 1, no output); that agrees without an audit.
+    def test_negative_grep_no_match_is_result_match_in_high_tier(self):
         grep = "grep -n no-such-text one.txt"
-        self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": grep, "expect": "empty"}]})
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": grep, "expect": "empty"}]},
+            audit={"claims": [_ok_audit()]},
+        )
         code, r = self.check([c(category="C", kind="negative", command=f"grep -n no-such-text {self.dir / 'one.txt'}",
-                                control_command=HAS_DATA)], verify=True)
+                                control_command=HAS_DATA)], verify=True, tier="high")
         self.assertEqual(code, 0, r)
-        self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind-equivalent")
+        self.assertTrue(r["verification"]["claims"]["c1"]["result_match"])
+        self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind+audit")
 
-    def assert_negative_blind_goes_to_audit(self, blind_command):
+    def assert_negative_blind_fails_result_match(self, blind_command):
         self.set_scenario(blind={"claims": [{"id": "c1", "source": SRC, "command": blind_command, "expect": "empty"}]},
                           audit={"claims": []})
-        code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)], verify=True)
+        code, r = self.check([c(category="C", kind="negative", command=EMPTY, control_command=HAS_DATA)],
+                             verify=True, tier="high")
         self.assertEqual(code, 1, r)
         e = r["verification"]["claims"]["c1"]
         self.assertIs(e["result_match"], False)
-        self.assertNotEqual(e.get("by"), "blind-equivalent")
         self.assertEqual([p["step"] for p in self.prompts_seen()], ["blind", "audit"])
 
-    def test_negative_blind_probe_with_data_goes_to_audit(self):
+    def test_negative_blind_probe_with_data_sets_result_match_false(self):
         # The verifier's absence probe exits 0 but returns a row, which contradicts the claim.
-        self.assert_negative_blind_goes_to_audit("grep -n 1 one.txt")
+        self.assert_negative_blind_fails_result_match("grep -n 1 one.txt")
 
-    def test_negative_blind_probe_that_errors_goes_to_audit(self):
+    def test_negative_blind_probe_that_errors_sets_result_match_false(self):
         # cat on a missing file exits 1 with no stdout but with stderr: an error, not grep's no-match.
         self.assertFalse((self.dir / "missing.txt").exists())
-        self.assert_negative_blind_goes_to_audit("cat missing.txt")
+        self.assert_negative_blind_fails_result_match("cat missing.txt")
 
     def test_same_family_refused_and_verifier_error_fails_closed(self):
-        self.set_scenario(blind={"claims": []})
+        self.set_scenario(blind={"claims": []}, audit={"claims": []})
         code, r = self.check([c()], verify=True, author_family="claude", verifier_family="claude")
         self.assertEqual(code, 1)
         self.assertTrue(any("different model family" in p for p in r["problems"]))
@@ -456,10 +575,66 @@ class DualModelTest(Base):
         self.assertEqual(code, 1)
         self.assertEqual(r["verification"]["status"], "error")
 
-    def test_missing_blind_answer_requires_audit(self):
+    def test_missing_audit_answer_fails(self):
         self.set_scenario(blind={"claims": []}, audit={"claims": []})
-        code, r = self.check([c()], verify=True)
+        code, r = self.check([c()], verify=True, tier="high")
         self.assertEqual(code, 1)
+
+    def test_clean_blind_contradiction_blocks_even_when_audit_approves(self):
+        # Author's positive claim returned data, while a clean blind probe returned empty -> must fail closed
+        # even if the auditor returns approve.
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat empty.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit()]},
+        )
+        code, r = self.check([c(command="cat one.txt")], verify=True, tier="high")
+        self.assertEqual(code, 1)
+        self.assertTrue(r["verification"]["claims"]["c1"]["blind_contradicted"])
+        self.assertTrue(any("blind probe contradicted" in p for p in self.problems(r, "c1")))
+
+    def test_blind_runtime_error_defers_to_audit_when_approved(self):
+        # Blind command errored (missing file, exit != 0): not a clean contradiction, so audit decides.
+        self.set_scenario(
+            blind={"claims": [{"id": "c1", "source": SRC, "command": "cat missing.txt", "expect": "data"}]},
+            audit={"claims": [_ok_audit()]},
+        )
+        code, r = self.check([c(command="cat one.txt")], verify=True, tier="high")
+        self.assertEqual(code, 0, r)
+        self.assertFalse(r["verification"]["claims"]["c1"]["blind_contradicted"])
+
+    def test_router_error_fails_closed_with_receipt_and_no_hardcoded_default_dict(self):
+        self.assertFalse(hasattr(fc, "DEFAULT_VERIFIER_MODEL"))
+        orig = fc.select_verifier_model
+        def boom(*_a, **_kw):
+            raise RuntimeError("simulated router import failure")
+        fc.select_verifier_model = boom
+        try:
+            code, r = self.check([c()], verify=True, tier="standard")
+        finally:
+            fc.select_verifier_model = orig
+        self.assertEqual(code, 1)
+        self.assertEqual(r["status"], "fail")
+        self.assertEqual(r["verification"]["status"], "error")
+        self.assertIn("simulated router import failure", r["verification"]["error"])
+        self.assertTrue(Path(r["receipt_path"]).is_file())
+
+    def test_unchecked_only_claims_cannot_pass_dual_model_tier(self):
+        # A claims file with zero verified claims must fail dual-model tiers instead of writing a
+        # signed high-tier receipt with zero verifier calls.
+        self.set_scenario(blind={"claims": []}, audit={"claims": []})
+        code, r = self.check([{"id": "u1", "label": "unchecked", "text": "unverified guess"}],
+                             target="db:orders", verify=True, tier="high")
+        self.assertEqual(code, 1)
+        self.assertEqual(r["status"], "fail")
+        self.assertFalse(r["dual_model"])
+        self.assertEqual(r["verification"]["calls"], [])
+        self.assertEqual(self.prompts_seen(), [])
+        self.assertTrue(any("at least one passing verified claim" in p for p in r["problems"]))
+
+    def test_unknown_tier_in_claims_spec_fails(self):
+        code, r = self.check([c()], spec_extra={"tier": "bogus"})
+        self.assertEqual(code, 1)
+        self.assertTrue(any("unknown tier" in p for p in r["problems"]))
 
 
 class ClaudeVerifierConfinementTest(Base):
@@ -544,8 +719,10 @@ class HookIntegrationTest(Base):
         key.write_text("s3cret-for-test-0123456789abcdef\n")
         key.chmod(0o600)
         os.environ["PAF_CONSENSUS_KEY_FILE"] = str(key)
-        self.scenario.write_text(json.dumps({"blind": {"claims": [
-            {"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]}, "audit": {"claims": []}}))
+        self.scenario.write_text(json.dumps({
+            "blind": {"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]},
+            "audit": {"claims": [_ok_audit()]},
+        }))
         code, r = self.check([c()], target="slack:C1", verify=True)
         self.assertEqual(code, 0, r)
         self.assertTrue(r["signed"])

@@ -283,7 +283,7 @@ def main() -> int:
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
         f"open({str(agy_args_file)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
-        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'Critical review ok.'}\n"
+        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'test_source_is_ground_truth': True, 'tests_prove_change': True, 'test_counterexamples': [], 'prose': 'Critical review ok.'}\n"
         "print(json.dumps({'conversation_id': 'agy-mr-1', 'status': 'DONE', 'structured_output': resp}))\n",
         encoding="utf-8",
     )
@@ -293,7 +293,7 @@ def main() -> int:
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
         f"open({str(claude_args_file)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
-        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'Claude review ok.'}\n"
+        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'test_source_is_ground_truth': True, 'tests_prove_change': True, 'test_counterexamples': [], 'prose': 'Claude review ok.'}\n"
         "print(json.dumps({'session_id': 'claude-mr-1', 'is_error': False, 'structured_output': resp}))\n",
         encoding="utf-8",
     )
@@ -443,9 +443,9 @@ def main() -> int:
         "with log_p.open('a') as fh:\n"
         "    fh.write(json.dumps({'cli': 'claude', 'round': rev_n, 'model': m, 'effort': e}) + '\\n')\n"
         "if rev_n == 1:\n"
-        "    out = {'verdict': 'request_changes', 'blocking_count': 1, 'needs_human_decision': False, 'prose': 'Add note.'}\n"
+        "    out = {'verdict': 'request_changes', 'blocking_count': 1, 'needs_human_decision': False, 'test_source_is_ground_truth': True, 'tests_prove_change': False, 'test_counterexamples': [{'test_or_claim': 'note', 'counterexample': 'missing note', 'blocking': True}], 'prose': 'Add note.'}\n"
         "else:\n"
-        "    out = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'Approved.'}\n"
+        "    out = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'test_source_is_ground_truth': True, 'tests_prove_change': True, 'test_counterexamples': [], 'prose': 'Approved.'}\n"
         "print(json.dumps({'session_id': sid, 'is_error': False, 'structured_output': out}))\n",
         encoding="utf-8",
     )
@@ -839,7 +839,7 @@ def main() -> int:
         "sid = args[args.index('--resume') + 1] if '--resume' in args else args[args.index('--session-id') + 1]\n"
         "with log_p.open('a') as fh:\n"
         "    fh.write(json.dumps({'model': m, 'effort': e}) + '\\n')\n"
-        "out = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'Approved on re-drive.'}\n"
+        "out = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'test_source_is_ground_truth': True, 'tests_prove_change': True, 'test_counterexamples': [], 'prose': 'Approved on re-drive.'}\n"
         "print(json.dumps({'session_id': sid, 'is_error': False, 'structured_output': out}))\n",
         encoding="utf-8",
     )

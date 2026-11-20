@@ -105,12 +105,39 @@ REVIEW_JSON_SCHEMA: dict[str, Any] = {
         "needs_human_decision": {
             "type": "boolean",
         },
+        "test_source_is_ground_truth": {
+            "type": "boolean",
+        },
+        "tests_prove_change": {
+            "type": "boolean",
+        },
+        "test_counterexamples": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "test_or_claim": {"type": "string", "minLength": 1},
+                    "counterexample": {"type": "string", "minLength": 1},
+                    "blocking": {"type": "boolean"},
+                },
+                "required": ["test_or_claim", "counterexample", "blocking"],
+                "additionalProperties": False,
+            },
+        },
         "prose": {
             "type": "string",
             "minLength": 1,
         },
     },
-    "required": ["verdict", "blocking_count", "needs_human_decision", "prose"],
+    "required": [
+        "verdict",
+        "blocking_count",
+        "needs_human_decision",
+        "test_source_is_ground_truth",
+        "tests_prove_change",
+        "test_counterexamples",
+        "prose",
+    ],
     "additionalProperties": False,
 }
 REVIEW_JSON_SCHEMA_STR = json.dumps(REVIEW_JSON_SCHEMA, separators=(",", ":"))
@@ -653,6 +680,20 @@ def _parse_last_json_dict(stdout: str) -> dict[str, Any]:
     raise RuntimeError(f"Model CLI output did not contain a valid JSON envelope: {stripped[:300]}")
 
 
+def _coerce_bool_field(val: Any, field_name: str) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and val in (0, 1):
+        return bool(val)
+    if isinstance(val, str):
+        low = val.strip().lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no"):
+            return False
+    raise RuntimeError(f"Structured review output missing boolean {field_name!r}")
+
+
 def _normalize_structured_review(raw: Any, session_id: str) -> dict[str, Any]:
     if isinstance(raw, str):
         raw = json.loads(raw)
@@ -661,8 +702,38 @@ def _normalize_structured_review(raw: Any, session_id: str) -> dict[str, Any]:
     verdict = str(raw.get("verdict") or "").strip().lower()
     if verdict not in ("approve", "request_changes"):
         raise RuntimeError(f"Invalid review verdict {verdict!r}")
+    test_source_ok = _coerce_bool_field(raw.get("test_source_is_ground_truth"), "test_source_is_ground_truth")
+    tests_prove_ok = _coerce_bool_field(raw.get("tests_prove_change"), "tests_prove_change")
+    raw_ces = raw.get("test_counterexamples")
+    if isinstance(raw_ces, str):
+        try:
+            raw_ces = json.loads(raw_ces)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Structured review output has unparsable 'test_counterexamples': {exc}") from exc
+    if not isinstance(raw_ces, list):
+        raise RuntimeError("Structured review output missing list 'test_counterexamples'")
+    counterexamples: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw_ces):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"test_counterexamples[{idx}] must be an object")
+        target = str(item.get("test_or_claim") or "").strip()
+        ce_text = str(item.get("counterexample") or "").strip()
+        if not target or not ce_text:
+            raise RuntimeError(f"test_counterexamples[{idx}] requires non-empty test_or_claim and counterexample")
+        blocking_flag = _coerce_bool_field(item.get("blocking"), f"test_counterexamples[{idx}].blocking")
+        counterexamples.append({
+            "test_or_claim": target,
+            "counterexample": ce_text,
+            "blocking": blocking_flag,
+        })
+
+    blocking_ces = [c for c in counterexamples if c["blocking"]]
     blocking_count = int(raw.get("blocking_count") or 0)
     needs_human = bool(raw.get("needs_human_decision", False))
+    gate_failures = len(blocking_ces) + (0 if test_source_ok else 1) + (0 if tests_prove_ok else 1)
+    if gate_failures > 0:
+        verdict = "request_changes"
+        blocking_count = max(blocking_count, gate_failures)
     if verdict == "approve" and (blocking_count > 0 or needs_human):
         verdict = "request_changes"
     if verdict == "request_changes" and blocking_count == 0 and not needs_human:
@@ -672,9 +743,39 @@ def _normalize_structured_review(raw: Any, session_id: str) -> dict[str, Any]:
         "verdict": verdict,
         "blocking_count": max(0, blocking_count),
         "needs_human_decision": needs_human,
+        "test_source_is_ground_truth": test_source_ok,
+        "tests_prove_change": tests_prove_ok,
+        "test_counterexamples": counterexamples,
         "prose": prose,
         "session_id": session_id,
     }
+
+
+def _format_review_comment_prose(review_result: dict[str, Any]) -> str:
+    prose = str(review_result.get("prose") or "").strip()
+    source_ok = review_result.get("test_source_is_ground_truth", True)
+    proves_ok = review_result.get("tests_prove_change", True)
+    ces = review_result.get("test_counterexamples") or []
+    if source_ok and proves_ok and not ces:
+        return prose
+    lines = [
+        "### Verification Audit",
+        f"- `test_source_is_ground_truth`: `{str(bool(source_ok)).lower()}`",
+        f"- `tests_prove_change`: `{str(bool(proves_ok)).lower()}`",
+    ]
+    for item in ces:
+        tag = "BLOCKING" if item.get("blocking") else "note"
+        lines.append(f"- [{tag}] `{item.get('test_or_claim', '')}`: {item.get('counterexample', '')}")
+    return prose + "\n\n" + "\n".join(lines)
+
+
+def _review_contains_secret(review_result: dict[str, Any], secret: str | None) -> bool:
+    if contains_secret_material(str(review_result.get("prose") or ""), secret):
+        return True
+    ces = review_result.get("test_counterexamples") or []
+    if ces and contains_secret_material(json.dumps(ces, ensure_ascii=False), secret):
+        return True
+    return False
 
 
 def _normalize_structured_author_turn(raw: Any, session_id: str) -> dict[str, Any]:
@@ -720,7 +821,11 @@ def build_followup_review_prompt(
         "raised in the prior round is resolved without regressions, and return ONLY the required JSON schema.\n"
         "Rules:\n"
         "- Do NOT attempt to modify files, run git push, or call gh CLI.\n"
-        "- Set verdict='approve' with blocking_count=0 if all blocking issues are resolved and the branch is safe to merge.\n"
+        "- Re-evaluate the three required verification fields on the new commit: `test_source_is_ground_truth`, "
+        "`tests_prove_change`, and `test_counterexamples` (drop resolved counterexamples; keep only unresolved "
+        "blocking ones or non-blocking notes).\n"
+        "- Set verdict='approve' with blocking_count=0 if all blocking issues are resolved, both verification "
+        "booleans are true, no counterexample has blocking=true, and the branch is safe to merge.\n"
         "- Set verdict='request_changes' with blocking_count>=1 ONLY if concrete blocking defects remain or were introduced.\n"
         "- Set needs_human_decision=true ONLY if a genuine product/UX trade-off requires human input.\n\n"
         f"Author Reply (Round {round_num}):\n{author_reply[:6000]}\n\n"
@@ -815,14 +920,21 @@ def build_review_prompt(
         "call is denied and ends your turn with nothing returned. The full diff is below; read any other file "
         "with your file-reading and search tools.\n"
         "- Batch independent Read/Grep calls in parallel so you finish well within the turn budget.\n"
-        "- Attack the tests, not only the code: for each new or changed test, name a concrete way the code could "
-        "still be wrong while that test passes (a mocked boundary, a branch never exercised, an assertion that "
-        "would also hold on the base commit, a time or NULL edge). If such a gap would let a real defect ship, it "
-        "is blocking: say which test case would close it. A test that would pass without the change proves nothing "
-        "(`paf tests-fail-on-base` checks this mechanically).\n"
+        "- Attack the tests, not only the code, and populate all three required verification fields in the JSON schema:\n"
+        "  1. `test_source_is_ground_truth`: true only when tests exercise the real code/boundary without mocking "
+        "away the changed logic; for environment-bound changes (external tools, schemas, deploy, permissions), "
+        "unit mocks alone are not ground truth and require live/staging verification evidence (docs-only changes "
+        "set true).\n"
+        "  2. `tests_prove_change`: true only when the tests actually prove the PR's stated fix or behavior and "
+        "would fail on a regression (pure refactors prove behavior preservation; docs-only changes set true).\n"
+        "  3. `test_counterexamples`: for each new or changed test, list concrete scenarios where the code could "
+        "still be wrong while that test passes (a mocked boundary, an unexercised branch, an assertion that also "
+        "passes on the base commit, a NULL/empty/timezone edge). Set `blocking: true` if that gap could let a "
+        "real defect ship; any `blocking: true` item or `false` boolean mechanically forces `request_changes`.\n"
         "- Every factual claim in the PR description (counts, 'X is unused', 'Y already exists', results) needs "
         "evidence in the diff or description; treat an unsupported claim like an untested branch.\n"
-        "- Set verdict='approve' with blocking_count=0 ONLY if the change is safe, tested, and ready to merge.\n"
+        "- Set verdict='approve' with blocking_count=0 ONLY if the change is safe, tested, both verification "
+        "booleans are true, no counterexample has blocking=true, and it is ready to merge.\n"
         "- Set verdict='request_changes' with blocking_count>=1 for concrete defects, security holes, or missing tests.\n"
         "- Set needs_human_decision=true ONLY if a genuine product/UX trade-off or policy ambiguity requires human input.\n"
         "- Write clear, concise English review notes in `prose`.\n\n"
@@ -2772,7 +2884,7 @@ def run_consensus_dialogue(
                     reviewer_session_started = True
                     _sync_active_registry()
 
-                if contains_secret_material(rev_res["prose"], secret):
+                if _review_contains_secret(rev_res, secret):
                     raise RuntimeError(
                         f"SECURITY BLOCK on {slug}#{pr_number}: reviewer prose contained secret/credential material."
                     )
@@ -2808,7 +2920,7 @@ def run_consensus_dialogue(
                 )
                 rev_comment = (
                     fb_banner
-                    + rev_res["prose"].strip()
+                    + _format_review_comment_prose(rev_res)
                     + "\n\n"
                     + f"<!-- paf-consensus: {json.dumps(rev_marker, separators=(',', ':'))} -->"
                 )
@@ -2848,7 +2960,7 @@ def run_consensus_dialogue(
                     repo_slug=slug,
                     pr_data=pr_data,
                     diff_stat=diff_stat,
-                    reviewer_prose=rev_res["prose"],
+                    reviewer_prose=_format_review_comment_prose(rev_res),
                     round_num=eff_round,
                     is_resume=author_session_started,
                 )
@@ -3513,7 +3625,7 @@ def watch_repo_once(
                     has_pending_work = True
                     continue
 
-                if contains_secret_material(review_result["prose"], secret):
+                if _review_contains_secret(review_result, secret):
                     has_pending_work = True
                     ledger[backoff_key] = (
                         dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=max(600, backoff_sec))
@@ -3562,7 +3674,7 @@ def watch_repo_once(
                 )
                 comment_body = (
                     fallback_banner
-                    + review_result["prose"].strip()
+                    + _format_review_comment_prose(review_result)
                     + "\n\n"
                     + f"<!-- paf-consensus: {json.dumps(marker, separators=(',', ':'))} -->"
                 )

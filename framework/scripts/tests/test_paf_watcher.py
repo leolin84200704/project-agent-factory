@@ -703,7 +703,7 @@ def main() -> int:
         f"open({str(args_dump)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
         f"open({str(key_mode_dump)!r}, 'w').write(oct(stat.S_IMODE(os.stat({str(key_file)!r}).st_mode)))\n"
         "print('[agy] booting sandbox...')\n"
-        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'All invariants hold.'}\n"
+        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'test_source_is_ground_truth': True, 'tests_prove_change': True, 'test_counterexamples': [], 'prose': 'All invariants hold.'}\n"
         "print(json.dumps({'conversation_id': 'agy-conv-777', 'status': 'DONE', 'response': json.dumps(resp)}))\n",
         encoding="utf-8",
     )
@@ -717,7 +717,7 @@ def main() -> int:
         "import json, os, sys\n"
         f"open({str(claude_env_dump)!r}, 'w').write(json.dumps(dict(os.environ)))\n"
         f"open({str(claude_args_dump)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
-        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'Claude fallback review ok.'}\n"
+        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'test_source_is_ground_truth': True, 'tests_prove_change': True, 'test_counterexamples': [], 'prose': 'Claude fallback review ok.'}\n"
         "print(json.dumps({'session_id': 'claude-sess-888', 'is_error': False, 'structured_output': resp}))\n",
         encoding="utf-8",
     )
@@ -1027,7 +1027,7 @@ def main() -> int:
     leaky_agy.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"
-        f"resp = {{'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'Leaked: {first_secret[:20]}'}}\n"
+        f"resp = {{'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'test_source_is_ground_truth': True, 'tests_prove_change': True, 'test_counterexamples': [], 'prose': 'Leaked: {first_secret[:20]}'}}\n"
         "print(json.dumps({'conversation_id': 'agy-leak-1', 'status': 'DONE', 'response': json.dumps(resp)}))\n",
         encoding="utf-8",
     )
@@ -1091,7 +1091,7 @@ def main() -> int:
     gh_leaky_agy.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"
-        f"resp = {{'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'Token {fake_gh_tok} here'}}\n"
+        f"resp = {{'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'test_source_is_ground_truth': True, 'tests_prove_change': True, 'test_counterexamples': [], 'prose': 'Token {fake_gh_tok} here'}}\n"
         "print(json.dumps({'conversation_id': 'agy-gh-leak', 'status': 'DONE', 'response': json.dumps(resp)}))\n",
         encoding="utf-8",
     )
@@ -1398,7 +1398,7 @@ if n == 1:
     (dlg_cwd_file := pathlib.Path({str(dlg_root / 'rev_cwd.txt')!r})).write_text(str(cwd))
     with trace.open("a", encoding="utf-8") as fh:
         fh.write(f"review_1:init:{{sid}}\\n")
-    out = {{"verdict": "request_changes", "blocking_count": 1, "needs_human_decision": False, "prose": "Please add fix1.txt."}}
+    out = {{"verdict": "request_changes", "blocking_count": 1, "needs_human_decision": False, "test_source_is_ground_truth": True, "tests_prove_change": False, "test_counterexamples": [{{"test_or_claim": "fix1", "counterexample": "missing fix1.txt", "blocking": True}}], "prose": "Please add fix1.txt."}}
 elif n == 2:
     assert "--resume" in args and "--session-id" not in args, f"Round 2 expected --resume, got {{args}}"
     sid = args[args.index("--resume") + 1]
@@ -1406,7 +1406,7 @@ elif n == 2:
     assert (cwd / "fix1.txt").is_file(), "Expected fix1.txt in reviewer worktree on Round 2"
     with trace.open("a", encoding="utf-8") as fh:
         fh.write(f"review_2:resume:{{sid}}\\n")
-    out = {{"verdict": "request_changes", "blocking_count": 1, "needs_human_decision": False, "prose": "Good, now also add fix2.txt."}}
+    out = {{"verdict": "request_changes", "blocking_count": 1, "needs_human_decision": False, "test_source_is_ground_truth": True, "tests_prove_change": False, "test_counterexamples": [{{"test_or_claim": "fix2", "counterexample": "missing fix2.txt", "blocking": True}}], "prose": "Good, now also add fix2.txt."}}
 else:
     assert "--resume" in args and "--session-id" not in args, f"Round 3 expected --resume, got {{args}}"
     sid = args[args.index("--resume") + 1]
@@ -1414,7 +1414,7 @@ else:
     assert (cwd / "fix1.txt").is_file() and (cwd / "fix2.txt").is_file(), "Expected fix1.txt and fix2.txt on Round 3"
     with trace.open("a", encoding="utf-8") as fh:
         fh.write(f"review_3:resume:{{sid}}\\n")
-    out = {{"verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "All issues resolved in persistent session. Approved."}}
+    out = {{"verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "test_source_is_ground_truth": True, "tests_prove_change": True, "test_counterexamples": [], "prose": "All issues resolved in persistent session. Approved."}}
 
 print(json.dumps({{"type": "result", "is_error": False, "session_id": sid, "structured_output": out}}))
 """,
@@ -1710,7 +1710,7 @@ print(json.dumps({{"status": "DONE", "conversation_id": sid, "structured_output"
         """#!/usr/bin/env python3
 import json
 print(json.dumps({"type": "result", "is_error": False, "session_id": "", "structured_output": {
-    "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "ok"
+    "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "test_source_is_ground_truth": True, "tests_prove_change": True, "test_counterexamples": [], "prose": "ok"
 }}))
 """,
         encoding="utf-8",
@@ -1724,7 +1724,7 @@ print(json.dumps({"type": "result", "is_error": False, "session_id": "", "struct
 import json, sys
 open({str(empty_sid_agy_args)!r}, "w").write(json.dumps(sys.argv[1:]))
 print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output": {{
-    "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "ok"
+    "verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "test_source_is_ground_truth": True, "tests_prove_change": True, "test_counterexamples": [], "prose": "ok"
 }}}}))
 """,
         encoding="utf-8",
@@ -1803,6 +1803,130 @@ print(json.dumps({{"status": "DONE", "conversation_id": "", "structured_output":
         failures += 1
     else:
         print("PASS 13 empty agy review names the denied tool calls instead of a JSON parse error")
+
+    # 14. Structured review verification gate enforces required fields, flips approve -> request_changes on
+    #     mock-only source, unproven change, or blocking counterexample, and scans counterexamples for secrets.
+    s14_ok = True
+    try:
+        paf_watcher._normalize_structured_review(
+            {"verdict": "approve", "blocking_count": 0, "needs_human_decision": False, "prose": "missing fields"},
+            "sid-14",
+        )
+        s14_ok = False
+    except RuntimeError:
+        pass
+    r_mock = paf_watcher._normalize_structured_review(
+        {
+            "verdict": "approve",
+            "blocking_count": 0,
+            "needs_human_decision": False,
+            "test_source_is_ground_truth": False,
+            "tests_prove_change": True,
+            "test_counterexamples": [],
+            "prose": "looks fine",
+        },
+        "sid-14",
+    )
+    r_ce = paf_watcher._normalize_structured_review(
+        {
+            "verdict": "approve",
+            "blocking_count": 0,
+            "needs_human_decision": False,
+            "test_source_is_ground_truth": True,
+            "tests_prove_change": True,
+            "test_counterexamples": [
+                {"test_or_claim": "test_null", "counterexample": "middle_name=None crashes", "blocking": True}
+            ],
+            "prose": "almost ok",
+        },
+        "sid-14",
+    )
+    r_note = paf_watcher._normalize_structured_review(
+        {
+            "verdict": "approve",
+            "blocking_count": 0,
+            "needs_human_decision": False,
+            "test_source_is_ground_truth": True,
+            "tests_prove_change": True,
+            "test_counterexamples": [
+                {"test_or_claim": "test_add", "counterexample": "non-blocking note", "blocking": False}
+            ],
+            "prose": "approved",
+        },
+        "sid-14",
+    )
+    r_drift = paf_watcher._normalize_structured_review(
+        {
+            "verdict": "approve",
+            "blocking_count": 0,
+            "needs_human_decision": False,
+            "test_source_is_ground_truth": True,
+            "tests_prove_change": True,
+            "test_counterexamples": json.dumps([
+                {"test_or_claim": "test_drift", "counterexample": "string blocking flag", "blocking": "true"}
+            ]),
+            "prose": "drift check",
+        },
+        "sid-14",
+    )
+    fmt_ce = paf_watcher._format_review_comment_prose(r_ce)
+    ce_secret_hit = paf_watcher._review_contains_secret(
+        {
+            "prose": "clean",
+            "test_counterexamples": [
+                {"test_or_claim": "t", "counterexample": f"leaked {first_secret[:20]}", "blocking": False}
+            ],
+        },
+        first_secret,
+    )
+    # End-to-end watch_repo_once fails closed when reviewer omits the new required verification fields.
+    missing_fields_agy = mock_bin / "agy_missing_verif_fields"
+    missing_fields_agy.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "resp = {'verdict': 'approve', 'blocking_count': 0, 'needs_human_decision': False, 'prose': 'missing fields'}\n"
+        "print(json.dumps({'conversation_id': 'agy-miss-14', 'status': 'DONE', 'response': json.dumps(resp)}))\n",
+        encoding="utf-8",
+    )
+    missing_fields_agy.chmod(0o755)
+    bus_miss = paf_watcher.InMemoryGitHubBus(
+        repo_path=repo1,
+        prs={42: make_pr_json(sha1, author_comment, [])},
+        etag='W/"etag-miss-14"',
+        key_file=key_file,
+    )
+    act_miss = paf_watcher.watch_repo_once(
+        repo=repo1,
+        repo_slug="leolin84200704/demo",
+        host_id="personal-mac",
+        families=("gemini",),
+        state_dir=_mkdtemp("paf-watch-miss14-"),
+        key_file=key_file,
+        bus=bus_miss,
+        claude_bin=str(fake_claude),
+        agy_bin=str(missing_fields_agy),
+        claim_settle_sec=0.0,
+    )
+    if (
+        not s14_ok
+        or r_mock["verdict"] != "request_changes"
+        or r_mock["blocking_count"] < 1
+        or r_ce["verdict"] != "request_changes"
+        or r_ce["blocking_count"] < 1
+        or r_note["verdict"] != "approve"
+        or r_drift["verdict"] != "request_changes"
+        or r_drift["blocking_count"] < 1
+        or r_drift["test_counterexamples"][0]["blocking"] is not True
+        or "### Verification Audit" not in fmt_ce
+        or "middle_name=None crashes" not in fmt_ce
+        or not ce_secret_hit
+        or act_miss.get("reviewed") != []
+        or any("paf-consensus" in body for _, body in bus_miss.comments_posted)
+    ):
+        print(f"FAIL 14 structured verification gate: s14_ok={s14_ok} r_mock={r_mock} r_ce={r_ce} r_note={r_note} r_drift={r_drift} secret={ce_secret_hit} act_miss={act_miss}")
+        failures += 1
+    else:
+        print("PASS 14 structured PR review gate enforces ground-truth source, test proof, blocking counterexamples, and secret scanning")
 
     failures += check_key_shield_modes()
 
