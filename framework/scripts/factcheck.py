@@ -584,8 +584,18 @@ def resolve_tier(spec: dict[str, Any], target: str, claims: list[dict[str, Any]]
 
 
 def select_verifier_model(verifier_family: str, tier: str, *, is_db_write: bool = False) -> tuple[str, str, str]:
-    """Select (cli_model, effort, router_tier) via model_router.py for the opposite family."""
-    router_tier = "standard" if tier == "standard" else ("critical" if is_db_write else "complex")
+    """Select (cli_model, effort, router_tier) via model_router.py for the opposite family.
+
+    Fact-checking runs frequently on small structured JSON payloads backed by deterministic command
+    execution, so it maps one router tier lighter than code-diff reviews (`standard` -> `trivial`,
+    `high` non-DB -> `standard`, `high` DB write -> `complex`).
+    """
+    if tier == "standard":
+        router_tier = "trivial"
+    elif is_db_write:
+        router_tier = "complex"
+    else:
+        router_tier = "standard"
     opposite_author = "claude" if verifier_family == "gemini" else "gemini"
     plan = _router().select_task_models(explicit_tier=router_tier, author_family=opposite_author)
     entry = plan["reviewer"][verifier_family]

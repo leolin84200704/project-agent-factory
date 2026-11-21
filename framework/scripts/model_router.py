@@ -47,6 +47,46 @@ MODEL_CATALOG: dict[str, dict[str, Any]] = {
         "ttft_sec": "60-100s",
         "task_minutes": "4-10m",
     },
+    "gemini_neon_xhigh": {
+        "id": "gemini_neon_xhigh",
+        "family": "gemini",
+        "cli_model": "gemini-4-neon-xhigh",
+        "effort": "xhigh",
+        "display_name": "Gemini 4 Neon (XHigh)",
+        "scores": {"planning": 9.4, "coding": 9.5, "debugging": 9.4, "review": 9.4, "tool_chain": 9.5, "speed": 5.5},
+        "ttft_sec": "15-35s",
+        "task_minutes": "2.5-6m",
+    },
+    "gemini_neon_high": {
+        "id": "gemini_neon_high",
+        "family": "gemini",
+        "cli_model": "gemini-4-neon-high",
+        "effort": "high",
+        "display_name": "Gemini 4 Neon (High)",
+        "scores": {"planning": 9.2, "coding": 9.3, "debugging": 9.2, "review": 9.2, "tool_chain": 9.3, "speed": 7.2},
+        "ttft_sec": "6-18s",
+        "task_minutes": "1.5-4m",
+    },
+    "gemini_neon_medium": {
+        "id": "gemini_neon_medium",
+        "family": "gemini",
+        "cli_model": "gemini-4-neon-medium",
+        "effort": "medium",
+        "display_name": "Gemini 4 Neon (Medium)",
+        "scores": {"planning": 8.8, "coding": 9.0, "debugging": 8.8, "review": 8.8, "tool_chain": 9.0, "speed": 8.3},
+        "ttft_sec": "4-12s",
+        "task_minutes": "1-2.5m",
+    },
+    "gemini_neon_low": {
+        "id": "gemini_neon_low",
+        "family": "gemini",
+        "cli_model": "gemini-4-neon-low",
+        "effort": "low",
+        "display_name": "Gemini 4 Neon (Low)",
+        "scores": {"planning": 8.3, "coding": 8.6, "debugging": 8.3, "review": 8.3, "tool_chain": 8.6, "speed": 8.9},
+        "ttft_sec": "2-7s",
+        "task_minutes": "30s-1.5m",
+    },
     "gemini_argon_high": {
         "id": "gemini_argon_high",
         "family": "gemini",
@@ -186,40 +226,42 @@ MODEL_CATALOG: dict[str, dict[str, Any]] = {
     },
 }
 
-# Gemini Carbon stays in the catalog for explicit overrides but no tier routes to it: its first token takes
-# two minutes or more. The critical tier uses Argon (High).
+# Favor fast, cost-effective models by default: trivial/standard stay on Hydrogen and Sonnet (low/medium),
+# while complex/critical route Gemini to Neon (medium/high) instead of slower Argon/Carbon and keep Claude
+# on Sonnet (high) for complex and Opus (high) for critical. Carbon, Argon, Opus (XHigh), and Fable remain
+# in MODEL_CATALOG for explicit overrides or `allow_apex_reviewer`.
 TIER_ROUTING_TABLE: dict[str, dict[str, dict[str, str]]] = {
     "trivial": {
         "router": {"claude": "claude_haiku_low", "gemini": "gemini_hydrogen_low"},
-        "planner": {"claude": "claude_sonnet_low", "gemini": "gemini_hydrogen_low"},
-        "executor": {"claude": "claude_sonnet_low", "gemini": "gemini_hydrogen_medium"},
-        "reviewer": {"claude": "claude_sonnet_medium", "gemini": "gemini_hydrogen_high"},
+        "planner": {"claude": "claude_haiku_low", "gemini": "gemini_hydrogen_low"},
+        "executor": {"claude": "claude_sonnet_low", "gemini": "gemini_hydrogen_low"},
+        "reviewer": {"claude": "claude_sonnet_low", "gemini": "gemini_hydrogen_low"},
     },
     "standard": {
         "router": {"claude": "claude_haiku_low", "gemini": "gemini_hydrogen_low"},
-        "planner": {"claude": "claude_sonnet_high", "gemini": "gemini_hydrogen_high"},
-        "executor": {"claude": "claude_sonnet_high", "gemini": "gemini_hydrogen_high"},
-        "reviewer": {"claude": "claude_sonnet_high", "gemini": "gemini_hydrogen_high"},
+        "planner": {"claude": "claude_sonnet_medium", "gemini": "gemini_hydrogen_medium"},
+        "executor": {"claude": "claude_sonnet_medium", "gemini": "gemini_hydrogen_medium"},
+        "reviewer": {"claude": "claude_sonnet_medium", "gemini": "gemini_hydrogen_medium"},
     },
     "complex": {
         "router": {"claude": "claude_haiku_low", "gemini": "gemini_hydrogen_low"},
-        "planner": {"claude": "claude_opus_high", "gemini": "gemini_argon_high"},
-        "executor": {"claude": "claude_opus_high", "gemini": "gemini_hydrogen_xhigh"},
-        "reviewer": {"claude": "claude_opus_high", "gemini": "gemini_argon_high"},
+        "planner": {"claude": "claude_sonnet_high", "gemini": "gemini_neon_medium"},
+        "executor": {"claude": "claude_sonnet_high", "gemini": "gemini_neon_medium"},
+        "reviewer": {"claude": "claude_sonnet_high", "gemini": "gemini_neon_medium"},
     },
     "critical": {
         "router": {"claude": "claude_haiku_low", "gemini": "gemini_hydrogen_low"},
-        "planner": {"claude": "claude_fable_high", "gemini": "gemini_argon_high"},
-        "executor": {"claude": "claude_opus_xhigh", "gemini": "gemini_argon_high"},
-        "reviewer": {"claude": "claude_opus_xhigh", "gemini": "gemini_argon_high"},
+        "planner": {"claude": "claude_opus_high", "gemini": "gemini_neon_high"},
+        "executor": {"claude": "claude_opus_high", "gemini": "gemini_neon_high"},
+        "reviewer": {"claude": "claude_opus_high", "gemini": "gemini_neon_high"},
     },
 }
 
 TIER_ESTIMATED_MINUTES: dict[str, str] = {
-    "trivial": "0.5-2 min",
-    "standard": "2-5 min",
-    "complex": "5-12 min",
-    "critical": "10-25 min",
+    "trivial": "0.5-1.5 min",
+    "standard": "1-3 min",
+    "complex": "2-6 min",
+    "critical": "4-10 min",
 }
 
 CRITICAL_PATH_RE = re.compile(

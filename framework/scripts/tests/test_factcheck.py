@@ -322,21 +322,27 @@ class DualModelTest(Base):
     def set_scenario(self, blind=None, audit=None, **extra):
         self.scenario.write_text(json.dumps({"blind": blind or {"claims": []}, "audit": audit or {"claims": []}, **extra}))
 
-    def test_standard_tier_runs_audit_directly_with_standard_router_model(self):
+    def test_standard_tier_runs_audit_directly_with_fast_trivial_router_model(self):
         self.set_scenario(audit={"claims": [_ok_audit()]})
         code, r = self.check([c()], verify=True)
         self.assertEqual(code, 0, r)
         self.assertEqual(r["tier"], "standard")
         self.assertEqual(r["verify_mode"], "audit")
         self.assertEqual(r["verification"]["status"], "pass")
-        self.assertEqual(r["verification"]["router_tier"], "standard")
-        self.assertEqual(r["verification"]["model"], "gemini-4-hydrogen-high")
-        self.assertEqual(r["verification"]["effort"], "high")
+        self.assertEqual(r["verification"]["router_tier"], "trivial")
+        self.assertEqual(r["verification"]["model"], "gemini-4-hydrogen-low")
+        self.assertEqual(r["verification"]["effort"], "low")
         self.assertEqual(r["verification"]["claims"]["c1"]["by"], "audit")
         self.assertEqual([p["step"] for p in self.prompts_seen()], ["audit"])
         # The fake verifier replaces the model CLI, so the receipt must not claim dual-model.
         self.assertFalse(r["dual_model"])
         self.assertTrue(r["verifier_override"])
+
+        code_c, r_c = self.check([c()], verify=True, author_family="gemini")
+        self.assertEqual(code_c, 0, r_c)
+        self.assertEqual(r_c["verification"]["router_tier"], "trivial")
+        self.assertEqual(r_c["verification"]["model"], "sonnet")
+        self.assertEqual(r_c["verification"]["effort"], "low")
 
     def test_high_tier_always_runs_blind_and_audit_even_when_blind_matches(self):
         self.set_scenario(
@@ -347,8 +353,9 @@ class DualModelTest(Base):
         self.assertEqual(code, 0, r)
         self.assertEqual(r["tier"], "high")
         self.assertEqual(r["verify_mode"], "blind+audit")
-        self.assertEqual(r["verification"]["router_tier"], "complex")
-        self.assertEqual(r["verification"]["model"], "gemini-4-argon-high")
+        self.assertEqual(r["verification"]["router_tier"], "standard")
+        self.assertEqual(r["verification"]["model"], "gemini-4-hydrogen-medium")
+        self.assertEqual(r["verification"]["effort"], "medium")
         self.assertEqual(r["verification"]["claims"]["c1"]["by"], "blind+audit")
         self.assertTrue(r["verification"]["claims"]["c1"]["source_match"])
         self.assertTrue(r["verification"]["claims"]["c1"]["result_match"])
@@ -378,7 +385,7 @@ class DualModelTest(Base):
         self.assertTrue(e["result_match"])
         self.assertFalse(e["hash_match"])
 
-    def test_auto_tier_infers_high_for_db_target_and_routes_critical_claude_verifier(self):
+    def test_auto_tier_infers_high_for_db_target_and_routes_complex_fast_verifiers(self):
         self.set_scenario(
             blind={"claims": [{"id": "c1", "source": SRC, "command": "cat one.txt", "expect": "data"}]},
             audit={"claims": [_ok_audit()]},
@@ -386,10 +393,17 @@ class DualModelTest(Base):
         code, r = self.check([c()], target="db:lis_core_v7.clinic", verify=True, author_family="gemini")
         self.assertEqual(code, 0, r)
         self.assertEqual(r["tier"], "high")
-        self.assertEqual(r["verification"]["router_tier"], "critical")
+        self.assertEqual(r["verification"]["router_tier"], "complex")
         self.assertEqual(r["verification"]["family"], "claude")
-        self.assertEqual(r["verification"]["model"], "opus")
-        self.assertEqual(r["verification"]["effort"], "xhigh")
+        self.assertEqual(r["verification"]["model"], "sonnet")
+        self.assertEqual(r["verification"]["effort"], "high")
+
+        code_g, r_g = self.check([c()], target="db:lis_core_v7.clinic", verify=True, author_family="claude")
+        self.assertEqual(code_g, 0, r_g)
+        self.assertEqual(r_g["verification"]["router_tier"], "complex")
+        self.assertEqual(r_g["verification"]["family"], "gemini")
+        self.assertEqual(r_g["verification"]["model"], "gemini-4-neon-medium")
+        self.assertEqual(r_g["verification"]["effort"], "medium")
 
     def test_auto_tier_infers_high_for_category_d_or_f_claims(self):
         self.set_scenario(

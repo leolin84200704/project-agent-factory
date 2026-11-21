@@ -1666,7 +1666,7 @@ sys.exit(1)
         r_sel.returncode != 0
         or sel_json.get("tier") != "standard"
         or sel_json.get("reviewer", {}).get("primary", {}).get("family") != "gemini"
-        or sel_json.get("reviewer", {}).get("primary", {}).get("cli_model") != "gemini-4-hydrogen-high"
+        or sel_json.get("reviewer", {}).get("primary", {}).get("cli_model") != "gemini-4-hydrogen-medium"
     ):
         print(f"FAIL select-model subcommand: rc={r_sel.returncode} out={r_sel.stdout!r} err={r_sel.stderr!r}")
         failures += 1

@@ -22,14 +22,18 @@
 
 | 模型名稱 | CLI `--model` 參數 | 規劃推理 | 寫碼實作 | 除錯定位 | 審查抓漏 | 工具長鏈 | 回應速度 | 綜合定位 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| **Gemini 4 Carbon (High)** | `gemini-4-carbon-high` | 9.7 | 9.3 | 9.6 | 9.6 | 9.4 | 2.5 | 最強深層推理與高風險把關，等待時間最長 |
-| **Gemini 4 Carbon (Medium)** | `gemini-4-carbon-medium` | 9.4 | 9.2 | 9.4 | 9.4 | 9.2 | 4.0 | 深層推理折衷版，延遲比 Carbon High 短 |
-| **Gemini 4 Argon (High)** | `gemini-4-argon-high` | 9.1 | 9.0 | 9.1 | 9.2 | 9.0 | 5.0 | 高階工程規劃與跨模組審查，延遲約 Carbon 三分之一 |
-| **Gemini 4 Argon (Medium)** | `gemini-4-argon-medium` | 8.8 | 8.8 | 8.8 | 8.9 | 8.8 | 6.2 | 中大型功能規劃與穩健審查 |
-| **Gemini 4 Hydrogen (XHigh)** | `gemini-4-hydrogen-xhigh` | 8.8 | 8.9 | 8.7 | 8.8 | 8.8 | 5.5 | 進階思考版主力實作與複雜修改 |
-| **Gemini 4 Hydrogen (High)** | `gemini-4-hydrogen-high` | 8.2 | 8.6 | 8.2 | 8.3 | 8.5 | 8.0 | 速度與品質最均衡的日常預設執行與審查主力 |
-| **Gemini 4 Hydrogen (Medium)** | `gemini-4-hydrogen-medium` | 7.4 | 8.0 | 7.4 | 7.3 | 7.9 | 9.2 | 小範圍低風險修改、補單元測試與設定調整 |
-| **Gemini 4 Hydrogen (Low)** | `gemini-4-hydrogen-low` | 6.8 | 7.6 | 6.8 | 6.7 | 7.4 | 9.5 | `agy` CLI 最快模型，適合前置路由與極簡任務 |
+| **Gemini 4 Carbon (High)** | `gemini-4-carbon-high` | 9.7 | 9.3 | 9.6 | 9.6 | 9.4 | 2.5 | 最強深層推理與高風險把關，等待時間最長（暫停自動路由） |
+| **Gemini 4 Carbon (Medium)** | `gemini-4-carbon-medium` | 9.4 | 9.2 | 9.4 | 9.4 | 9.2 | 4.0 | 深層推理折衷版，延遲比 Carbon High 短（暫停自動路由） |
+| **Gemini 4 Neon (XHigh)** | `gemini-4-neon-xhigh` | 9.4 | 9.5 | 9.4 | 9.4 | 9.5 | 5.5 | 最高檔位程式碼代理與深層除錯，僅顯式覆寫使用 |
+| **Gemini 4 Neon (High)** | `gemini-4-neon-high` | 9.2 | 9.3 | 9.2 | 9.2 | 9.3 | 7.2 | 2026-11 新旗艦工程模型，寫碼與工具鏈領先 Argon 且更便宜快速（$3/$15），`critical` 主力 |
+| **Gemini 4 Neon (Medium)** | `gemini-4-neon-medium` | 8.8 | 9.0 | 8.8 | 8.8 | 9.0 | 8.3 | 高性價比中大型功能、跨模組審查與 DB 寫入事實查核主力，`complex` 預設 |
+| **Gemini 4 Neon (Low)** | `gemini-4-neon-low` | 8.3 | 8.6 | 8.3 | 8.3 | 8.6 | 8.9 | 輕量版 Neon，需要比 Hydrogen 強但維持秒級回應時可選用 |
+| **Gemini 4 Argon (High)** | `gemini-4-argon-high` | 9.1 | 9.0 | 9.1 | 9.2 | 9.0 | 5.0 | 舊一代高階規劃與審查（$4/$20），自動路由已由 Neon 取代，保留於型錄供覆寫 |
+| **Gemini 4 Argon (Medium)** | `gemini-4-argon-medium` | 8.8 | 8.8 | 8.8 | 8.9 | 8.8 | 6.2 | 舊一代中大型規劃與審查，自動路由已由 Neon 取代 |
+| **Gemini 4 Hydrogen (XHigh)** | `gemini-4-hydrogen-xhigh` | 8.8 | 8.9 | 8.7 | 8.8 | 8.8 | 5.5 | 進階思考版 Hydrogen，複雜修改已改由 Neon Medium 接手 |
+| **Gemini 4 Hydrogen (High)** | `gemini-4-hydrogen-high` | 8.2 | 8.6 | 8.2 | 8.3 | 8.5 | 8.0 | 均衡型高速執行與審查模型，需要比 Medium 更深思考時可用 |
+| **Gemini 4 Hydrogen (Medium)** | `gemini-4-hydrogen-medium` | 7.4 | 8.0 | 7.4 | 7.3 | 7.9 | 9.2 | 日常標準開發、一般 PR 審查與高風險非 DB 事實查核預設主力 |
+| **Gemini 4 Hydrogen (Low)** | `gemini-4-hydrogen-low` | 6.8 | 7.6 | 6.8 | 6.7 | 7.4 | 9.5 | `agy` CLI 最快最省模型，適合前置路由、純文件與一般事實查核 |
 | **Gemini 3.8 Flash (High)** | `gemini-3.8-flash-high` | 7.2 | 7.6 | 7.2 | 7.1 | 7.5 | 6.5 | 舊世代快模型，已被 Hydrogen 系列全面超越 |
 | **IDE Flash Lite 子代理** | IDE `Model="flash_lite"` | 4.5 | 5.2 | 4.2 | 4.0 | 5.0 | 10.0 | 僅限 IDE 內建 subagent 純分類與抽取，非 `agy` CLI 參數 |
 
@@ -54,6 +58,9 @@
 | 模型與思考設定 | 輸出速度參考 | 首字延遲（TTFT） | 單輪對話時間 | 完整任務（讀檔+改碼+跑測試） |
 | :--- | :--- | :--- | :--- | :--- |
 | **Gemini 4 Carbon (`high`)** | 約 76 tok/s | 120 到 160 秒 | 2 到 6 分鐘 | 6 到 15 分鐘以上 |
+| **Gemini 4 Neon (`xhigh`)** | 中快 | 15 到 35 秒 | 25 秒到 1.5 分鐘 | 2.5 到 6 分鐘 |
+| **Gemini 4 Neon (`high`)** | 快 | 6 到 18 秒 | 10 到 45 秒 | 1.5 到 4 分鐘 |
+| **Gemini 4 Neon (`low / medium`)** | 快 | 2 到 12 秒 | 5 到 25 秒 | 30 秒到 2.5 分鐘 |
 | **Gemini 4 Argon (`high`)** | 中等 | 35 到 55 秒 | 45 秒到 2 分鐘 | 3 到 7 分鐘 |
 | **Gemini 4 Hydrogen (`xhigh`)** | 中快 | 20 到 45 秒 | 40 秒到 2 分鐘 | 2.5 到 6 分鐘 |
 | **Gemini 4 Hydrogen (`high`)** | 約 190 tok/s | 5 到 15 秒 | 15 到 45 秒 | 1 到 3 分鐘 |
@@ -70,31 +77,35 @@
 
 ### Google Gemini 系列
 
-1. **Gemini 4 Carbon**
+1. **Gemini 4 Neon**（2026-11-18 推出，1M context，$3 / $15 per 1M tokens）
+   - 定位介於 Hydrogen（極速日常）與 Carbon（超長鏈深層推理）之間，是專為寫碼、跨檔重構、除錯與多步驟工具代理打造的中高階主力模型（Artificial Analysis Coding Agent Index 第 1、AutomationBench 第 1、Intelligence Index 第 3）。
+   - 提供 `low / medium / high / xhigh` 四段思考深度，端到端輸出精簡且延遲明顯低於 Argon 與 Carbon，價格也低於 Argon（$4 / $20）。
+   - 自動路由中 `complex` 等級與 DB 寫入事實查核使用 `neon-medium`，`critical` 等級使用 `neon-high`；`neon-xhigh` 留在型錄供顯式覆寫。
+2. **Gemini 4 Carbon**
    - 優勢是深層推理與假設驗證極強，能主動抓出並發競爭、權限繞過與資料一致性漏洞。
    - 劣勢是 `high` 模式首字延遲常超過兩分鐘且配額消耗大，拿來跑一般任務會拖慢整體回饋迴圈。
-   - **暫時停用（Leo 指令 2026-11-19）**：路由表沒有任何等級會選到 Carbon，`critical` 等級的規劃與審查改用 Argon (High)。Gemini 這一側只用 Argon 或 Hydrogen；Carbon 留在型錄裡，只有明確指定 `--agy-model` 時才會用到。
-2. **Gemini 4 Argon**
-   - 優勢是保留接近 Carbon 的多模組推理深度，同時把首字延遲降到三分之一左右。
-   - 適用跨模組技術規劃、治理與核心工具鏈變更、以及 `complex` 等級 PR 雙模型審查。
-3. **Gemini 4 Hydrogen**
-   - 優勢是輸出達 190 tokens/s 且工具呼叫穩定，四段思考深度可從秒級分類一路涵蓋到複雜實作。
-   - `low` 專責秒級路由與探索；`medium` 處理文件與設定小改；`high` 負責絕大多數標準業務開發與第一輪 PR 審查；`xhigh` 負責複雜程式修改。
+   - **暫時停用（Leo 指令 2026-11-19）**：路由表沒有任何等級會選到 Carbon，留在型錄裡，只有明確指定 `--agy-model` 或 repo `overrides` 時才會用到。
+3. **Gemini 4 Argon**
+   - 保留接近 Carbon 的多模組推理深度，但在寫碼與工具鏈表現已被同代更便宜、更快的 Neon 超越。
+   - 自動路由已改由 Neon 接手，Argon 留在型錄供顯式覆寫。
+4. **Gemini 4 Hydrogen**
+   - 優勢是輸出達 190 tokens/s、成本最低且工具呼叫穩定，承擔絕大多數日常與高頻工作。
+   - `low` 專責秒級路由、純文件修改與審查、以及 `standard` 事實查核；`medium` 負責絕大多數 `standard` 開發與第一輪 PR 審查、以及非 DB 的 `high` 事實查核。
 
 ### Anthropic Claude Code 系列
 
 1. **Claude Fable 5 (`fable`)**
    - 優勢是多步長鏈推理與模糊需求拆解最強，防呆考慮最完整。
-   - 劣勢是單價與延遲最高，僅保留給 `critical` 等級架構規劃、死鎖除錯、或顯式開啟 `allow_apex_reviewer` 的最高風險審查。
+   - 劣勢是單價與延遲最高，預設不進自動路由表，僅在顯式開啟 `allow_apex_reviewer` 或手動指定覆寫時使用。
 2. **Claude Opus 5 (`opus`)**
    - 優勢是長週期寫碼、跨檔案重構與規範遵循度極穩。
-   - 適用 `complex` 與 `critical` 等級的規劃、實作與異質審查（依風險搭配 `--effort high` 或 `--effort xhigh`）。
+   - 僅保留給 `critical` 等級（DB migration、auth／安全／計費、線上事故、第 3 輪爭議收斂），預設用 `--effort high`，`xhigh` 留給顯式覆寫。
 3. **Claude Sonnet 5 (`sonnet`)**
-   - 優勢是延遲低、互動流暢、寫碼與抓漏能力均衡，成本僅 Opus 一半。
-   - 適用 `trivial` 與 `standard` 等級的日常開發、作者修正回合與標準 PR 審查。
+   - 優勢是延遲低、寫碼與抓漏能力均衡，成本僅 Opus 一半，是大多數任務的主力。
+   - `low` 處理 `trivial` 與 `standard` 事實查核（實測 4–5 秒且結構化輸出穩定，比 `haiku` 跑 JSON schema 更快更準）；`medium` 負責絕大多數 `standard` 開發、第一輪 PR 審查與非 DB `high` 事實查核；`high` 負責 `complex` 任務、第 2 輪爭議審查與 DB 寫入事實查核。
 4. **Claude Haiku 4.5 (`haiku`)**
-   - 優勢是 1 到 3 秒內回應且成本極低。
-   - 適用新 ticket 進件時的第一步分類、快速檔案掃描與大量 log 過濾，不單獨承擔複雜寫碼或安全把關。
+   - 優勢是極低成本與秒級純文字分類。
+   - 適用新 ticket 進件的前置分派（`router`）、純文件規劃與快速 log 過濾；複雜 JSON schema 審查交給 `sonnet --effort low` 以上以兼顧速度與穩定度。
 
 ---
 
@@ -111,12 +122,13 @@
 
 | 等級 (`tier`) | 觸發條件（任一成立即歸入該級，由高往低匹配） | 預估時間 | Router（前置分派） | Planner（規劃） | Executor（執行／修正） | Reviewer（異質檢測審查） |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`critical`** | DB migration / `ALTER` / `DROP`、`auth` / `security` / `crypto` / `billing` / `HMAC`、`PERMISSIONS.md`、`pre-tool-guard.py`、線上事故（`--incident`）、檔案數 `> 20`、變更行數 `> 1200`、點數 `>= 8`、或共識進入第 3 輪以上 | 10–25 分鐘 | `haiku (low)` / `hydrogen-low` | `fable (high)` / `argon-high` | `opus (xhigh)` / `argon-high` | `opus (xhigh)`（或 `fable`） / `argon-high` |
-| **`complex`** | 修改治理或核心引擎檔（`CORE.md`、`AGENTS.md`、`.agent-verify.json`、`bin/paf`、`paf_watcher.py`、hooks、workflows、skills）、跨倉或並發狀態機、檔案數 `9–20`、變更行數 `401–1200`、點數 `5–7`、或共識進入第 2 輪 | 5–12 分鐘 | `haiku (low)` / `hydrogen-low` | `opus (high)` / `argon-high` | `opus (high)` / `hydrogen-xhigh` | `opus (high)` / `argon-high` |
-| **`standard`** | 一般業務邏輯新增、單一服務 bug 修復、測試與腳本更新（未命中高風險路徑，檔案數 `<= 8` 且變更行數 `<= 400`） | 2–5 分鐘 | `haiku (low)` / `hydrogen-low` | `sonnet (high)` / `hydrogen-high` | `sonnet (high)` / `hydrogen-high` | `sonnet (high)` / `hydrogen-high` |
-| **`trivial`** | 純文件或說明檔（`.md` / `.txt` / `.rst` / `.adoc`）且檔案數 `<= 3`、變更行數 `<= 120`；或點數 `<= 1` 的純文案微調 | 0.5–2 分鐘 | `haiku (low)` / `hydrogen-low` | 與 Executor 合併（`sonnet-low` / `hydrogen-low`） | `sonnet (low)` / `hydrogen-medium` | `sonnet (medium)` / `hydrogen-high` |
+| **`critical`** | DB migration / `ALTER` / `DROP`、`auth` / `security` / `crypto` / `billing` / `HMAC`、`PERMISSIONS.md`、`pre-tool-guard.py`、線上事故（`--incident`）、檔案數 `> 20`、變更行數 `> 1200`、點數 `>= 8`、或共識進入第 3 輪以上 | 4–10 分鐘 | `haiku (low)` / `hydrogen-low` | `opus (high)` / `neon-high` | `opus (high)` / `neon-high` | `opus (high)`（開啟 `allow_apex_reviewer` 時為 `fable`） / `neon-high` |
+| **`complex`** | 修改治理或核心引擎檔（`CORE.md`、`AGENTS.md`、`.agent-verify.json`、`bin/paf`、`paf_watcher.py`、hooks、workflows、skills）、跨倉或並發狀態機、檔案數 `9–20`、變更行數 `401–1200`、點數 `5–7`、或共識進入第 2 輪 | 2–6 分鐘 | `haiku (low)` / `hydrogen-low` | `sonnet (high)` / `neon-medium` | `sonnet (high)` / `neon-medium` | `sonnet (high)` / `neon-medium` |
+| **`standard`** | 一般業務邏輯新增、單一服務 bug 修復、測試與腳本更新（未命中高風險路徑，檔案數 `<= 8` 且變更行數 `<= 400`） | 1–3 分鐘 | `haiku (low)` / `hydrogen-low` | `sonnet (medium)` / `hydrogen-medium` | `sonnet (medium)` / `hydrogen-medium` | `sonnet (medium)` / `hydrogen-medium` |
+| **`trivial`** | 純文件或說明檔（`.md` / `.txt` / `.rst` / `.adoc`）且檔案數 `<= 3`、變更行數 `<= 120`；或點數 `<= 1` 的純文案微調 | 0.5–1.5 分鐘 | `haiku (low)` / `hydrogen-low` | 與 Executor 合併（`haiku-low` / `hydrogen-low`） | `sonnet (low)` / `hydrogen-low` | `sonnet (low)` / `hydrogen-low` |
 
 > 審查者永遠優先選取與作者相反的模型家族（`claude` 作者配 `gemini` 審查者；`gemini` 作者配 `claude` 審查者）。當異質家族發生 API 配額耗盡或逾時而觸發全新空白 session 同家族備援時，路由引擎也會自動套用該家族同等級的審查模型與 effort。
+> **事實查核（`paf factcheck`）再降一階**：事實查核頻率高、payload 短且每條指令皆由本機腳本確定性實跑，因此比程式碼審查少一級：`standard`（一般對外文字與結論）走 `trivial` 審查模型（`sonnet --effort low` / `gemini-4-hydrogen-low`），非 DB 的 `high`（D／F 類盲測加審查）走 `standard`（`sonnet --effort medium` / `gemini-4-hydrogen-medium`），DB 寫入的 `high` 走 `complex`（`sonnet --effort high` / `gemini-4-neon-medium`）。
 
 ### 3. CLI 與自動化整合用法
 
@@ -131,7 +143,7 @@
    ```
 3. **`paf ship --consensus`、`paf drive-consensus` 與 `paf watch-prs` 自動執行**：
    - 未指定 `--claude-model` / `--agy-model`（或設為 `auto`）時，`paf_watcher.py` 每一輪都會呼叫 `model_router.select_pr_models()`，讀取 PR 標題、描述、變更檔案清單、實際 diff 行數與當前有效 `round`（跨呼叫與跨 commit 累計），自動為審查端與作者修正端選取模型與 `--effort`，並在 stderr 印出 `[paf model-router]` 稽核紀錄。若操作者顯式傳入 `--claude-model` 而未指定 `--claude-effort`，`haiku` 預設配對 `--effort low`，其餘模型名稱預設配對 `--effort high`。
-   - 若第 1 輪 `standard` 審查提出 `request_changes` 進入第 2 輪，路由器會自動把第 2 輪升階到 `complex`（`opus --effort high` / `gemini-4-argon-high`），第 3 輪升階到 `critical`（`opus --effort xhigh` / `gemini-4-argon-high`），在同一條持久化 session 上集中火力收斂爭議。
+   - 若第 1 輪 `standard` 審查提出 `request_changes` 進入第 2 輪，路由器會自動把第 2 輪升階到 `complex`（`sonnet --effort high` / `gemini-4-neon-medium`），第 3 輪升階到 `critical`（`opus --effort high` / `gemini-4-neon-high`），在同一條持久化 session 上集中火力收斂爭議。
 4. **個別倉庫自訂上下限與安全不降級保護（`.agent-verify.json` 選填設定）**：
    倉庫可在 `.agent-verify.json`（或 `consensus.model_routing`）加入 `model_routing` 設定最低／最高等級、啟用 `fable` 最高階審查、或指定個別角色的 catalog key 覆寫（`overrides`）：
    ```json
