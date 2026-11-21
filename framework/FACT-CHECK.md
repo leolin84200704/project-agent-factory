@@ -73,8 +73,8 @@ STM 和 handoff 的 Verified facts 只放已驗證的內容，推論另列一欄
 | 等級 | 適用情境 | 執行流程 | 驗證模型（`model_router.py`） |
 |---|---|---|---|
 | `low` | 終端機一般問答、內部低風險查詢 | 本機三欄加收據，不呼叫第二模型 | 無 |
-| `standard` | 一般對外文字（Slack、Email、Jira、PR 描述）、一般結論 | 做法 1（審查＋結果一致＋反例） | `standard` 級（`sonnet --effort high` / `gemini-4-hydrogen-high`） |
-| `high` | DB 寫入、批次資料清單、D 類歸屬與 F 類全集合陳述、高風險決策 | 做法 2（盲測）再接做法 1（審查＋反例） | DB 寫入走 `critical` 級，其餘走 `complex` 級（`opus --effort high/xhigh` / `gemini-4-argon-high`） |
+| `standard` | 一般對外文字（Slack、Email、Jira、PR 描述）、一般結論 | 做法 1（審查＋結果一致＋反例） | `trivial` 級（`sonnet --effort low` / `gemini-4-hydrogen-low`） |
+| `high` | DB 寫入、批次資料清單、D 類歸屬與 F 類全集合陳述、高風險決策 | 做法 2（盲測）再接做法 1（審查＋反例） | 一般走 `standard` 級（`sonnet --effort medium` / `gemini-4-hydrogen-medium`）；DB 寫入走 `complex` 級（`sonnet --effort high` / `gemini-4-neon-medium`） |
 
 ### 唯讀與隱私
 - 驗證模型提出的每一條指令，執行前都要過唯讀檢查：只准登記過的查詢 runner（SQL 只能是一條 SELECT、SHOW、DESCRIBE、EXPLAIN、WITH）、grep、rg、cat、head、tail、wc、ls、jq、find（不含 -exec、-delete）、唯讀的 git、gh、kubectl；不准 pipe、redirect、串接和指令替換。沒過的指令不執行，記在收據裡。

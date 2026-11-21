@@ -37,6 +37,10 @@ VALID_AGY_MODELS = {
     "gemini-4-carbon-high",
     "gemini-4-carbon-medium",
     "gemini-4-carbon-low",
+    "gemini-4-neon-xhigh",
+    "gemini-4-neon-high",
+    "gemini-4-neon-medium",
+    "gemini-4-neon-low",
     "gemini-4-argon-high",
     "gemini-4-argon-medium",
     "gemini-4-argon-low",
@@ -66,7 +70,7 @@ def main() -> int:
     mr = _load_mod("model_router", ROUTER_PATH)
     pw = _load_mod("paf_watcher", WATCHER_PATH)
 
-    # 1. Catalog entries map strictly to verified live CLI identifiers
+    # 1. Catalog entries map strictly to verified live CLI identifiers and expose all Gemini 4 Neon variants
     bad_catalog = []
     for key, spec in mr.MODEL_CATALOG.items():
         fam = spec.get("family")
@@ -78,13 +82,17 @@ def main() -> int:
             bad_catalog.append((key, cli_m, eff))
         elif fam not in ("gemini", "claude"):
             bad_catalog.append((key, fam))
-    if bad_catalog:
-        print(f"FAIL 1 invalid catalog entries: {bad_catalog}")
+    missing_neon = [
+        k for k in ("gemini_neon_low", "gemini_neon_medium", "gemini_neon_high", "gemini_neon_xhigh")
+        if k not in mr.MODEL_CATALOG
+    ]
+    if bad_catalog or missing_neon:
+        print(f"FAIL 1 invalid catalog entries: bad={bad_catalog} missing_neon={missing_neon}")
         failures += 1
     else:
-        print("PASS 1 MODEL_CATALOG uses verified live agy and claude CLI model identifiers")
+        print("PASS 1 MODEL_CATALOG uses verified live agy and claude CLI model identifiers including Gemini 4 Neon")
 
-    # 2. Trivial tier: pure docs/markdown small change avoids slow/expensive Carbon/Fable/Opus
+    # 2. Trivial tier: pure docs/markdown small change stays on fastest low-effort Hydrogen/Sonnet/Haiku
     p_triv = mr.select_task_models(
         title="docs: fix typo in onboarding README",
         changed_files=["README.md", "docs/setup.md"],
@@ -95,18 +103,22 @@ def main() -> int:
         p_triv["tier"] != "trivial"
         or p_triv["router"]["claude"]["cli_model"] != "haiku"
         or p_triv["router"]["gemini"]["cli_model"] != "gemini-4-hydrogen-low"
+        or p_triv["planner"]["claude"]["cli_model"] != "haiku"
         or p_triv["planner"]["gemini"]["cli_model"] != "gemini-4-hydrogen-low"
         or p_triv["executor"]["claude"]["cli_model"] != "sonnet"
+        or p_triv["executor"]["claude"]["effort"] != "low"
+        or p_triv["executor"]["gemini"]["cli_model"] != "gemini-4-hydrogen-low"
         or p_triv["reviewer"]["primary"]["family"] != "claude"
         or p_triv["reviewer"]["primary"]["cli_model"] != "sonnet"
-        or p_triv["reviewer"]["gemini"]["cli_model"] != "gemini-4-hydrogen-high"
+        or p_triv["reviewer"]["primary"]["effort"] != "low"
+        or p_triv["reviewer"]["gemini"]["cli_model"] != "gemini-4-hydrogen-low"
     ):
         print(f"FAIL 2 trivial routing mismatch: {json.dumps(p_triv, indent=2)}")
         failures += 1
     else:
-        print("PASS 2 trivial markdown task routes to fast Hydrogen/Sonnet/Haiku tiers without Carbon/Fable wait")
+        print("PASS 2 trivial markdown task routes to fast low-effort Hydrogen/Sonnet/Haiku tiers")
 
-    # 3. Standard tier: normal single-service bug fix with unit test
+    # 3. Standard tier: normal single-service bug fix routes to fast Sonnet (medium) and Hydrogen (medium)
     p_std = mr.select_task_models(
         title="[VP-19401] Handle empty middle name in patient mapper",
         changed_files=["src/mapper.py", "tests/test_mapper.py"],
@@ -117,16 +129,19 @@ def main() -> int:
     if (
         p_std["tier"] != "standard"
         or p_std["planner"]["claude"]["cli_model"] != "sonnet"
-        or p_std["executor"]["gemini"]["cli_model"] != "gemini-4-hydrogen-high"
+        or p_std["planner"]["claude"]["effort"] != "medium"
+        or p_std["executor"]["gemini"]["cli_model"] != "gemini-4-hydrogen-medium"
         or p_std["reviewer"]["primary"]["family"] != "gemini"
-        or p_std["reviewer"]["primary"]["cli_model"] != "gemini-4-hydrogen-high"
+        or p_std["reviewer"]["primary"]["cli_model"] != "gemini-4-hydrogen-medium"
+        or p_std["reviewer"]["claude"]["cli_model"] != "sonnet"
+        or p_std["reviewer"]["claude"]["effort"] != "medium"
     ):
         print(f"FAIL 3 standard routing mismatch: {json.dumps(p_std, indent=2)}")
         failures += 1
     else:
-        print("PASS 3 standard code fix routes to Sonnet (high) and Gemini 4 Hydrogen (high)")
+        print("PASS 3 standard code fix routes to Sonnet (medium) and Gemini 4 Hydrogen (medium)")
 
-    # 4. Complex tier: governance / orchestration engine files (`bin/paf`, `CORE.md`) or round 2 escalation
+    # 4. Complex tier: governance / orchestration engine files (`bin/paf`, `CORE.md`) or round 2 escalation -> Sonnet (high) / Neon (medium)
     p_cplx = mr.select_task_models(
         title="[paf] Update persistent consensus orchestration",
         changed_files=["bin/paf", "CORE.md", "framework/scripts/tests/test_paf_cli.py"],
@@ -142,19 +157,29 @@ def main() -> int:
     )
     if (
         p_cplx["tier"] != "complex"
-        or p_cplx["planner"]["claude"]["cli_model"] != "opus"
-        or p_cplx["planner"]["gemini"]["cli_model"] != "gemini-4-argon-high"
-        or p_cplx["executor"]["gemini"]["cli_model"] != "gemini-4-hydrogen-xhigh"
-        or p_cplx["reviewer"]["primary"]["cli_model"] != "opus"
-        or p_cplx["reviewer"]["gemini"]["cli_model"] != "gemini-4-argon-high"
+        or p_cplx["planner"]["claude"]["cli_model"] != "sonnet"
+        or p_cplx["planner"]["claude"]["effort"] != "high"
+        or p_cplx["planner"]["gemini"]["cli_model"] != "gemini-4-neon-medium"
+        or p_cplx["executor"]["gemini"]["cli_model"] != "gemini-4-neon-medium"
+        or p_cplx["reviewer"]["primary"]["cli_model"] != "sonnet"
+        or p_cplx["reviewer"]["primary"]["effort"] != "high"
+        or p_cplx["reviewer"]["gemini"]["cli_model"] != "gemini-4-neon-medium"
         or p_round2["tier"] != "complex"
+        or p_round2["reviewer"]["primary"]["cli_model"] != "gemini-4-neon-medium"
     ):
         print(f"FAIL 4 complex routing mismatch: cplx={p_cplx} round2={p_round2}")
         failures += 1
     else:
-        print("PASS 4 governance/engine changes and contested round 2 escalate to Opus / Argon / Hydrogen-XHigh")
+        print("PASS 4 governance/engine changes and contested round 2 route to Sonnet (high) and Gemini 4 Neon (medium)")
 
-    # 5. Critical tier: DB schema migration / auth / HMAC / round 3 escalates to Argon (High) / Fable / Opus-XHigh
+    # 5. Critical tier: DB schema migration / auth / HMAC / round 3 escalates to Opus (high) and Gemini 4 Neon (high) (apex Fable only when opt-in)
+    p_crit_default = mr.select_task_models(
+        title="[DB] Drop legacy token column and rotate OAuth HMAC verification",
+        description="ALTER TABLE users DROP COLUMN legacy_oauth_token; update payment auth guard",
+        changed_files=["migrations/20261116_drop_legacy_token.sql", "src/auth/hmac_guard.py"],
+        diff_lines=310,
+        author_family="claude",
+    )
     p_crit = mr.select_task_models(
         title="[DB] Drop legacy token column and rotate OAuth HMAC verification",
         description="ALTER TABLE users DROP COLUMN legacy_oauth_token; update payment auth guard",
@@ -164,17 +189,23 @@ def main() -> int:
         routing_cfg={"allow_apex_reviewer": True},
     )
     if (
-        p_crit["tier"] != "critical"
-        or p_crit["planner"]["claude"]["cli_model"] != "fable"
-        or p_crit["planner"]["gemini"]["cli_model"] != "gemini-4-argon-high"
-        or p_crit["reviewer"]["primary"]["cli_model"] != "gemini-4-argon-high"
+        p_crit_default["tier"] != "critical"
+        or p_crit_default["planner"]["claude"]["cli_model"] != "opus"
+        or p_crit_default["planner"]["claude"]["effort"] != "high"
+        or p_crit_default["planner"]["gemini"]["cli_model"] != "gemini-4-neon-high"
+        or p_crit_default["executor"]["claude"]["cli_model"] != "opus"
+        or p_crit_default["executor"]["claude"]["effort"] != "high"
+        or p_crit_default["executor"]["gemini"]["cli_model"] != "gemini-4-neon-high"
+        or p_crit_default["reviewer"]["primary"]["cli_model"] != "gemini-4-neon-high"
+        or p_crit_default["reviewer"]["claude"]["cli_model"] != "opus"
+        or p_crit_default["reviewer"]["claude"]["effort"] != "high"
         or p_crit["reviewer"]["claude"]["cli_model"] != "fable"
         or not p_crit["reasons"]
     ):
-        print(f"FAIL 5 critical routing mismatch: {json.dumps(p_crit, indent=2)}")
+        print(f"FAIL 5 critical routing mismatch: default={json.dumps(p_crit_default, indent=2)} apex={json.dumps(p_crit, indent=2)}")
         failures += 1
     else:
-        print("PASS 5 DB schema/auth/HMAC task escalates planner & reviewer to Fable and Gemini 4 Argon (High)")
+        print("PASS 5 DB schema/auth/HMAC task escalates to Opus (high) and Gemini 4 Neon (high) with opt-in Fable apex")
 
     # 6. `paf select-model` CLI inspects live git diff on a temporary repository
     tmp_repo = _mkdtemp("paf-model-router-repo-")
@@ -255,7 +286,7 @@ def main() -> int:
         or cli_triv_json.get("tier") != "trivial"
         or cli_crit.returncode != 0
         or cli_crit_json.get("tier") != "critical"
-        or cli_crit_json.get("reviewer", {}).get("primary", {}).get("cli_model") != "gemini-4-argon-high"
+        or cli_crit_json.get("reviewer", {}).get("primary", {}).get("cli_model") != "gemini-4-neon-high"
     ):
         print(
             f"FAIL 6 paf select-model git diff detection:\n"
@@ -299,7 +330,7 @@ def main() -> int:
     )
     fake_claude.chmod(0o755)
 
-    # 7a: Claude-authored critical migration PR -> Gemini watcher auto-selects `gemini-4-argon-high`
+    # 7a: Claude-authored critical migration PR -> Gemini watcher auto-selects `gemini-4-neon-high`
     m_claude_auth = {
         "v": 1,
         "role": "author",
@@ -345,7 +376,7 @@ def main() -> int:
     )
     agy_seen = json.loads(agy_args_file.read_text(encoding="utf-8")) if agy_args_file.is_file() else []
 
-    # 7b: Gemini-authored critical migration PR -> Claude watcher auto-selects `--model opus --effort xhigh`
+    # 7b: Gemini-authored critical migration PR -> Claude watcher auto-selects `--model opus --effort high`
     m_gem_auth = dict(m_claude_auth, model_family="gemini", pr_number=52, session_id="gem-auth-52")
     m_gem_auth.pop("sig", None)
     m_gem_auth.pop("key_id", None)
@@ -388,9 +419,9 @@ def main() -> int:
     claude_effort_val = claude_seen[claude_seen.index("--effort") + 1] if "--effort" in claude_seen else ""
 
     if (
-        agy_model_val != "gemini-4-argon-high"
+        agy_model_val != "gemini-4-neon-high"
         or claude_model_val != "opus"
-        or claude_effort_val != "xhigh"
+        or claude_effort_val != "high"
     ):
         print(
             f"FAIL 7 watcher automatic model routing:\n"
@@ -400,7 +431,7 @@ def main() -> int:
     else:
         print("PASS 7 `paf_watcher` automatically self-assesses PR risk and pins `--model` and `--effort`")
 
-    # 8. `run_consensus_dialogue` starts fast on standard PRs (Round 1: sonnet/high) and escalates on Round 2 (opus/high)
+    # 8. `run_consensus_dialogue` starts fast on standard PRs (Round 1: sonnet/medium) and escalates on Round 2 (sonnet/high)
     std_repo = _mkdtemp("paf-mr-dlg-repo-")
     subprocess.run(["git", "init", "-b", "main"], cwd=std_repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=std_repo, check=True)
@@ -523,9 +554,9 @@ def main() -> int:
 
     recorded = [json.loads(ln) for ln in dlg_calls_log.read_text().splitlines()] if dlg_calls_log.is_file() else []
     expected_recorded = [
-        {"cli": "claude", "round": 1, "model": "sonnet", "effort": "high"},
-        {"cli": "agy", "model": "gemini-4-hydrogen-high"},
-        {"cli": "claude", "round": 2, "model": "opus", "effort": "high"},
+        {"cli": "claude", "round": 1, "model": "sonnet", "effort": "medium"},
+        {"cli": "agy", "model": "gemini-4-hydrogen-medium"},
+        {"cli": "claude", "round": 2, "model": "sonnet", "effort": "high"},
     ]
     if (
         dlg_res.get("status") != "merged"
@@ -632,21 +663,22 @@ def main() -> int:
         title="Fix mapper",
         changed_files=["src/mapper.py"],
         author_family="gemini",
-        routing_cfg={"overrides": {"reviewer_claude": "claude_fable_high"}},
+        routing_cfg={"overrides": {"reviewer_claude": "claude_fable_high", "reviewer_gemini": "gemini_neon_xhigh"}},
     )
     if (
         base_loaded_cfg != {"min_tier": "standard"}
         or pr_tamper_plan["tier"] != "critical"
         or pr_tamper_plan["reviewer"]["claude"]["cli_model"] != "opus"
-        or pr_tamper_plan["reviewer"]["claude"]["effort"] != "xhigh"
-        or pr_tamper_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-argon-high"
+        or pr_tamper_plan["reviewer"]["claude"]["effort"] != "high"
+        or pr_tamper_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-neon-high"
         or direct_guard_plan["tier"] != "trivial"
         or direct_guard_plan["reviewer_tier"] != "critical"
         or direct_guard_plan["reviewer"]["claude"]["cli_model"] != "opus"
-        or direct_guard_plan["reviewer"]["claude"]["effort"] != "xhigh"
-        or direct_guard_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-argon-high"
+        or direct_guard_plan["reviewer"]["claude"]["effort"] != "high"
+        or direct_guard_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-neon-high"
         or direct_guard_plan["executor"]["gemini"]["cli_model"] != "gemini-4-hydrogen-low"
         or escalate_override_plan["reviewer"]["claude"]["cli_model"] != "fable"
+        or escalate_override_plan["reviewer"]["gemini"]["cli_model"] != "gemini-4-neon-xhigh"
     ):
         print(
             f"FAIL 10 base-branch & non-lowering reviewer guard:\n"
@@ -714,8 +746,8 @@ def main() -> int:
         print("PASS 12 `_extract_changed_patch_lines` accurately counts `--` deletions and blocks `+++` hunk header spoofing")
 
     # 13. Operator CLI override precedence, model-matched effort, `auto`, and invalid effort validation
-    triv_claude_spec = p_triv["reviewer"]["claude"]  # sonnet / medium
-    triv_gemini_spec = p_triv["reviewer"]["gemini"]  # gemini-4-hydrogen-high
+    triv_claude_spec = p_triv["reviewer"]["claude"]  # sonnet / low
+    triv_gemini_spec = p_triv["reviewer"]["gemini"]  # gemini-4-hydrogen-low
     r_auto_c = pw._resolve_cli_model_and_effort("claude", triv_claude_spec, claude_model="auto", claude_effort="auto")
     r_fable_default_e = pw._resolve_cli_model_and_effort("claude", triv_claude_spec, claude_model="fable")
     r_haiku_default_e = pw._resolve_cli_model_and_effort("claude", triv_claude_spec, claude_model="haiku")
@@ -723,7 +755,7 @@ def main() -> int:
         "claude", triv_claude_spec, claude_model="opus", claude_effort="max"
     )
     r_agy_override = pw._resolve_cli_model_and_effort(
-        "gemini", triv_gemini_spec, agy_model="gemini-4-argon-medium", agy_effort="high"
+        "gemini", triv_gemini_spec, agy_model="gemini-4-neon-medium", agy_effort="high"
     )
     bad_effort_caught = False
     try:
@@ -731,11 +763,11 @@ def main() -> int:
     except ValueError:
         bad_effort_caught = True
     if (
-        r_auto_c != ("sonnet", "medium")
+        r_auto_c != ("sonnet", "low")
         or r_fable_default_e != ("fable", "high")
         or r_haiku_default_e != ("haiku", "low")
         or r_explicit_both != ("opus", "max")
-        or r_agy_override != ("gemini-4-argon-medium", "high")
+        or r_agy_override != ("gemini-4-neon-medium", "high")
         or not bad_effort_caught
     ):
         print(
@@ -935,7 +967,7 @@ def main() -> int:
     )
     if (
         rd_res.get("status") != "merged"
-        or rd_calls != [{"model": "opus", "effort": "high"}]
+        or rd_calls != [{"model": "sonnet", "effort": "high"}]
         or csv_plan["tier"] != "standard"
         or tail_plan["tier"] != "critical"
         or "warning: git base ref" not in warn_diff.stderr
@@ -947,7 +979,7 @@ def main() -> int:
         )
         failures += 1
     else:
-        print("PASS 15 re-driven `run_consensus_dialogue` escalates round=2 to `opus/high`, samples diff tail, treats CSV as code/data, and warns on missing `--diff-base`")
+        print("PASS 15 re-driven `run_consensus_dialogue` escalates round=2 to `sonnet/high`, samples diff tail, treats CSV as code/data, and warns on missing `--diff-base`")
 
     return 1 if failures else 0
 
